@@ -1,9 +1,9 @@
 # containerctl
-KISS single-file Docker CLI/TUI manager, in Python
+KISS containers CLI/TUI manager, in Python
 
 ## Help
 ```
-containerctl - KISS single-file Docker CLI/TUI manager
+containerctl - KISS containers CLI/TUI manager
 ───────────────────────────────────────────────────────
 - containerctl                       ==> launch TUI
 - containerctl help                  ==> show this help

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-containerctl - KISS single-file Docker CLI/TUI manager
+containerctl - KISS containers CLI/TUI manager
 MIT License - Copyright (c) 2026 c4ffein
 WARNING: I don't recommand using this as-is. This a PoC, and usable by me because I know what I want to do with it.
 - You can use it if you feel that you can edit the code yourself and you can live with my future breaking changes.
@@ -988,7 +988,7 @@ def cli_shell(args: argparse.Namespace) -> None:
 def usage() -> int:
     """Display usage information"""
     output_lines = [
-        "containerctl - KISS single-file Docker CLI/TUI manager",
+        "containerctl - KISS containers CLI/TUI manager",
         "───────────────────────────────────────────────────────",
         "- containerctl                       ==> launch TUI",
         "- containerctl help                  ==> show this help",
@@ -1027,7 +1027,7 @@ def main() -> None:
         sys.exit(usage())
 
     parser = argparse.ArgumentParser(
-        description="containerctl - Docker CLI/TUI manager",
+        description="containerctl - containers CLI/TUI manager",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         add_help=False,
     )
