@@ -1,18 +1,9 @@
 #!/usr/bin/env python3
 """
-containerctl - A single-file Docker CLI/TUI manager
-Usage:
-    containerctl          # Launch TUI
-    containerctl ps       # List containers
-    containerctl images   # List images
-    containerctl volumes  # List volumes
-    containerctl networks # List networks
-    containerctl start <id>
-    containerctl stop <id>
-    containerctl restart <id>
-    containerctl logs <id>
-    containerctl exec <id> <cmd...>
-    containerctl shell <id>
+containerctl - KISS single-file Docker CLI/TUI manager
+MIT License - Copyright (c) 2026 c4ffein
+WARNING: I don't recommand using this as-is. This a PoC, and usable by me because I know what I want to do with it.
+- You can use it if you feel that you can edit the code yourself and you can live with my future breaking changes.
 """
 
 import argparse
@@ -994,12 +985,51 @@ def cli_shell(args: argparse.Namespace) -> None:
     Docker.shell(args.container, args.shell)
 
 
+def usage() -> int:
+    """Display usage information"""
+    output_lines = [
+        "containerctl - KISS single-file Docker CLI/TUI manager",
+        "───────────────────────────────────────────────────────",
+        "- containerctl                       ==> launch TUI",
+        "- containerctl help                  ==> show this help",
+        "───────────────────────────────────────────────────────",
+        "- containerctl ps                    ==> list containers",
+        "- containerctl ps -q                 ==> list container IDs only",
+        "- containerctl ps -r                 ==> list running containers only",
+        "- containerctl images                ==> list images",
+        "- containerctl images -q             ==> list image IDs only",
+        "- containerctl volumes               ==> list volumes",
+        "- containerctl volumes -q            ==> list volume names only",
+        "- containerctl networks              ==> list networks",
+        "- containerctl networks -q           ==> list network IDs only",
+        "───────────────────────────────────────────────────────",
+        "- containerctl start <id>            ==> start container",
+        "- containerctl stop <id>             ==> stop container",
+        "- containerctl restart <id>          ==> restart container",
+        "───────────────────────────────────────────────────────",
+        "- containerctl logs <id>             ==> show container logs",
+        "- containerctl logs <id> -f          ==> follow container logs",
+        "- containerctl logs <id> -n 100      ==> show last 100 lines",
+        "───────────────────────────────────────────────────────",
+        "- containerctl exec <id> <cmd...>    ==> execute command in container",
+        "- containerctl shell <id>            ==> open shell in container",
+        "- containerctl shell <id> -s /bin/bash ==> open bash in container",
+        "───────────────────────────────────────────────────────",
+    ]
+    print("\n" + "\n".join(output_lines) + "\n")
+    return 0
+
+
 def main() -> None:
     """Main entry point"""
+    # Check for help before argparse
+    if len(sys.argv) > 1 and sys.argv[1] in ("help", "-h", "--help"):
+        sys.exit(usage())
+
     parser = argparse.ArgumentParser(
         description="containerctl - Docker CLI/TUI manager",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Run without arguments to launch the TUI.",
+        add_help=False,
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Commands")
