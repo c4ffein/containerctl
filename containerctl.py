@@ -312,6 +312,86 @@ class Docker:
         except json.JSONDecodeError:
             return None
 
+    @staticmethod
+    def investigate_source(container_id: str) -> dict:
+        """Investigate container source (compose, systemd, devcontainer, etc.)"""
+        result = {"source": "cli", "details": []}
+
+        # Get container info
+        info = Docker.inspect(container_id)
+        if not info:
+            return result
+
+        container_name = info.get("Name", "").lstrip("/")
+        labels = info.get("Config", {}).get("Labels") or {}
+
+        # Check Docker Compose
+        if "com.docker.compose.project" in labels:
+            result["source"] = "docker-compose"
+            result["details"].append(f"Project: {labels.get('com.docker.compose.project')}")
+            result["details"].append(f"Service: {labels.get('com.docker.compose.service')}")
+            if "com.docker.compose.project.working_dir" in labels:
+                result["details"].append(f"Working dir: {labels.get('com.docker.compose.project.working_dir')}")
+            if "com.docker.compose.project.config_files" in labels:
+                for f in labels.get("com.docker.compose.project.config_files", "").split(","):
+                    if f and not f.startswith("/tmp/"):
+                        result["details"].append(f"Config: {f}")
+
+        # Check Devcontainer
+        if "devcontainer.config_file" in labels:
+            result["source"] = "devcontainer"
+            result["details"].append(f"Config: {labels.get('devcontainer.config_file')}")
+            if "devcontainer.local_folder" in labels:
+                result["details"].append(f"Folder: {labels.get('devcontainer.local_folder')}")
+
+        # Check Kubernetes
+        if "io.kubernetes.pod.name" in labels:
+            result["source"] = "kubernetes"
+            result["details"].append(f"Pod: {labels.get('io.kubernetes.pod.name')}")
+            result["details"].append(f"Namespace: {labels.get('io.kubernetes.pod.namespace')}")
+
+        # Check Portainer
+        if "io.portainer.accesscontrol.public" in labels or any(k.startswith("io.portainer") for k in labels):
+            result["source"] = "portainer"
+            result["details"].append("Managed by Portainer")
+
+        # Systemd heuristic scan (only if no other source found)
+        if result["source"] == "cli":
+            systemd_paths = ["/etc/systemd/system", os.path.expanduser("~/.config/systemd/user")]
+            for spath in systemd_paths:
+                if not os.path.isdir(spath):
+                    continue
+                try:
+                    for fname in os.listdir(spath):
+                        if not fname.endswith(".service"):
+                            continue
+                        fpath = os.path.join(spath, fname)
+                        try:
+                            with open(fpath, "r") as f:
+                                content = f.read()
+                                # Look for container name in docker run --name or docker start
+                                if f"--name {container_name}" in content or f"--name={container_name}" in content:
+                                    result["source"] = "systemd"
+                                    result["details"].append(f"Unit: {fpath}")
+                                    break
+                                if f"docker start {container_name}" in content:
+                                    result["source"] = "systemd"
+                                    result["details"].append(f"Unit: {fpath}")
+                                    break
+                        except (IOError, PermissionError):
+                            pass
+                    if result["source"] == "systemd":
+                        break
+                except (IOError, PermissionError):
+                    pass
+
+        # If still cli, add a note
+        if result["source"] == "cli" and not result["details"]:
+            result["details"].append("No managed source detected")
+            result["details"].append("Likely started via: docker run ...")
+
+        return result
+
 
 # =============================================================================
 # Background Data Fetcher
@@ -501,6 +581,36 @@ class UI:
             if key.lower() == 'n' or key == Term.KEY_ENTER or key == Term.KEY_ESC:
                 return False
 
+    @staticmethod
+    def info_box(title: str, lines: list[str], rows: int, cols: int) -> None:
+        """Display an info box modal and wait for keypress to dismiss"""
+        # Calculate box dimensions
+        content_width = max(len(title), max((len(line) for line in lines), default=20)) + 4
+        box_width = min(content_width, cols - 4)
+        box_height = len(lines) + 4
+        start_row = (rows - box_height) // 2
+        start_col = (cols - box_width) // 2
+
+        # Draw box
+        top_border = "┌" + "─" * (box_width - 2) + "┐"
+        bottom_border = "└" + "─" * (box_width - 2) + "┘"
+        empty_line = "│" + " " * (box_width - 2) + "│"
+
+        sys.stdout.write(f"\033[{start_row};{start_col}H" + Term.style(top_border, Term.CYAN))
+        sys.stdout.write(f"\033[{start_row + 1};{start_col}H" + Term.style("│ ", Term.CYAN) + Term.style(title.center(box_width - 4), Term.BOLD) + Term.style(" │", Term.CYAN))
+        sys.stdout.write(f"\033[{start_row + 2};{start_col}H" + Term.style("├" + "─" * (box_width - 2) + "┤", Term.CYAN))
+
+        for i, line in enumerate(lines):
+            display_line = line[:box_width - 4].ljust(box_width - 4)
+            sys.stdout.write(f"\033[{start_row + 3 + i};{start_col}H" + Term.style("│ ", Term.CYAN) + display_line + Term.style(" │", Term.CYAN))
+
+        sys.stdout.write(f"\033[{start_row + 3 + len(lines)};{start_col}H" + Term.style(bottom_border, Term.CYAN))
+        sys.stdout.write(f"\033[{start_row + 4 + len(lines)};{start_col}H" + Term.DIM + "[Press any key to close]".center(box_width) + Term.RESET)
+        sys.stdout.flush()
+
+        # Wait for keypress
+        Term.getch()
+
 
 # =============================================================================
 # Application
@@ -689,7 +799,7 @@ class App:
 
         # Status bar with keybindings
         if self.current().key == "containers":
-            keys = "[s]tart [S]top [r]estart [L]ogs [e]xec [d]elete [q]uit"
+            keys = "[s]tart [S]top [r]estart [L]ogs [e]xec [d]elete [o]rigin [q]uit"
         else:
             keys = "[d]elete [q]uit"
         keys += f"  │  {len(items)} items"
@@ -795,7 +905,14 @@ class App:
                         self.set_message(f"Deleted {name}", Term.GREEN)
                     else:
                         self.set_message(f"Failed to delete {name}", Term.RED)
-                    
+
+            elif key == 'o':  # Origin/source
+                name = self.selected_item().get("Names", container_id[:12])
+                result = Docker.investigate_source(container_id)
+                title = f"Source: {result['source']}"
+                lines = [f"Container: {name}"] + result["details"]
+                UI.info_box(title, lines, rows, cols)
+
         # Image deletion
         elif self.current().key == "images" and key == 'd' and self.selected_id():
             image_id = self.selected_id()
