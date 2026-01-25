@@ -14,9 +14,398 @@ import subprocess
 import sys
 import termios
 import threading
+import time
 import tty
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+
+# =============================================================================
+# Error Registry
+# =============================================================================
+
+_errors: list[dict] = []
+
+
+def log_error(category: str, message: str, context: dict | None = None) -> None:
+    """Log a non-fatal error to the global registry"""
+    _errors.append({
+        "ts": time.time(),
+        "cat": category,
+        "msg": message,
+        "ctx": context or {},
+    })
+
+
+def get_errors() -> list[dict]:
+    """Get all logged errors"""
+    return _errors
+
+
+def get_errors_by_category() -> dict[str, list[dict]]:
+    """Get errors grouped by category"""
+    grouped: dict[str, list[dict]] = {}
+    for err in _errors:
+        cat = err["cat"]
+        if cat not in grouped:
+            grouped[cat] = []
+        grouped[cat].append(err)
+    return grouped
+
+
+def clear_errors(category: str) -> int:
+    """Clear all errors in a category, returns count cleared"""
+    global _errors
+    before = len(_errors)
+    _errors = [e for e in _errors if e["cat"] != category]
+    return before - len(_errors)
+
+
+def fetch_errors() -> list[dict]:
+    """Fetch errors formatted for the TUI tab"""
+    grouped = get_errors_by_category()
+    if not grouped:
+        return [{"Category": "No errors", "Count": "", "Latest": "", "_category": ""}]
+    result = []
+    for cat, errs in sorted(grouped.items()):
+        latest = errs[-1]
+        result.append({
+            "Category": cat,
+            "Count": str(len(errs)),
+            "Latest": latest["msg"][:50],
+            "_category": cat,  # Hidden field for clearing
+        })
+    return result
+
+
+# =============================================================================
+# Docker Data Models
+# =============================================================================
+
+VALID_ID_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+VALID_IMAGE_REF_CHARS = VALID_ID_CHARS + "/:."  # Images can have repo/name:tag and registry.domain
+
+
+def is_valid_id(id_str: str) -> bool:
+    """Check if ID contains only valid characters (a-z, A-Z, 0-9, -, _)"""
+    return all(c in VALID_ID_CHARS for c in id_str)
+
+
+def is_valid_image_ref(ref_str: str) -> bool:
+    """Check if image reference contains only valid characters (allows /, :, . for repo:tag)"""
+    return all(c in VALID_IMAGE_REF_CHARS for c in ref_str)
+
+
+@dataclass
+class Container:
+    """Docker container data model"""
+    ID: str
+    Names: str
+    Image: str
+    Status: str
+    State: str = ""
+    Command: str = ""
+    CreatedAt: str = ""
+    Ports: str = ""
+    Networks: str = ""
+    Mounts: str = ""
+    Labels: str = ""
+    Size: str = ""
+    RunningFor: str = ""
+    LocalVolumes: str = ""
+    Platform: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Container | None":
+        """Create Container from dict, logging errors for missing required fields"""
+        required = ["ID", "Names", "Image", "Status"]
+        missing = [f for f in required if f not in data]
+        if missing:
+            log_error("docker.container_parse", f"Missing fields: {missing}", {"data": str(data)[:200]})
+            return None
+        if not is_valid_id(data["ID"]):
+            log_error("docker.container_parse", f"Invalid ID: {data['ID']}", {"data": str(data)[:200]})
+            return None
+        try:
+            return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+        except TypeError as e:
+            log_error("docker.container_parse", str(e), {"data": str(data)[:200]})
+            return None
+
+    def to_dict(self) -> dict:
+        """Convert to dict for UI compatibility"""
+        return {k: v for k, v in self.__dict__.items() if v is not None}
+
+
+@dataclass
+class Image:
+    """Docker image data model"""
+    ID: str
+    Repository: str
+    Tag: str
+    Size: str
+    CreatedAt: str = ""
+    CreatedSince: str = ""
+    Digest: str = ""
+    Containers: str = ""
+    SharedSize: str = ""
+    UniqueSize: str = ""
+    VirtualSize: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Image | None":
+        """Create Image from dict, logging errors for missing required fields"""
+        required = ["ID", "Repository", "Tag"]
+        missing = [f for f in required if f not in data]
+        if missing:
+            log_error("docker.image_parse", f"Missing fields: {missing}", {"data": str(data)[:200]})
+            return None
+        if not is_valid_id(data["ID"]):
+            log_error("docker.image_parse", f"Invalid ID: {data['ID']}", {"data": str(data)[:200]})
+            return None
+        try:
+            return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+        except TypeError as e:
+            log_error("docker.image_parse", str(e), {"data": str(data)[:200]})
+            return None
+
+    def to_dict(self) -> dict:
+        """Convert to dict for UI compatibility"""
+        return {k: v for k, v in self.__dict__.items() if v is not None}
+
+
+@dataclass
+class Volume:
+    """Docker volume data model"""
+    Name: str
+    Driver: str
+    Mountpoint: str = ""
+    Scope: str = ""
+    Labels: str = ""
+    Size: str = ""
+    Status: str = ""
+    Availability: str = ""
+    Group: str = ""
+    Links: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Volume | None":
+        """Create Volume from dict, logging errors for missing required fields"""
+        required = ["Name", "Driver"]
+        missing = [f for f in required if f not in data]
+        if missing:
+            log_error("docker.volume_parse", f"Missing fields: {missing}", {"data": str(data)[:200]})
+            return None
+        if not is_valid_id(data["Name"]):
+            log_error("docker.volume_parse", f"Invalid Name: {data['Name']}", {"data": str(data)[:200]})
+            return None
+        try:
+            return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+        except TypeError as e:
+            log_error("docker.volume_parse", str(e), {"data": str(data)[:200]})
+            return None
+
+    def to_dict(self) -> dict:
+        """Convert to dict for UI compatibility"""
+        return {k: v for k, v in self.__dict__.items() if v is not None}
+
+
+@dataclass
+class Network:
+    """Docker network data model"""
+    ID: str
+    Name: str
+    Driver: str
+    Scope: str = ""
+    CreatedAt: str = ""
+    Internal: str = ""
+    IPv4: str = ""
+    IPv6: str = ""
+    Labels: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Network | None":
+        """Create Network from dict, logging errors for missing required fields"""
+        required = ["ID", "Name", "Driver"]
+        missing = [f for f in required if f not in data]
+        if missing:
+            log_error("docker.network_parse", f"Missing fields: {missing}", {"data": str(data)[:200]})
+            return None
+        if not is_valid_id(data["ID"]):
+            log_error("docker.network_parse", f"Invalid ID: {data['ID']}", {"data": str(data)[:200]})
+            return None
+        try:
+            return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+        except TypeError as e:
+            log_error("docker.network_parse", str(e), {"data": str(data)[:200]})
+            return None
+
+    def to_dict(self) -> dict:
+        """Convert to dict for UI compatibility"""
+        return {k: v for k, v in self.__dict__.items() if v is not None}
+
+
+# =============================================================================
+# Docker Inspect Data Models
+# =============================================================================
+
+@dataclass
+class ContainerInspect:
+    """Docker container inspect data model (from docker inspect)"""
+    Id: str
+    Name: str
+    Created: str
+    State: dict
+    Image: str
+    Config: dict
+    Path: str = ""
+    Args: list = field(default_factory=list)
+    ResolvConfPath: str = ""
+    HostnamePath: str = ""
+    HostsPath: str = ""
+    LogPath: str = ""
+    RestartCount: int = 0
+    Driver: str = ""
+    Platform: str = ""
+    MountLabel: str = ""
+    ProcessLabel: str = ""
+    AppArmorProfile: str = ""
+    ExecIDs: list | None = None
+    HostConfig: dict = field(default_factory=dict)
+    GraphDriver: dict = field(default_factory=dict)
+    Mounts: list = field(default_factory=list)
+    NetworkSettings: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ContainerInspect | None":
+        """Create ContainerInspect from dict, logging errors for missing required fields"""
+        required = ["Id", "Name", "Created", "State", "Image", "Config"]
+        missing = [f for f in required if f not in data]
+        if missing:
+            log_error("docker.container_inspect_parse", f"Missing fields: {missing}", {"data": str(data)[:200]})
+            return None
+        if not is_valid_id(data["Id"]):
+            log_error("docker.container_inspect_parse", f"Invalid Id: {data['Id']}", {"data": str(data)[:200]})
+            return None
+        try:
+            return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+        except TypeError as e:
+            log_error("docker.container_inspect_parse", str(e), {"data": str(data)[:200]})
+            return None
+
+    @property
+    def labels(self) -> dict:
+        """Get container labels from Config"""
+        return self.Config.get("Labels") or {}
+
+    @property
+    def name_clean(self) -> str:
+        """Get container name without leading slash"""
+        return self.Name.lstrip("/")
+
+
+@dataclass
+class ImageInspect:
+    """Docker image inspect data model (from docker image inspect)"""
+    Id: str
+    Created: str
+    Architecture: str
+    Os: str
+    Size: int
+    RepoTags: list = field(default_factory=list)
+    RepoDigests: list = field(default_factory=list)
+    Parent: str = ""
+    Comment: str = ""
+    DockerVersion: str = ""
+    Author: str = ""
+    Config: dict = field(default_factory=dict)
+    GraphDriver: dict = field(default_factory=dict)
+    RootFS: dict = field(default_factory=dict)
+    Metadata: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ImageInspect | None":
+        """Create ImageInspect from dict, logging errors for missing required fields"""
+        required = ["Id", "Created", "Architecture", "Os", "Size"]
+        missing = [f for f in required if f not in data]
+        if missing:
+            log_error("docker.image_inspect_parse", f"Missing fields: {missing}", {"data": str(data)[:200]})
+            return None
+        if not is_valid_image_ref(data["Id"]):
+            log_error("docker.image_inspect_parse", f"Invalid Id: {data['Id']}", {"data": str(data)[:200]})
+            return None
+        try:
+            return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+        except TypeError as e:
+            log_error("docker.image_inspect_parse", str(e), {"data": str(data)[:200]})
+            return None
+
+
+@dataclass
+class VolumeInspect:
+    """Docker volume inspect data model (from docker volume inspect)"""
+    Name: str
+    Driver: str
+    Mountpoint: str
+    Scope: str
+    CreatedAt: str = ""
+    Labels: dict | None = None
+    Options: dict | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "VolumeInspect | None":
+        """Create VolumeInspect from dict, logging errors for missing required fields"""
+        required = ["Name", "Driver", "Mountpoint", "Scope"]
+        missing = [f for f in required if f not in data]
+        if missing:
+            log_error("docker.volume_inspect_parse", f"Missing fields: {missing}", {"data": str(data)[:200]})
+            return None
+        if not is_valid_id(data["Name"]):
+            log_error("docker.volume_inspect_parse", f"Invalid Name: {data['Name']}", {"data": str(data)[:200]})
+            return None
+        try:
+            return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+        except TypeError as e:
+            log_error("docker.volume_inspect_parse", str(e), {"data": str(data)[:200]})
+            return None
+
+
+@dataclass
+class NetworkInspect:
+    """Docker network inspect data model (from docker network inspect)"""
+    Id: str
+    Name: str
+    Created: str
+    Scope: str
+    Driver: str
+    EnableIPv4: bool = True
+    EnableIPv6: bool = False
+    IPAM: dict = field(default_factory=dict)
+    Internal: bool = False
+    Attachable: bool = False
+    Ingress: bool = False
+    ConfigFrom: dict = field(default_factory=dict)
+    ConfigOnly: bool = False
+    Containers: dict = field(default_factory=dict)
+    Options: dict = field(default_factory=dict)
+    Labels: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "NetworkInspect | None":
+        """Create NetworkInspect from dict, logging errors for missing required fields"""
+        required = ["Id", "Name", "Created", "Scope", "Driver"]
+        missing = [f for f in required if f not in data]
+        if missing:
+            log_error("docker.network_inspect_parse", f"Missing fields: {missing}", {"data": str(data)[:200]})
+            return None
+        if not is_valid_id(data["Id"]):
+            log_error("docker.network_inspect_parse", f"Invalid Id: {data['Id']}", {"data": str(data)[:200]})
+            return None
+        try:
+            return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+        except TypeError as e:
+            log_error("docker.network_inspect_parse", str(e), {"data": str(data)[:200]})
+            return None
 
 
 # =============================================================================
@@ -192,6 +581,10 @@ class Docker:
         """Run docker command and parse JSON output"""
         result = Docker._run(args)
         if result.returncode != 0:
+            log_error("docker.command", f"docker {' '.join(args)}", {
+                "returncode": result.returncode,
+                "stderr": result.stderr.strip() if result.stderr else "",
+            })
             return []
 
         items = []
@@ -199,8 +592,8 @@ class Docker:
             if line:
                 try:
                     items.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
+                except json.JSONDecodeError as e:
+                    log_error("docker.json_parse", str(e), {"line": line[:100]})
         return items
 
     @staticmethod
@@ -209,44 +602,64 @@ class Docker:
         args = ["ps", "--format", "{{json .}}"]
         if all_containers:
             args.insert(1, "-a")
-        return Docker._run_json(args)
+        raw = Docker._run_json(args)
+        # Claude did this, not me - we should directly use these objects in the long-term, but since it works...
+        return [c.to_dict() for c in (Container.from_dict(r) for r in raw) if c is not None]
 
     @staticmethod
     def images() -> list[dict]:
         """List images"""
-        return Docker._run_json(["images", "--format", "{{json .}}"])
+        raw = Docker._run_json(["images", "--format", "{{json .}}"])
+        # Claude did this, not me - we should directly use these objects in the long-term, but since it works...
+        return [i.to_dict() for i in (Image.from_dict(r) for r in raw) if i is not None]
 
     @staticmethod
     def volumes() -> list[dict]:
         """List volumes"""
-        return Docker._run_json(["volume", "ls", "--format", "{{json .}}"])
+        raw = Docker._run_json(["volume", "ls", "--format", "{{json .}}"])
+        # Claude did this, not me - we should directly use these objects in the long-term, but since it works...
+        return [v.to_dict() for v in (Volume.from_dict(r) for r in raw) if v is not None]
 
     @staticmethod
     def networks() -> list[dict]:
         """List networks"""
-        return Docker._run_json(["network", "ls", "--format", "{{json .}}"])
+        raw = Docker._run_json(["network", "ls", "--format", "{{json .}}"])
+        # Claude did this, not me - we should directly use these objects in the long-term, but since it works...
+        return [n.to_dict() for n in (Network.from_dict(r) for r in raw) if n is not None]
 
     @staticmethod
     def start(container_id: str) -> bool:
         """Start a container"""
+        if not is_valid_id(container_id):
+            log_error("docker.invalid_id", f"Invalid container ID: {container_id}")
+            return False
         result = Docker._run(["start", container_id])
         return result.returncode == 0
 
     @staticmethod
     def stop(container_id: str) -> bool:
         """Stop a container"""
+        if not is_valid_id(container_id):
+            log_error("docker.invalid_id", f"Invalid container ID: {container_id}")
+            return False
         result = Docker._run(["stop", container_id])
         return result.returncode == 0
 
     @staticmethod
     def restart(container_id: str) -> bool:
         """Restart a container"""
+        if not is_valid_id(container_id):
+            log_error("docker.invalid_id", f"Invalid container ID: {container_id}")
+            return False
         result = Docker._run(["restart", container_id])
         return result.returncode == 0
 
     @staticmethod
     def remove_container(container_id: str, force: bool = False) -> bool:
         """Remove a container"""
+        if not is_valid_id(container_id):
+            log_error("docker.invalid_id", f"Invalid container ID: {container_id}")
+            return False
         args = ["rm", container_id]
         if force:
             args.insert(1, "-f")
@@ -256,6 +669,9 @@ class Docker:
     @staticmethod
     def remove_image(image_id: str, force: bool = False) -> bool:
         """Remove an image"""
+        if not is_valid_image_ref(image_id):
+            log_error("docker.invalid_id", f"Invalid image ID: {image_id}")
+            return False
         args = ["rmi", image_id]
         if force:
             args.insert(1, "-f")
@@ -265,18 +681,27 @@ class Docker:
     @staticmethod
     def remove_volume(volume_name: str) -> bool:
         """Remove a volume"""
+        if not is_valid_id(volume_name):
+            log_error("docker.invalid_id", f"Invalid volume name: {volume_name}")
+            return False
         result = Docker._run(["volume", "rm", volume_name])
         return result.returncode == 0
 
     @staticmethod
     def remove_network(network_id: str) -> bool:
         """Remove a network"""
+        if not is_valid_id(network_id):
+            log_error("docker.invalid_id", f"Invalid network ID: {network_id}")
+            return False
         result = Docker._run(["network", "rm", network_id])
         return result.returncode == 0
 
     @staticmethod
     def logs(container_id: str, follow: bool = False, tail: int | None = None) -> None:
         """Show container logs (streams to stdout)"""
+        if not is_valid_id(container_id):
+            log_error("docker.invalid_id", f"Invalid container ID: {container_id}")
+            return
         args = ["logs"]
         if follow:
             args.append("-f")
@@ -288,6 +713,9 @@ class Docker:
     @staticmethod
     def exec(container_id: str, command: list[str], interactive: bool = True) -> None:
         """Execute command in container"""
+        if not is_valid_id(container_id):
+            log_error("docker.invalid_id", f"Invalid container ID: {container_id}")
+            return
         args = ["exec"]
         if interactive:
             args.extend(["-it"])
@@ -298,11 +726,14 @@ class Docker:
     @staticmethod
     def shell(container_id: str, shell: str = "/bin/sh") -> None:
         """Open interactive shell in container"""
+        if not is_valid_id(container_id):
+            log_error("docker.invalid_id", f"Invalid container ID: {container_id}")
+            return
         Docker.exec(container_id, [shell], interactive=True)
 
     @staticmethod
-    def inspect(object_id: str) -> dict | None:
-        """Inspect a Docker object"""
+    def _inspect_raw(object_id: str) -> dict | None:
+        """Inspect a Docker object (raw dict output) - caller must validate ID"""
         result = Docker._run(["inspect", object_id])
         if result.returncode != 0:
             return None
@@ -313,17 +744,64 @@ class Docker:
             return None
 
     @staticmethod
+    def inspect_container(container_id: str) -> ContainerInspect | None:
+        """Inspect a container, returning typed ContainerInspect"""
+        if not is_valid_id(container_id):
+            log_error("docker.invalid_id", f"Invalid container ID: {container_id}")
+            return None
+        raw = Docker._inspect_raw(container_id)
+        if not raw:
+            return None
+        return ContainerInspect.from_dict(raw)
+
+    @staticmethod
+    def inspect_image(image_id: str) -> ImageInspect | None:
+        """Inspect an image, returning typed ImageInspect"""
+        if not is_valid_image_ref(image_id):
+            log_error("docker.invalid_id", f"Invalid image ref: {image_id}")
+            return None
+        raw = Docker._inspect_raw(image_id)
+        if not raw:
+            return None
+        return ImageInspect.from_dict(raw)
+
+    @staticmethod
+    def inspect_volume(volume_name: str) -> VolumeInspect | None:
+        """Inspect a volume, returning typed VolumeInspect"""
+        if not is_valid_id(volume_name):
+            log_error("docker.invalid_id", f"Invalid volume name: {volume_name}")
+            return None
+        raw = Docker._inspect_raw(volume_name)
+        if not raw:
+            return None
+        return VolumeInspect.from_dict(raw)
+
+    @staticmethod
+    def inspect_network(network_id: str) -> NetworkInspect | None:
+        """Inspect a network, returning typed NetworkInspect"""
+        if not is_valid_id(network_id):
+            log_error("docker.invalid_id", f"Invalid network ID: {network_id}")
+            return None
+        raw = Docker._inspect_raw(network_id)
+        if not raw:
+            return None
+        return NetworkInspect.from_dict(raw)
+
+    @staticmethod
     def investigate_source(container_id: str) -> dict:
         """Investigate container source (compose, systemd, devcontainer, etc.)"""
+        if not is_valid_id(container_id):
+            log_error("docker.invalid_id", f"Invalid container ID: {container_id}")
+            return {"source": "error", "details": ["Invalid container ID"]}
         result = {"source": "cli", "details": []}
 
         # Get container info
-        info = Docker.inspect(container_id)
+        info = Docker.inspect_container(container_id)
         if not info:
             return result
 
-        container_name = info.get("Name", "").lstrip("/")
-        labels = info.get("Config", {}).get("Labels") or {}
+        container_name = info.name_clean
+        labels = info.labels
 
         # Check Docker Compose
         if "com.docker.compose.project" in labels:
@@ -378,12 +856,12 @@ class Docker:
                                     result["source"] = "systemd"
                                     result["details"].append(f"Unit: {fpath}")
                                     break
-                        except (IOError, PermissionError):
-                            pass
+                        except (IOError, PermissionError) as e:
+                            log_error("source.systemd_read", str(e), {"path": fpath})
                     if result["source"] == "systemd":
                         break
-                except (IOError, PermissionError):
-                    pass
+                except (IOError, PermissionError) as e:
+                    log_error("source.systemd_list", str(e), {"path": spath})
 
         # If still cli, add a note
         if result["source"] == "cli" and not result["details"]:
@@ -478,7 +956,13 @@ class UI:
 
         x = 1
         for i, tab in enumerate(tabs):
-            if i == selected:
+            # Errors tab in red if there are errors
+            if tab.key == "errors" and _errors:
+                if i == selected:
+                    text = Term.style(f" {tab.name} ", Term.BOLD, Term.INVERT, Term.RED)
+                else:
+                    text = Term.style(f" {tab.name} ", Term.RED)
+            elif i == selected:
                 text = Term.style(f" {tab.name} ", Term.BOLD, Term.INVERT)
             else:
                 text = Term.style(f" {tab.name} ", Term.DIM)
@@ -695,6 +1179,18 @@ class App:
                 id_key="ID",
                 actions={},
             ),
+            Tab(
+                name="Errors",
+                key="errors",
+                fetch=fetch_errors,
+                columns=[
+                    ("Category", "CATEGORY", 30),
+                    ("Count", "COUNT", 8),
+                    ("Latest", "LATEST", 0),
+                ],
+                id_key="_category",
+                actions={},
+            ),
         ]
 
     def current(self) -> Tab:
@@ -703,6 +1199,8 @@ class App:
 
     def items(self) -> list[dict]:
         """Get items for current tab from cache"""
+        if self.current().key == "errors":
+            return fetch_errors()
         return self.fetcher.get(self.current().key)
 
     def selected_item(self) -> dict | None:
@@ -800,6 +1298,8 @@ class App:
         # Status bar with keybindings
         if self.current().key == "containers":
             keys = "[s]tart [S]top [r]estart [L]ogs [e]xec [d]elete [o]rigin [q]uit"
+        elif self.current().key == "errors":
+            keys = "[c]lear [q]uit"
         else:
             keys = "[d]elete [q]uit"
         keys += f"  │  {len(items)} items"
@@ -858,7 +1358,7 @@ class App:
             self.scroll_offset = 0
 
         # Number keys for tabs
-        elif key in '1234':
+        elif key in '12345':
             idx = int(key) - 1
             if idx < len(self.tabs):
                 self.current_tab = idx
@@ -946,7 +1446,15 @@ class App:
                     self.set_message(f"Deleted {name}", Term.GREEN)
                 else:
                     self.set_message(f"Failed to delete {name}", Term.RED)
-                
+
+        # Error clearing
+        elif self.current().key == "errors" and key == 'c' and self.selected_id():
+            category = self.selected_id()
+            if category:  # Not the "No errors" placeholder
+                if UI.confirm(f"Clear all '{category}' errors?", rows - 1):
+                    count = clear_errors(category)
+                    self.set_message(f"Cleared {count} errors from {category}", Term.GREEN)
+
     def enter_tui(self) -> None:
         """Enter TUI mode"""
         print(Term.ALT_SCREEN + Term.HIDE_CURSOR, end="", flush=True)
@@ -1214,6 +1722,9 @@ def main() -> None:
     else:
         # Run CLI command
         args.func(args)
+        # Output errors to stderr as JSON if any
+        if _errors:
+            sys.stderr.write(json.dumps({"errors": _errors}, indent=2) + "\n")
 
 
 if __name__ == "__main__":
