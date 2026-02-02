@@ -17,8 +17,7 @@ import threading
 import time
 import tty
 from dataclasses import dataclass, field
-from typing import Any, Callable
-
+from typing import Callable
 
 # =============================================================================
 # Error Registry
@@ -29,12 +28,14 @@ _errors: list[dict] = []
 
 def log_error(category: str, message: str, context: dict | None = None) -> None:
     """Log a non-fatal error to the global registry"""
-    _errors.append({
-        "ts": time.time(),
-        "cat": category,
-        "msg": message,
-        "ctx": context or {},
-    })
+    _errors.append(
+        {
+            "ts": time.time(),
+            "cat": category,
+            "msg": message,
+            "ctx": context or {},
+        }
+    )
 
 
 def get_errors() -> list[dict]:
@@ -69,12 +70,14 @@ def fetch_errors() -> list[dict]:
     result = []
     for cat, errs in sorted(grouped.items()):
         latest = errs[-1]
-        result.append({
-            "Category": cat,
-            "Count": str(len(errs)),
-            "Latest": latest["msg"][:50],
-            "_category": cat,  # Hidden field for clearing
-        })
+        result.append(
+            {
+                "Category": cat,
+                "Count": str(len(errs)),
+                "Latest": latest["msg"][:50],
+                "_category": cat,  # Hidden field for clearing
+            }
+        )
     return result
 
 
@@ -99,6 +102,7 @@ def is_valid_image_ref(ref_str: str) -> bool:
 @dataclass
 class Container:
     """Docker container data model"""
+
     ID: str
     Names: str
     Image: str
@@ -140,6 +144,7 @@ class Container:
 @dataclass
 class Image:
     """Docker image data model"""
+
     ID: str
     Repository: str
     Tag: str
@@ -177,6 +182,7 @@ class Image:
 @dataclass
 class Volume:
     """Docker volume data model"""
+
     Name: str
     Driver: str
     Mountpoint: str = ""
@@ -213,6 +219,7 @@ class Volume:
 @dataclass
 class Network:
     """Docker network data model"""
+
     ID: str
     Name: str
     Driver: str
@@ -249,9 +256,11 @@ class Network:
 # Docker Inspect Data Models
 # =============================================================================
 
+
 @dataclass
 class ContainerInspect:
     """Docker container inspect data model (from docker inspect)"""
+
     Id: str
     Name: str
     Created: str
@@ -307,6 +316,7 @@ class ContainerInspect:
 @dataclass
 class ImageInspect:
     """Docker image inspect data model (from docker image inspect)"""
+
     Id: str
     Created: str
     Architecture: str
@@ -344,6 +354,7 @@ class ImageInspect:
 @dataclass
 class VolumeInspect:
     """Docker volume inspect data model (from docker volume inspect)"""
+
     Name: str
     Driver: str
     Mountpoint: str
@@ -373,6 +384,7 @@ class VolumeInspect:
 @dataclass
 class NetworkInspect:
     """Docker network inspect data model (from docker network inspect)"""
+
     Id: str
     Name: str
     Created: str
@@ -411,6 +423,7 @@ class NetworkInspect:
 # =============================================================================
 # Terminal Primitives
 # =============================================================================
+
 
 class Term:
     """ANSI escape code utilities for terminal manipulation"""
@@ -507,12 +520,13 @@ class Term:
             tty.setraw(fd)
             ch = sys.stdin.read(1)
             # Handle escape sequences
-            if ch == '\x1b':
+            if ch == "\x1b":
                 # Try to read more characters for escape sequences
                 import select
+
                 if select.select([sys.stdin], [], [], 0.1)[0]:
                     ch += sys.stdin.read(1)
-                    if ch[-1] == '[':
+                    if ch[-1] == "[":
                         if select.select([sys.stdin], [], [], 0.1)[0]:
                             ch += sys.stdin.read(1)
             return ch
@@ -563,6 +577,7 @@ class Screen:
 # Docker Backend
 # =============================================================================
 
+
 class Docker:
     """Docker CLI wrapper using subprocess"""
 
@@ -581,14 +596,18 @@ class Docker:
         """Run docker command and parse JSON output"""
         result = Docker._run(args)
         if result.returncode != 0:
-            log_error("docker.command", f"docker {' '.join(args)}", {
-                "returncode": result.returncode,
-                "stderr": result.stderr.strip() if result.stderr else "",
-            })
+            log_error(
+                "docker.command",
+                f"docker {' '.join(args)}",
+                {
+                    "returncode": result.returncode,
+                    "stderr": result.stderr.strip() if result.stderr else "",
+                },
+            )
             return []
 
         items = []
-        for line in result.stdout.strip().split('\n'):
+        for line in result.stdout.strip().split("\n"):
             if line:
                 try:
                     items.append(json.loads(line))
@@ -875,6 +894,7 @@ class Docker:
 # Background Data Fetcher
 # =============================================================================
 
+
 class DataFetcher:
     """Background thread that fetches Docker data every N seconds"""
 
@@ -934,9 +954,11 @@ class DataFetcher:
 # UI Components
 # =============================================================================
 
+
 @dataclass
 class Tab:
     """Tab definition"""
+
     name: str
     key: str
     fetch: Callable[[], list[dict]]
@@ -1001,7 +1023,7 @@ class UI:
         row: int,
         width: int,
         selected: bool,
-        status_colors: dict[str, str] | None = None
+        status_colors: dict[str, str] | None = None,
     ) -> None:
         """Render a single list row"""
         scr.move(row, 1)
@@ -1060,9 +1082,9 @@ class UI:
 
         while True:
             key = Term.getch()
-            if key.lower() == 'y':
+            if key.lower() == "y":
                 return True
-            if key.lower() == 'n' or key == Term.KEY_ENTER or key == Term.KEY_ESC:
+            if key.lower() == "n" or key == Term.KEY_ENTER or key == Term.KEY_ESC:
                 return False
 
     @staticmethod
@@ -1078,18 +1100,34 @@ class UI:
         # Draw box
         top_border = "┌" + "─" * (box_width - 2) + "┐"
         bottom_border = "└" + "─" * (box_width - 2) + "┘"
-        empty_line = "│" + " " * (box_width - 2) + "│"
 
         sys.stdout.write(f"\033[{start_row};{start_col}H" + Term.style(top_border, Term.CYAN))
-        sys.stdout.write(f"\033[{start_row + 1};{start_col}H" + Term.style("│ ", Term.CYAN) + Term.style(title.center(box_width - 4), Term.BOLD) + Term.style(" │", Term.CYAN))
-        sys.stdout.write(f"\033[{start_row + 2};{start_col}H" + Term.style("├" + "─" * (box_width - 2) + "┤", Term.CYAN))
+        sys.stdout.write(
+            f"\033[{start_row + 1};{start_col}H"
+            + Term.style("│ ", Term.CYAN)
+            + Term.style(title.center(box_width - 4), Term.BOLD)
+            + Term.style(" │", Term.CYAN)
+        )
+        sys.stdout.write(
+            f"\033[{start_row + 2};{start_col}H" + Term.style("├" + "─" * (box_width - 2) + "┤", Term.CYAN)
+        )
 
         for i, line in enumerate(lines):
-            display_line = line[:box_width - 4].ljust(box_width - 4)
-            sys.stdout.write(f"\033[{start_row + 3 + i};{start_col}H" + Term.style("│ ", Term.CYAN) + display_line + Term.style(" │", Term.CYAN))
+            display_line = line[: box_width - 4].ljust(box_width - 4)
+            sys.stdout.write(
+                f"\033[{start_row + 3 + i};{start_col}H"
+                + Term.style("│ ", Term.CYAN)
+                + display_line
+                + Term.style(" │", Term.CYAN)
+            )
 
         sys.stdout.write(f"\033[{start_row + 3 + len(lines)};{start_col}H" + Term.style(bottom_border, Term.CYAN))
-        sys.stdout.write(f"\033[{start_row + 4 + len(lines)};{start_col}H" + Term.DIM + "[Press any key to close]".center(box_width) + Term.RESET)
+        sys.stdout.write(
+            f"\033[{start_row + 4 + len(lines)};{start_col}H"
+            + Term.DIM
+            + "[Press any key to close]".center(box_width)
+            + Term.RESET
+        )
         sys.stdout.flush()
 
         # Wait for keypress
@@ -1099,6 +1137,7 @@ class UI:
 # =============================================================================
 # Application
 # =============================================================================
+
 
 class App:
     """Main TUI application"""
@@ -1253,7 +1292,7 @@ class App:
         UI.list_header(scr, self.current(), header_row, cols)
 
         # List items
-        visible_items = items[self.scroll_offset:self.scroll_offset + list_height]
+        visible_items = items[self.scroll_offset : self.scroll_offset + list_height]
         for i, item in enumerate(visible_items):
             actual_index = self.scroll_offset + i
             is_selected = actual_index == self.selected_index
@@ -1317,48 +1356,48 @@ class App:
         self.message_text = ""
 
         # Quit (check first, before any other handlers)
-        if key == 'q':
+        if key == "q":
             self.running = False
             return
 
         # Navigation (jikl: j=left, i=up, k=down, l=right)
         items = self.items()
 
-        if key in ('k', Term.KEY_DOWN):
+        if key in ("k", Term.KEY_DOWN):
             if self.selected_index < len(items) - 1:
                 self.selected_index += 1
                 # Scroll down if needed
                 if self.selected_index >= self.scroll_offset + list_height:
                     self.scroll_offset += 1
 
-        elif key in ('i', Term.KEY_UP):
+        elif key in ("i", Term.KEY_UP):
             if self.selected_index > 0:
                 self.selected_index -= 1
                 # Scroll up if needed
                 if self.selected_index < self.scroll_offset:
                     self.scroll_offset = self.selected_index
 
-        elif key == 'g':  # Go to top
+        elif key == "g":  # Go to top
             self.selected_index = 0
             self.scroll_offset = 0
 
-        elif key == 'G':  # Go to bottom
+        elif key == "G":  # Go to bottom
             self.selected_index = max(0, len(items) - 1)
             self.scroll_offset = max(0, len(items) - list_height)
 
         # Tab switching (no refresh needed - background thread handles it)
-        elif key == Term.KEY_TAB or key == 'l' or key == Term.KEY_RIGHT:
+        elif key == Term.KEY_TAB or key == "l" or key == Term.KEY_RIGHT:
             self.current_tab = (self.current_tab + 1) % len(self.tabs)
             self.selected_index = 0
             self.scroll_offset = 0
 
-        elif key == 'j' or key == Term.KEY_LEFT:
+        elif key == "j" or key == Term.KEY_LEFT:
             self.current_tab = (self.current_tab - 1) % len(self.tabs)
             self.selected_index = 0
             self.scroll_offset = 0
 
         # Number keys for tabs
-        elif key in '12345':
+        elif key in "12345":
             idx = int(key) - 1
             if idx < len(self.tabs):
                 self.current_tab = idx
@@ -1369,36 +1408,36 @@ class App:
         elif self.current().key == "containers" and self.selected_id():
             container_id = self.selected_id()
 
-            if key == 's':  # Start
+            if key == "s":  # Start
                 if Docker.start(container_id):
                     self.set_message(f"Started {container_id[:12]}", Term.GREEN)
                 else:
                     self.set_message(f"Failed to start {container_id[:12]}", Term.RED)
-                
-            elif key == 'S':  # Stop
+
+            elif key == "S":  # Stop
                 if Docker.stop(container_id):
                     self.set_message(f"Stopped {container_id[:12]}", Term.GREEN)
                 else:
                     self.set_message(f"Failed to stop {container_id[:12]}", Term.RED)
-                
-            elif key == 'r':  # Restart
+
+            elif key == "r":  # Restart
                 if Docker.restart(container_id):
                     self.set_message(f"Restarted {container_id[:12]}", Term.GREEN)
                 else:
                     self.set_message(f"Failed to restart {container_id[:12]}", Term.RED)
-                
-            elif key == 'L':  # Logs
+
+            elif key == "L":  # Logs
                 self.exit_tui_temporarily()
                 Docker.logs(container_id, tail=100)
                 input("\nPress Enter to return...")
                 self.enter_tui()
 
-            elif key == 'e':  # Exec
+            elif key == "e":  # Exec
                 self.exit_tui_temporarily()
                 Docker.shell(container_id)
                 self.enter_tui()
-                
-            elif key == 'd':  # Delete
+
+            elif key == "d":  # Delete
                 name = self.selected_item().get("Names", container_id[:12])
                 if UI.confirm(f"Delete container '{name}'?", rows - 1):
                     if Docker.remove_container(container_id, force=True):
@@ -1406,7 +1445,7 @@ class App:
                     else:
                         self.set_message(f"Failed to delete {name}", Term.RED)
 
-            elif key == 'o':  # Origin/source
+            elif key == "o":  # Origin/source
                 name = self.selected_item().get("Names", container_id[:12])
                 result = Docker.investigate_source(container_id)
                 title = f"Source: {result['source']}"
@@ -1414,7 +1453,7 @@ class App:
                 UI.info_box(title, lines, rows, cols)
 
         # Image deletion
-        elif self.current().key == "images" and key == 'd' and self.selected_id():
+        elif self.current().key == "images" and key == "d" and self.selected_id():
             image_id = self.selected_id()
             repo = self.selected_item().get("Repository", image_id[:12])
             tag = self.selected_item().get("Tag", "")
@@ -1425,9 +1464,9 @@ class App:
                     self.set_message(f"Deleted {name}", Term.GREEN)
                 else:
                     self.set_message(f"Failed to delete {name}", Term.RED)
-                
+
         # Volume deletion
-        elif self.current().key == "volumes" and key == 'd' and self.selected_id():
+        elif self.current().key == "volumes" and key == "d" and self.selected_id():
             volume_name = self.selected_id()
 
             if UI.confirm(f"Delete volume '{volume_name}'?", rows - 1):
@@ -1435,9 +1474,9 @@ class App:
                     self.set_message(f"Deleted {volume_name}", Term.GREEN)
                 else:
                     self.set_message(f"Failed to delete {volume_name}", Term.RED)
-                
+
         # Network deletion
-        elif self.current().key == "networks" and key == 'd' and self.selected_id():
+        elif self.current().key == "networks" and key == "d" and self.selected_id():
             network_id = self.selected_id()
             name = self.selected_item().get("Name", network_id[:12])
 
@@ -1448,7 +1487,7 @@ class App:
                     self.set_message(f"Failed to delete {name}", Term.RED)
 
         # Error clearing
-        elif self.current().key == "errors" and key == 'c' and self.selected_id():
+        elif self.current().key == "errors" and key == "c" and self.selected_id():
             category = self.selected_id()
             if category:  # Not the "No errors" placeholder
                 if UI.confirm(f"Clear all '{category}' errors?", rows - 1):
@@ -1469,6 +1508,7 @@ class App:
 
     def run(self) -> None:
         """Main TUI loop"""
+
         # Set up signal handler for window resize
         def handle_resize(signum, frame):
             self.render()
@@ -1492,6 +1532,7 @@ class App:
 # =============================================================================
 # CLI
 # =============================================================================
+
 
 def cli_ps(args: argparse.Namespace) -> None:
     """List containers"""
