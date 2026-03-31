@@ -92,6 +92,7 @@ VALID_ID_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
 VALID_IMAGE_REF_CHARS = VALID_ID_CHARS + "/:."  # Images can have repo/name:tag and registry.domain
 VALID_PATH_CHARS = VALID_ID_CHARS + "/:.~+ "  # Paths can have slashes, dots, tildes, etc.
 VALID_REPO_URL_CHARS = VALID_ID_CHARS + "/:@."  # Git URLs: git@github.com:user/repo.git or https://...
+VALID_PORT_SPEC_CHARS = "0123456789:-/udptcp"  # Port specs: 8080:80, 8080:80/tcp, 4000-5000:4000-5000
 
 
 def is_valid_id(id_str: str) -> bool:
@@ -445,10 +446,13 @@ class NetworkInspect:
 # =============================================================================
 
 PROJECTS_DIR = Path.home() / ".config" / "containerctl" / "projects"
+SERVICES_DIR = Path.home() / ".config" / "containerctl" / "services"
 CONTAINER_PREFIX = "cctl-"
+SERVICE_PREFIX = "cctl-svc-"
 NETWORK_PREFIX = "cctl-net-"
 LABEL_PROJECT = "cctl.project"
 LABEL_REPO = "cctl.repo"
+LABEL_SERVICE = "cctl.service"
 
 
 @dataclass
@@ -541,6 +545,101 @@ def load_projects() -> dict[str, ProjectConfig]:
         if project:
             projects[project.name] = project
     return projects
+
+
+VALID_RESTART_POLICIES = {"no", "always", "unless-stopped", "on-failure"}
+VALID_VOLUME_SUFFIX = {"ro", "rw"}
+
+
+@dataclass
+class ServiceConfig:
+    """Service configuration loaded from TOML"""
+
+    name: str
+    image: str
+    restart: str = "unless-stopped"
+    ports: list[str] = field(default_factory=list)
+    volumes: list[str] = field(default_factory=list)
+
+    @property
+    def container_name(self) -> str:
+        return f"{SERVICE_PREFIX}{self.name}"
+
+    @classmethod
+    def from_toml(cls, path: Path) -> "ServiceConfig | None":
+        """Load service config from a TOML file"""
+        try:
+            with open(path, "rb") as f:
+                data = tomllib.load(f)
+        except (OSError, tomllib.TOMLDecodeError) as e:
+            log_error("service.config", f"Failed to load {path}: {e}")
+            return None
+
+        name = path.stem
+        if not is_valid_id(name):
+            log_error("service.config", f"Invalid service name '{name}': must be a-zA-Z0-9-_")
+            return None
+
+        image = data.get("image", "")
+        if not image:
+            log_error("service.config", f"Missing 'image' in {path}")
+            return None
+        if not is_valid_image_ref(image):
+            log_error("service.config", f"Invalid image ref '{image}' in {path}")
+            return None
+
+        restart = data.get("restart", "unless-stopped")
+        if restart not in VALID_RESTART_POLICIES:
+            log_error("service.config", f"Invalid restart policy '{restart}' in {path}")
+            return None
+
+        ports = []
+        for p in data.get("ports", []):
+            if not isinstance(p, str) or not all(c in VALID_PORT_SPEC_CHARS for c in p):
+                log_error("service.config", f"Invalid port spec '{p}' in {path}")
+                return None
+            ports.append(p)
+
+        volumes = []
+        for v in data.get("volumes", []):
+            if not isinstance(v, str):
+                log_error("service.config", f"Invalid volume '{v}' in {path}")
+                return None
+            # Split volume spec: host:container or host:container:mode
+            parts = v.split(":")
+            if len(parts) < 2 or len(parts) > 3:
+                log_error("service.config", f"Invalid volume spec '{v}' in {path}")
+                return None
+            host_path = str(Path(parts[0]).expanduser())
+            if not is_valid_path(host_path):
+                log_error("service.config", f"Invalid volume host path '{parts[0]}' in {path}")
+                return None
+            if len(parts) == 3 and parts[2] not in VALID_VOLUME_SUFFIX:
+                log_error("service.config", f"Invalid volume mode '{parts[2]}' in {path}")
+                return None
+            # Rebuild with expanded host path
+            expanded = f"{host_path}:{':'.join(parts[1:])}"
+            volumes.append(expanded)
+
+        return cls(
+            name=name,
+            image=image,
+            restart=restart,
+            ports=ports,
+            volumes=volumes,
+        )
+
+
+def load_services() -> dict[str, ServiceConfig]:
+    """Load all service configs from ~/.config/containerctl/services/"""
+    services: dict[str, ServiceConfig] = {}
+    if not SERVICES_DIR.is_dir():
+        return services
+    for path in sorted(SERVICES_DIR.glob("*.toml")):
+        service = ServiceConfig.from_toml(path)
+        if service:
+            services[service.name] = service
+    return services
 
 
 # =============================================================================
@@ -1202,6 +1301,78 @@ class Docker:
         Docker.remove_network(network_name)
         return True
 
+    @staticmethod
+    def find_service_container(service_name: str) -> dict | None:
+        """Find a container belonging to a service by its cctl-svc- name"""
+        container_name = f"{SERVICE_PREFIX}{service_name}"
+        containers = Docker.containers(all_containers=True)
+        for c in containers:
+            if c.get("Names") == container_name:
+                return c
+        return None
+
+    @staticmethod
+    def create_service_container(service: "ServiceConfig") -> bool:
+        """Create and start a container for a service"""
+        args = [
+            "run",
+            "-d",
+            "--name",
+            service.container_name,
+            "--restart",
+            service.restart,
+            "--label",
+            f"{LABEL_SERVICE}={service.name}",
+        ]
+        for port in service.ports:
+            args.extend(["-p", port])
+        for vol in service.volumes:
+            args.extend(["-v", vol])
+        args.append(service.image)
+        result = Docker._run(args)
+        if result.returncode != 0:
+            log_error(
+                "service.create",
+                f"Failed to create container: {result.stderr.strip()}",
+            )
+            return False
+        return True
+
+    @staticmethod
+    def service_up(service: "ServiceConfig") -> bool:
+        """Bring a service up: create if missing, start if stopped"""
+        container = Docker.find_service_container(service.name)
+        if container is None:
+            print(f"Creating service {service.container_name}...")
+            return Docker.create_service_container(service)
+        state = container.get("State", "").lower()
+        if state != "running":
+            print(f"Starting {service.container_name}...")
+            return Docker.start(service.container_name)
+        print(f"Service {service.container_name} is already running")
+        return True
+
+    @staticmethod
+    def service_down(service: "ServiceConfig") -> bool:
+        """Stop and remove a service container"""
+        container = Docker.find_service_container(service.name)
+        if container is None:
+            print(f"No container found for service {service.name}")
+            return False
+        print(f"Removing {service.container_name}...")
+        return Docker.remove_container(service.container_name, force=True)
+
+    @staticmethod
+    def service_recreate(service: "ServiceConfig") -> bool:
+        """Recreate a service container (down + up)"""
+        container = Docker.find_service_container(service.name)
+        if container is not None:
+            print(f"Removing {service.container_name}...")
+            if not Docker.remove_container(service.container_name, force=True):
+                return False
+        print(f"Creating {service.container_name}...")
+        return Docker.create_service_container(service)
+
 
 # =============================================================================
 # Background Data Fetcher
@@ -1220,6 +1391,7 @@ class DataFetcher:
             "volumes": [],
             "networks": [],
             "projects": [],
+            "services": [],
         }
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -1277,12 +1449,35 @@ class DataFetcher:
                 }
             )
 
+        # Build services list
+        services_config = load_services()
+        services_data = []
+        for name, service in services_config.items():
+            container = None
+            for c in containers:
+                if c.get("Names") == service.container_name:
+                    container = c
+                    break
+            status = container.get("State", container.get("Status", "unknown")) if container else "not created"
+            ports_str = ", ".join(service.ports[:3])
+            if len(service.ports) > 3:
+                ports_str += f" +{len(service.ports) - 3}"
+            services_data.append(
+                {
+                    "Name": name,
+                    "Status": status,
+                    "Image": service.image,
+                    "Ports": ports_str,
+                }
+            )
+
         with self.lock:
             self.data["containers"] = containers
             self.data["images"] = images
             self.data["volumes"] = volumes
             self.data["networks"] = networks
             self.data["projects"] = projects_data
+            self.data["services"] = services_data
 
     def _run(self) -> None:
         """Background thread loop"""
@@ -1580,6 +1775,19 @@ class App:
                 actions={},
             ),
             Tab(
+                name="Services",
+                key="services",
+                fetch=lambda: [],  # Fetched by DataFetcher
+                columns=[
+                    ("Name", "SERVICE", 20),
+                    ("Status", "STATUS", 15),
+                    ("Image", "IMAGE", 30),
+                    ("Ports", "PORTS", 0),
+                ],
+                id_key="Name",
+                actions={},
+            ),
+            Tab(
                 name="Errors",
                 key="errors",
                 fetch=fetch_errors,
@@ -1609,6 +1817,15 @@ class App:
                     "Status": "",
                     "Image": "",
                     "Repo": f"Add TOML to {PROJECTS_DIR}/",
+                }
+            ]
+        if self.current().key == "services" and not data:
+            return [
+                {
+                    "Name": "No services configured",
+                    "Status": "",
+                    "Image": "",
+                    "Ports": f"Add TOML to {SERVICES_DIR}/",
                 }
             ]
         return data
@@ -1674,6 +1891,8 @@ class App:
                 status_colors = self.container_status_colors
             elif self.current().key == "projects":
                 status_colors = self.project_status_colors
+            elif self.current().key == "services":
+                status_colors = self.project_status_colors
 
             UI.list_row(
                 scr,
@@ -1712,6 +1931,8 @@ class App:
             keys = "[s]tart [S]top [r]estart [L]ogs [e]xec [d]elete [o]rigin [q]uit"
         elif self.current().key == "projects":
             keys = "[e]nter [d]estroy [q]uit"
+        elif self.current().key == "services":
+            keys = "[u]p [d]own [r]ecreate [q]uit"
         elif self.current().key == "networks":
             keys = "[e]dit [d]elete [q]uit"
         elif self.current().key == "errors":
@@ -1774,7 +1995,7 @@ class App:
             self.scroll_offset = 0
 
         # Number keys for tabs
-        elif key in "123456":
+        elif key in "1234567":
             idx = int(key) - 1
             if idx < len(self.tabs):
                 self.current_tab = idx
@@ -1896,6 +2117,38 @@ class App:
                             self.set_message(f"Failed to destroy {project_name}", Term.RED)
                 else:
                     self.set_message(f"No container for {project_name}", Term.YELLOW)
+
+        # Service actions
+        elif self.current().key == "services" and self.selected_id():
+            service_name = self.selected_id()
+            services = load_services()
+            service = services.get(service_name)
+
+            if service and key == "u":  # Up
+                self.exit_tui_temporarily()
+                Docker.service_up(service)
+                input("\nPress Enter to return...")
+                self.enter_tui()
+
+            elif service and key == "d":  # Down
+                if Docker.find_service_container(service_name):
+                    if UI.confirm(f"Stop service '{service_name}'?", rows - 1):
+                        if Docker.service_down(service):
+                            self.set_message(f"Stopped {service_name}", Term.GREEN)
+                        else:
+                            self.set_message(f"Failed to stop {service_name}", Term.RED)
+                else:
+                    self.set_message(f"No container for {service_name}", Term.YELLOW)
+
+            elif service and key == "r":  # Recreate
+                if UI.confirm(f"Recreate service '{service_name}'?", rows - 1):
+                    self.exit_tui_temporarily()
+                    if Docker.service_recreate(service):
+                        print(f"Recreated {service_name}")
+                    else:
+                        print(f"Failed to recreate {service_name}")
+                    input("\nPress Enter to return...")
+                    self.enter_tui()
 
         # Error clearing
         elif self.current().key == "errors" and key == "c" and self.selected_id():
@@ -2117,6 +2370,63 @@ def cli_projects(args: argparse.Namespace) -> None:
         print(f"{name:<20} {status:<15} {project.image:<30} {repo}")
 
 
+def cli_service_up(args: argparse.Namespace) -> None:
+    """Bring a service up"""
+    services = load_services()
+    if args.service not in services:
+        print(f"Unknown service: {args.service}", file=sys.stderr)
+        print(
+            f"Available services: {', '.join(services.keys()) or 'none'}",
+            file=sys.stderr,
+        )
+        print(f"Add service configs to {SERVICES_DIR}/", file=sys.stderr)
+        sys.exit(1)
+    if not Docker.service_up(services[args.service]):
+        sys.exit(1)
+
+
+def cli_service_down(args: argparse.Namespace) -> None:
+    """Bring a service down"""
+    services = load_services()
+    if args.service not in services:
+        print(f"Unknown service: {args.service}", file=sys.stderr)
+        sys.exit(1)
+    if not Docker.service_down(services[args.service]):
+        sys.exit(1)
+
+
+def cli_service_recreate(args: argparse.Namespace) -> None:
+    """Recreate a service"""
+    services = load_services()
+    if args.service not in services:
+        print(f"Unknown service: {args.service}", file=sys.stderr)
+        sys.exit(1)
+    if not Docker.service_recreate(services[args.service]):
+        sys.exit(1)
+    print(f"Recreated {args.service}")
+
+
+def cli_services(args: argparse.Namespace) -> None:
+    """List configured services and their container status"""
+    services = load_services()
+    if not services:
+        print(f"No services configured. Add TOML files to {SERVICES_DIR}/")
+        return
+
+    print(f"{'SERVICE':<20} {'STATUS':<15} {'IMAGE':<30} {'PORTS'}")
+    print("-" * 90)
+    for name, service in services.items():
+        container = Docker.find_service_container(name)
+        if container:
+            status = container.get("State", container.get("Status", "unknown"))
+        else:
+            status = "not created"
+        ports = ", ".join(service.ports[:3])
+        if len(service.ports) > 3:
+            ports += f" +{len(service.ports) - 3}"
+        print(f"{name:<20} {status:<15} {service.image:<30} {ports}")
+
+
 def usage() -> int:
     """Display usage information"""
     output_lines = [
@@ -2152,7 +2462,13 @@ def usage() -> int:
         "- containerctl destroy <project>        ==> stop and remove project container",
         "- containerctl projects                 ==> list configured projects",
         "──────────────────────────────────────────────",
+        "- containerctl service up <name>        ==> create/start a service",
+        "- containerctl service down <name>      ==> stop and remove a service",
+        "- containerctl service recreate <name>  ==> recreate a service",
+        "- containerctl services                 ==> list configured services",
+        "──────────────────────────────────────────────",
         f"Project configs: {PROJECTS_DIR}/<name>.toml",
+        f"Service configs: {SERVICES_DIR}/<name>.toml",
     ]
     print("\n" + "\n".join(output_lines) + "\n")
     return 0
@@ -2246,12 +2562,34 @@ def main() -> None:
     projects_parser = subparsers.add_parser("projects", help="List configured projects")
     projects_parser.set_defaults(func=cli_projects)
 
+    # service (with sub-subcommands)
+    service_parser = subparsers.add_parser("service", help="Manage services")
+    service_sub = service_parser.add_subparsers(dest="service_command")
+
+    svc_up = service_sub.add_parser("up", help="Create/start a service")
+    svc_up.add_argument("service", help="Service name")
+    svc_up.set_defaults(func=cli_service_up)
+
+    svc_down = service_sub.add_parser("down", help="Stop and remove a service")
+    svc_down.add_argument("service", help="Service name")
+    svc_down.set_defaults(func=cli_service_down)
+
+    svc_recreate = service_sub.add_parser("recreate", help="Recreate a service")
+    svc_recreate.add_argument("service", help="Service name")
+    svc_recreate.set_defaults(func=cli_service_recreate)
+
+    # services (list)
+    services_parser = subparsers.add_parser("services", help="List configured services")
+    services_parser.set_defaults(func=cli_services)
+
     args = parser.parse_args()
 
     if args.command is None:
         # No command - launch TUI
         app = App()
         app.run()
+    elif args.command == "service" and not hasattr(args, "func"):
+        service_parser.print_help()
     else:
         # Run CLI command
         args.func(args)
