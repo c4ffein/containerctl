@@ -15,8 +15,10 @@ import sys
 import termios
 import threading
 import time
+import tomllib
 import tty
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
 # =============================================================================
@@ -87,6 +89,8 @@ def fetch_errors() -> list[dict]:
 
 VALID_ID_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
 VALID_IMAGE_REF_CHARS = VALID_ID_CHARS + "/:."  # Images can have repo/name:tag and registry.domain
+VALID_PATH_CHARS = VALID_ID_CHARS + "/:.~+ "  # Paths can have slashes, dots, tildes, etc.
+VALID_REPO_URL_CHARS = VALID_ID_CHARS + "/:@."  # Git URLs: git@github.com:user/repo.git or https://...
 
 
 def is_valid_id(id_str: str) -> bool:
@@ -97,6 +101,21 @@ def is_valid_id(id_str: str) -> bool:
 def is_valid_image_ref(ref_str: str) -> bool:
     """Check if image reference contains only valid characters (allows /, :, . for repo:tag)"""
     return all(c in VALID_IMAGE_REF_CHARS for c in ref_str)
+
+
+def has_path_traversal(path_str: str) -> bool:
+    """Check if a path contains '..' components"""
+    return ".." in path_str.split("/")
+
+
+def is_valid_path(path_str: str) -> bool:
+    """Check if path contains only valid characters and no traversal"""
+    return all(c in VALID_PATH_CHARS for c in path_str) and not has_path_traversal(path_str)
+
+
+def is_valid_repo_url(url_str: str) -> bool:
+    """Check if repo URL contains only valid characters and no traversal"""
+    return all(c in VALID_REPO_URL_CHARS for c in url_str) and not has_path_traversal(url_str)
 
 
 @dataclass
@@ -418,6 +437,108 @@ class NetworkInspect:
         except TypeError as e:
             log_error("docker.network_inspect_parse", str(e), {"data": str(data)[:200]})
             return None
+
+
+# =============================================================================
+# Project Configuration
+# =============================================================================
+
+PROJECTS_DIR = Path.home() / ".config" / "containerctl" / "projects"
+CONTAINER_PREFIX = "cctl-"
+LABEL_PROJECT = "cctl.project"
+LABEL_REPO = "cctl.repo"
+
+
+@dataclass
+class EnvFile:
+    """Environment file mapping"""
+
+    src: str
+    dest: str
+
+
+@dataclass
+class ProjectConfig:
+    """Project configuration loaded from TOML"""
+
+    name: str
+    image: str
+    repo: str = ""
+    ssh_key: str = ""
+    env_files: list[EnvFile] = field(default_factory=list)
+
+    @property
+    def container_name(self) -> str:
+        return f"{CONTAINER_PREFIX}{self.name}"
+
+    @classmethod
+    def from_toml(cls, path: Path) -> "ProjectConfig | None":
+        """Load project config from a TOML file"""
+        try:
+            with open(path, "rb") as f:
+                data = tomllib.load(f)
+        except (OSError, tomllib.TOMLDecodeError) as e:
+            log_error("project.config", f"Failed to load {path}: {e}")
+            return None
+
+        name = path.stem
+        if not is_valid_id(name):
+            log_error("project.config", f"Invalid project name '{name}': must be a-zA-Z0-9-_")
+            return None
+
+        image = data.get("image", "")
+        if not image:
+            log_error("project.config", f"Missing 'image' in {path}")
+            return None
+        if not is_valid_image_ref(image):
+            log_error("project.config", f"Invalid image ref '{image}' in {path}")
+            return None
+
+        repo = data.get("repo", "")
+        if repo and not is_valid_repo_url(repo):
+            log_error("project.config", f"Invalid repo URL '{repo}' in {path}")
+            return None
+
+        ssh_key = ""
+        if data.get("ssh_key"):
+            ssh_key = str(Path(data["ssh_key"]).expanduser())
+            if not is_valid_path(ssh_key):
+                log_error("project.config", f"Invalid ssh_key path '{ssh_key}' in {path}")
+                return None
+
+        env_files = []
+        for ef in data.get("env_files", []):
+            src = ef.get("src", "")
+            dest = ef.get("dest", "")
+            if src and dest:
+                src_expanded = str(Path(src).expanduser())
+                if not is_valid_path(src_expanded):
+                    log_error("project.config", f"Invalid env_file src path '{src}' in {path}")
+                    return None
+                if not is_valid_path(dest) or has_path_traversal(dest):
+                    log_error("project.config", f"Invalid env_file dest path '{dest}' in {path}")
+                    return None
+                env_files.append(EnvFile(src=src_expanded, dest=dest))
+
+        return cls(
+            name=name,
+            image=image,
+            repo=repo,
+            ssh_key=ssh_key,
+            env_files=env_files,
+        )
+
+
+def load_projects() -> dict[str, ProjectConfig]:
+    """Load all project configs from ~/.config/containerctl/projects/"""
+    projects: dict[str, ProjectConfig] = {}
+    if not PROJECTS_DIR.is_dir():
+        return projects
+    for path in sorted(PROJECTS_DIR.glob("*.toml")):
+        project = ProjectConfig.from_toml(path)
+        if project:
+            projects[project.name] = project
+    return projects
 
 
 # =============================================================================
@@ -889,6 +1010,146 @@ class Docker:
 
         return result
 
+    @staticmethod
+    def find_project_container(project_name: str) -> dict | None:
+        """Find a container belonging to a project by its cctl- name"""
+        container_name = f"{CONTAINER_PREFIX}{project_name}"
+        containers = Docker.containers(all_containers=True)
+        for c in containers:
+            if c.get("Names") == container_name:
+                return c
+        return None
+
+    @staticmethod
+    def create_project_container(project: "ProjectConfig") -> bool:
+        """Create and start a container for a project"""
+        args = [
+            "run", "-d",
+            "--name", project.container_name,
+            "--label", f"{LABEL_PROJECT}={project.name}",
+        ]
+        if project.repo:
+            args.extend(["--label", f"{LABEL_REPO}={project.repo}"])
+        args.extend([project.image, "sleep", "infinity"])
+        result = Docker._run(args)
+        if result.returncode != 0:
+            log_error("project.create", f"Failed to create container: {result.stderr.strip()}")
+            return False
+        return True
+
+    @staticmethod
+    def cp(src: str, container_id: str, dest: str) -> bool:
+        """Copy file into container"""
+        result = Docker._run(["cp", src, f"{container_id}:{dest}"])
+        if result.returncode != 0:
+            log_error("docker.cp", f"Failed to copy {src} to {container_id}:{dest}: {result.stderr.strip()}")
+            return False
+        return True
+
+    @staticmethod
+    def exec_noninteractive(container_id: str, command: list[str]) -> subprocess.CompletedProcess:
+        """Execute command in container non-interactively (capture output)"""
+        return Docker._run(["exec", container_id] + command)
+
+    @staticmethod
+    def spawn_project(project: "ProjectConfig") -> bool:
+        """Full spawn flow: create container, copy SSH key, clone repo, inject env files"""
+        print(f"Creating container {project.container_name}...")
+        if not Docker.create_project_container(project):
+            return False
+
+        # Copy SSH key if configured
+        if project.ssh_key:
+            if not os.path.isfile(project.ssh_key):
+                print(f"Error: SSH key not found: {project.ssh_key}", file=sys.stderr)
+                Docker.remove_container(project.container_name, force=True)
+                return False
+            print(f"Injecting SSH key...")
+            Docker.exec_noninteractive(project.container_name, ["mkdir", "-p", "/home/dev/.ssh"])
+            if not Docker.cp(project.ssh_key, project.container_name, "/home/dev/.ssh/id_ed25519"):
+                print(f"Error: failed to copy SSH key into container", file=sys.stderr)
+                Docker.remove_container(project.container_name, force=True)
+                return False
+            Docker.exec_noninteractive(project.container_name, ["chmod", "600", "/home/dev/.ssh/id_ed25519"])
+            Docker.exec_noninteractive(project.container_name, ["chown", "-R", "dev:dev", "/home/dev/.ssh"])
+            # Verify key is accessible
+            result = Docker.exec_noninteractive(
+                project.container_name, ["test", "-r", "/home/dev/.ssh/id_ed25519"]
+            )
+            if result.returncode != 0:
+                print(f"Error: SSH key not readable inside container", file=sys.stderr)
+                Docker.remove_container(project.container_name, force=True)
+                return False
+            # Add common hosts to known_hosts to avoid prompts
+            Docker.exec_noninteractive(
+                project.container_name,
+                ["bash", "-c", "ssh-keyscan -t ed25519 github.com gitlab.com >> /home/dev/.ssh/known_hosts 2>/dev/null"],
+            )
+
+        # Clone repo if configured
+        if project.repo:
+            print(f"Cloning {project.repo}...")
+            Docker.exec_noninteractive(project.container_name, ["mkdir", "-p", "/home/dev/workspace"])
+            result = Docker.exec_noninteractive(
+                project.container_name,
+                ["bash", "-c", f"cd /home/dev/workspace && git clone {project.repo}"],
+            )
+            if result.returncode != 0:
+                print(f"Error: git clone failed: {result.stderr.strip()}", file=sys.stderr)
+                print(f"Cleaning up container {project.container_name}...", file=sys.stderr)
+                Docker.remove_container(project.container_name, force=True)
+                return False
+
+        # Copy env files
+        for ef in project.env_files:
+            if os.path.isfile(ef.src):
+                print(f"Injecting {ef.dest}...")
+                # Ensure destination directory exists
+                dest_dir = os.path.dirname(ef.dest)
+                Docker.exec_noninteractive(project.container_name, ["mkdir", "-p", dest_dir])
+                Docker.cp(ef.src, project.container_name, ef.dest)
+            else:
+                print(f"Warning: env file {ef.src} not found, skipping", file=sys.stderr)
+
+        print(f"Container {project.container_name} ready!")
+        return True
+
+    @staticmethod
+    def enter_project(project: "ProjectConfig") -> None:
+        """Enter a project: spawn if needed, start if stopped, then attach shell"""
+        container = Docker.find_project_container(project.name)
+
+        if container is None:
+            # No container — spawn it
+            if not Docker.spawn_project(project):
+                print(f"Failed to spawn project {project.name}", file=sys.stderr)
+                sys.exit(1)
+        else:
+            state = container.get("State", "").lower()
+            if state != "running":
+                print(f"Starting {project.container_name}...")
+                Docker.start(project.container_name)
+
+        # Attach shell in the repo directory if available
+        VALID_REPO_NAME_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._"
+        if project.repo:
+            repo_name = project.repo.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+            if repo_name and all(c in VALID_REPO_NAME_CHARS for c in repo_name):
+                workdir = f"/home/dev/workspace/{repo_name}"
+                Docker.exec(project.container_name, ["bash", "-c", f"cd {workdir} 2>/dev/null || cd /home/dev; exec bash"])
+            else:
+                Docker.shell(project.container_name, shell="/bin/bash")
+
+    @staticmethod
+    def destroy_project(project: "ProjectConfig") -> bool:
+        """Stop and remove a project container"""
+        container = Docker.find_project_container(project.name)
+        if container is None:
+            print(f"No container found for project {project.name}")
+            return False
+        print(f"Destroying {project.container_name}...")
+        return Docker.remove_container(project.container_name, force=True)
+
 
 # =============================================================================
 # Background Data Fetcher
@@ -906,6 +1167,7 @@ class DataFetcher:
             "images": [],
             "volumes": [],
             "networks": [],
+            "projects": [],
         }
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -936,11 +1198,37 @@ class DataFetcher:
         volumes = Docker.volumes()
         networks = Docker.networks()
 
+        # Enrich containers with project labels
+        for c in containers:
+            name = c.get("Names", "")
+            if name.startswith(CONTAINER_PREFIX):
+                c["Project"] = name[len(CONTAINER_PREFIX):]
+            else:
+                c["Project"] = ""
+
+        # Build projects list
+        projects_config = load_projects()
+        projects_data = []
+        for name, project in projects_config.items():
+            container = None
+            for c in containers:
+                if c.get("Names") == project.container_name:
+                    container = c
+                    break
+            status = container.get("State", container.get("Status", "unknown")) if container else "not created"
+            projects_data.append({
+                "Name": name,
+                "Status": status,
+                "Image": project.image,
+                "Repo": project.repo or "-",
+            })
+
         with self.lock:
             self.data["containers"] = containers
             self.data["images"] = images
             self.data["volumes"] = volumes
             self.data["networks"] = networks
+            self.data["projects"] = projects_data
 
     def _run(self) -> None:
         """Background thread loop"""
@@ -1152,13 +1440,18 @@ class App:
         self.scr = Screen()  # Buffered screen for flicker-free rendering
         self.fetcher = DataFetcher(interval=2.0)  # Background data fetcher
 
-        # Status colors for containers
+        # Status colors for containers and projects
         self.container_status_colors = {
             "up": Term.GREEN,
             "running": Term.GREEN,
             "exited": Term.RED,
             "created": Term.YELLOW,
             "paused": Term.YELLOW,
+        }
+        self.project_status_colors = {
+            "running": Term.GREEN,
+            "exited": Term.RED,
+            "not created": Term.DIM,
         }
 
         # Define tabs
@@ -1168,9 +1461,10 @@ class App:
                 key="containers",
                 fetch=Docker.containers,
                 columns=[
-                    ("Names", "NAME", 25),
-                    ("Status", "STATUS", 20),
-                    ("Image", "IMAGE", 30),
+                    ("Names", "NAME", 20),
+                    ("Project", "PROJECT", 15),
+                    ("Status", "STATUS", 18),
+                    ("Image", "IMAGE", 25),
                     ("Ports", "PORTS", 0),
                 ],
                 id_key="ID",
@@ -1219,6 +1513,19 @@ class App:
                 actions={},
             ),
             Tab(
+                name="Projects",
+                key="projects",
+                fetch=lambda: [],  # Fetched by DataFetcher
+                columns=[
+                    ("Name", "PROJECT", 20),
+                    ("Status", "STATUS", 15),
+                    ("Image", "IMAGE", 30),
+                    ("Repo", "REPO", 0),
+                ],
+                id_key="Name",
+                actions={},
+            ),
+            Tab(
                 name="Errors",
                 key="errors",
                 fetch=fetch_errors,
@@ -1240,7 +1547,10 @@ class App:
         """Get items for current tab from cache"""
         if self.current().key == "errors":
             return fetch_errors()
-        return self.fetcher.get(self.current().key)
+        data = self.fetcher.get(self.current().key)
+        if self.current().key == "projects" and not data:
+            return [{"Name": "No projects configured", "Status": "", "Image": "", "Repo": f"Add TOML to {PROJECTS_DIR}/"}]
+        return data
 
     def selected_item(self) -> dict | None:
         """Get currently selected item"""
@@ -1297,10 +1607,12 @@ class App:
             actual_index = self.scroll_offset + i
             is_selected = actual_index == self.selected_index
 
-            # Apply status colors only for containers tab
+            # Apply status colors for containers and projects tabs
             status_colors = None
             if self.current().key == "containers":
                 status_colors = self.container_status_colors
+            elif self.current().key == "projects":
+                status_colors = self.project_status_colors
 
             UI.list_row(
                 scr,
@@ -1337,6 +1649,8 @@ class App:
         # Status bar with keybindings
         if self.current().key == "containers":
             keys = "[s]tart [S]top [r]estart [L]ogs [e]xec [d]elete [o]rigin [q]uit"
+        elif self.current().key == "projects":
+            keys = "[e]nter [d]estroy [q]uit"
         elif self.current().key == "errors":
             keys = "[c]lear [q]uit"
         else:
@@ -1397,7 +1711,7 @@ class App:
             self.scroll_offset = 0
 
         # Number keys for tabs
-        elif key in "12345":
+        elif key in "123456":
             idx = int(key) - 1
             if idx < len(self.tabs):
                 self.current_tab = idx
@@ -1485,6 +1799,27 @@ class App:
                     self.set_message(f"Deleted {name}", Term.GREEN)
                 else:
                     self.set_message(f"Failed to delete {name}", Term.RED)
+
+        # Project actions
+        elif self.current().key == "projects" and self.selected_id():
+            project_name = self.selected_id()
+            projects = load_projects()
+            project = projects.get(project_name)
+
+            if project and key == "e":  # Enter
+                self.exit_tui_temporarily()
+                Docker.enter_project(project)
+                self.enter_tui()
+
+            elif project and key == "d":  # Destroy
+                if Docker.find_project_container(project_name):
+                    if UI.confirm(f"Destroy project '{project_name}'?", rows - 1):
+                        if Docker.destroy_project(project):
+                            self.set_message(f"Destroyed {project_name}", Term.GREEN)
+                        else:
+                            self.set_message(f"Failed to destroy {project_name}", Term.RED)
+                else:
+                    self.set_message(f"No container for {project_name}", Term.YELLOW)
 
         # Error clearing
         elif self.current().key == "errors" and key == "c" and self.selected_id():
@@ -1651,6 +1986,61 @@ def cli_shell(args: argparse.Namespace) -> None:
     Docker.shell(args.container, args.shell)
 
 
+def cli_enter(args: argparse.Namespace) -> None:
+    """Enter a project (spawn or attach)"""
+    projects = load_projects()
+    if args.project not in projects:
+        print(f"Unknown project: {args.project}", file=sys.stderr)
+        print(f"Available projects: {', '.join(projects.keys()) or 'none'}", file=sys.stderr)
+        print(f"Add project configs to {PROJECTS_DIR}/", file=sys.stderr)
+        sys.exit(1)
+    Docker.enter_project(projects[args.project])
+
+
+def cli_spawn(args: argparse.Namespace) -> None:
+    """Spawn a new project container"""
+    projects = load_projects()
+    if args.project not in projects:
+        print(f"Unknown project: {args.project}", file=sys.stderr)
+        sys.exit(1)
+    project = projects[args.project]
+    if Docker.find_project_container(project.name):
+        print(f"Container {project.container_name} already exists. Use 'enter' or 'destroy' first.", file=sys.stderr)
+        sys.exit(1)
+    if not Docker.spawn_project(project):
+        sys.exit(1)
+
+
+def cli_destroy(args: argparse.Namespace) -> None:
+    """Destroy a project container"""
+    projects = load_projects()
+    if args.project not in projects:
+        print(f"Unknown project: {args.project}", file=sys.stderr)
+        sys.exit(1)
+    if not Docker.destroy_project(projects[args.project]):
+        sys.exit(1)
+    print(f"Destroyed {args.project}")
+
+
+def cli_projects(args: argparse.Namespace) -> None:
+    """List configured projects and their container status"""
+    projects = load_projects()
+    if not projects:
+        print(f"No projects configured. Add TOML files to {PROJECTS_DIR}/")
+        return
+
+    print(f"{'PROJECT':<20} {'STATUS':<15} {'IMAGE':<30} {'REPO'}")
+    print("-" * 90)
+    for name, project in projects.items():
+        container = Docker.find_project_container(name)
+        if container:
+            status = container.get("State", container.get("Status", "unknown"))
+        else:
+            status = "not created"
+        repo = project.repo or "-"
+        print(f"{name:<20} {status:<15} {project.image:<30} {repo}")
+
+
 def usage() -> int:
     """Display usage information"""
     output_lines = [
@@ -1680,6 +2070,13 @@ def usage() -> int:
         "- containerctl exec <id> <cmd...>       ==> execute command in container",
         "- containerctl shell <id>               ==> open shell in container",
         "- containerctl shell <id> -s /bin/bash  ==> open bash in container",
+        "──────────────────────────────────────────────",
+        "- containerctl enter <project>          ==> enter project (spawn or attach)",
+        "- containerctl spawn <project>          ==> force-create project container",
+        "- containerctl destroy <project>        ==> stop and remove project container",
+        "- containerctl projects                 ==> list configured projects",
+        "──────────────────────────────────────────────",
+        f"Project configs: {PROJECTS_DIR}/<name>.toml",
     ]
     print("\n" + "\n".join(output_lines) + "\n")
     return 0
@@ -1753,6 +2150,25 @@ def main() -> None:
     shell_parser.add_argument("container", help="Container ID or name")
     shell_parser.add_argument("-s", "--shell", default="/bin/sh", help="Shell to use")
     shell_parser.set_defaults(func=cli_shell)
+
+    # enter
+    enter_parser = subparsers.add_parser("enter", help="Enter a project (spawn or attach)")
+    enter_parser.add_argument("project", help="Project name")
+    enter_parser.set_defaults(func=cli_enter)
+
+    # spawn
+    spawn_parser = subparsers.add_parser("spawn", help="Spawn a new project container")
+    spawn_parser.add_argument("project", help="Project name")
+    spawn_parser.set_defaults(func=cli_spawn)
+
+    # destroy
+    destroy_parser = subparsers.add_parser("destroy", help="Destroy a project container")
+    destroy_parser.add_argument("project", help="Project name")
+    destroy_parser.set_defaults(func=cli_destroy)
+
+    # projects
+    projects_parser = subparsers.add_parser("projects", help="List configured projects")
+    projects_parser.set_defaults(func=cli_projects)
 
     args = parser.parse_args()
 
