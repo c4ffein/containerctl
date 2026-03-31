@@ -15,11 +15,12 @@ import sys
 import termios
 import threading
 import time
-import tomllib
 import tty
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
+
+import tomllib
 
 # =============================================================================
 # Error Registry
@@ -445,6 +446,7 @@ class NetworkInspect:
 
 PROJECTS_DIR = Path.home() / ".config" / "containerctl" / "projects"
 CONTAINER_PREFIX = "cctl-"
+NETWORK_PREFIX = "cctl-net-"
 LABEL_PROJECT = "cctl.project"
 LABEL_REPO = "cctl.repo"
 
@@ -837,6 +839,39 @@ class Docker:
         return result.returncode == 0
 
     @staticmethod
+    def ensure_network(name: str) -> bool:
+        """Ensure a Docker network exists (create if missing)"""
+        if not is_valid_id(name):
+            log_error("docker.invalid_id", f"Invalid network name: {name}")
+            return False
+        result = Docker._run(["network", "inspect", name])
+        if result.returncode == 0:
+            return True
+        result = Docker._run(["network", "create", name])
+        if result.returncode != 0:
+            log_error("docker.network_create", f"Failed to create network {name}: {result.stderr.strip()}")
+            return False
+        return True
+
+    @staticmethod
+    def connect_network(network: str, container: str) -> bool:
+        """Connect a container to a network"""
+        if not is_valid_id(network) or not is_valid_id(container):
+            log_error("docker.invalid_id", f"Invalid network/container: {network}/{container}")
+            return False
+        result = Docker._run(["network", "connect", network, container])
+        return result.returncode == 0
+
+    @staticmethod
+    def disconnect_network(network: str, container: str) -> bool:
+        """Disconnect a container from a network"""
+        if not is_valid_id(network) or not is_valid_id(container):
+            log_error("docker.invalid_id", f"Invalid network/container: {network}/{container}")
+            return False
+        result = Docker._run(["network", "disconnect", network, container])
+        return result.returncode == 0
+
+    @staticmethod
     def logs(container_id: str, follow: bool = False, tail: int | None = None) -> None:
         """Show container logs (streams to stdout)"""
         if not is_valid_id(container_id):
@@ -1023,10 +1058,19 @@ class Docker:
     @staticmethod
     def create_project_container(project: "ProjectConfig") -> bool:
         """Create and start a container for a project"""
+        network_name = f"{NETWORK_PREFIX}{project.name}"
+        if not Docker.ensure_network(network_name):
+            log_error("project.create", f"Failed to ensure network {network_name}")
+            return False
         args = [
-            "run", "-d",
-            "--name", project.container_name,
-            "--label", f"{LABEL_PROJECT}={project.name}",
+            "run",
+            "-d",
+            "--name",
+            project.container_name,
+            "--network",
+            network_name,
+            "--label",
+            f"{LABEL_PROJECT}={project.name}",
         ]
         if project.repo:
             args.extend(["--label", f"{LABEL_REPO}={project.repo}"])
@@ -1064,26 +1108,28 @@ class Docker:
                 print(f"Error: SSH key not found: {project.ssh_key}", file=sys.stderr)
                 Docker.remove_container(project.container_name, force=True)
                 return False
-            print(f"Injecting SSH key...")
+            print("Injecting SSH key...")
             Docker.exec_noninteractive(project.container_name, ["mkdir", "-p", "/home/dev/.ssh"])
             if not Docker.cp(project.ssh_key, project.container_name, "/home/dev/.ssh/id_ed25519"):
-                print(f"Error: failed to copy SSH key into container", file=sys.stderr)
+                print("Error: failed to copy SSH key into container", file=sys.stderr)
                 Docker.remove_container(project.container_name, force=True)
                 return False
             Docker.exec_noninteractive(project.container_name, ["chmod", "600", "/home/dev/.ssh/id_ed25519"])
             Docker.exec_noninteractive(project.container_name, ["chown", "-R", "dev:dev", "/home/dev/.ssh"])
             # Verify key is accessible
-            result = Docker.exec_noninteractive(
-                project.container_name, ["test", "-r", "/home/dev/.ssh/id_ed25519"]
-            )
+            result = Docker.exec_noninteractive(project.container_name, ["test", "-r", "/home/dev/.ssh/id_ed25519"])
             if result.returncode != 0:
-                print(f"Error: SSH key not readable inside container", file=sys.stderr)
+                print("Error: SSH key not readable inside container", file=sys.stderr)
                 Docker.remove_container(project.container_name, force=True)
                 return False
             # Add common hosts to known_hosts to avoid prompts
             Docker.exec_noninteractive(
                 project.container_name,
-                ["bash", "-c", "ssh-keyscan -t ed25519 github.com gitlab.com >> /home/dev/.ssh/known_hosts 2>/dev/null"],
+                [
+                    "bash",
+                    "-c",
+                    "ssh-keyscan -t ed25519 github.com gitlab.com >> /home/dev/.ssh/known_hosts 2>/dev/null",
+                ],
             )
 
         # Clone repo if configured
@@ -1136,7 +1182,8 @@ class Docker:
             repo_name = project.repo.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
             if repo_name and all(c in VALID_REPO_NAME_CHARS for c in repo_name):
                 workdir = f"/home/dev/workspace/{repo_name}"
-                Docker.exec(project.container_name, ["bash", "-c", f"cd {workdir} 2>/dev/null || cd /home/dev; exec bash"])
+                cmd = f"cd {workdir} 2>/dev/null || cd /home/dev; exec bash"
+                Docker.exec(project.container_name, ["bash", "-c", cmd])
             else:
                 Docker.shell(project.container_name, shell="/bin/bash")
 
@@ -1148,7 +1195,12 @@ class Docker:
             print(f"No container found for project {project.name}")
             return False
         print(f"Destroying {project.container_name}...")
-        return Docker.remove_container(project.container_name, force=True)
+        if not Docker.remove_container(project.container_name, force=True):
+            return False
+        # Best-effort network cleanup
+        network_name = f"{NETWORK_PREFIX}{project.name}"
+        Docker.remove_network(network_name)
+        return True
 
 
 # =============================================================================
@@ -1202,7 +1254,7 @@ class DataFetcher:
         for c in containers:
             name = c.get("Names", "")
             if name.startswith(CONTAINER_PREFIX):
-                c["Project"] = name[len(CONTAINER_PREFIX):]
+                c["Project"] = name[len(CONTAINER_PREFIX) :]
             else:
                 c["Project"] = ""
 
@@ -1216,12 +1268,14 @@ class DataFetcher:
                     container = c
                     break
             status = container.get("State", container.get("Status", "unknown")) if container else "not created"
-            projects_data.append({
-                "Name": name,
-                "Status": status,
-                "Image": project.image,
-                "Repo": project.repo or "-",
-            })
+            projects_data.append(
+                {
+                    "Name": name,
+                    "Status": status,
+                    "Image": project.image,
+                    "Repo": project.repo or "-",
+                }
+            )
 
         with self.lock:
             self.data["containers"] = containers
@@ -1549,7 +1603,14 @@ class App:
             return fetch_errors()
         data = self.fetcher.get(self.current().key)
         if self.current().key == "projects" and not data:
-            return [{"Name": "No projects configured", "Status": "", "Image": "", "Repo": f"Add TOML to {PROJECTS_DIR}/"}]
+            return [
+                {
+                    "Name": "No projects configured",
+                    "Status": "",
+                    "Image": "",
+                    "Repo": f"Add TOML to {PROJECTS_DIR}/",
+                }
+            ]
         return data
 
     def selected_item(self) -> dict | None:
@@ -1651,6 +1712,8 @@ class App:
             keys = "[s]tart [S]top [r]estart [L]ogs [e]xec [d]elete [o]rigin [q]uit"
         elif self.current().key == "projects":
             keys = "[e]nter [d]estroy [q]uit"
+        elif self.current().key == "networks":
+            keys = "[e]dit [d]elete [q]uit"
         elif self.current().key == "errors":
             keys = "[c]lear [q]uit"
         else:
@@ -1789,16 +1852,29 @@ class App:
                 else:
                     self.set_message(f"Failed to delete {volume_name}", Term.RED)
 
-        # Network deletion
-        elif self.current().key == "networks" and key == "d" and self.selected_id():
+        # Network actions
+        elif self.current().key == "networks" and self.selected_id():
             network_id = self.selected_id()
             name = self.selected_item().get("Name", network_id[:12])
 
-            if UI.confirm(f"Delete network '{name}'?", rows - 1):
-                if Docker.remove_network(network_id):
-                    self.set_message(f"Deleted {name}", Term.GREEN)
+            if key == "d":  # Delete
+                if UI.confirm(f"Delete network '{name}'?", rows - 1):
+                    if Docker.remove_network(network_id):
+                        self.set_message(f"Deleted {name}", Term.GREEN)
+                    else:
+                        self.set_message(f"Failed to delete {name}", Term.RED)
+
+            elif key == "e":  # Edit — show connected containers
+                info = Docker.inspect_network(network_id)
+                if info:
+                    containers = info.Containers
+                    if containers:
+                        lines = [v.get("Name", k[:12]) for k, v in containers.items()]
+                    else:
+                        lines = ["No containers connected"]
+                    UI.info_box(f"Network: {info.Name}", lines, rows, cols)
                 else:
-                    self.set_message(f"Failed to delete {name}", Term.RED)
+                    self.set_message(f"Failed to inspect {name}", Term.RED)
 
         # Project actions
         elif self.current().key == "projects" and self.selected_id():
