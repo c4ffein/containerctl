@@ -560,6 +560,7 @@ class ServiceConfig:
     restart: str = "unless-stopped"
     ports: list[str] = field(default_factory=list)
     volumes: list[str] = field(default_factory=list)
+    scripts: dict[str, list[str]] = field(default_factory=dict)
 
     @property
     def container_name(self) -> str:
@@ -621,12 +622,30 @@ class ServiceConfig:
             expanded = f"{host_path}:{':'.join(parts[1:])}"
             volumes.append(expanded)
 
+        scripts: dict[str, list[str]] = {}
+        scripts_data = data.get("scripts", {})
+        if not isinstance(scripts_data, dict):
+            log_error("service.config", f"Invalid 'scripts' (must be a table) in {path}")
+            return None
+        for script_name, argv in scripts_data.items():
+            if not script_name or not is_valid_id(script_name):
+                log_error("service.config", f"Invalid script name '{script_name}' in {path}")
+                return None
+            if not isinstance(argv, list) or not argv:
+                log_error("service.config", f"Script '{script_name}' must be a non-empty list in {path}")
+                return None
+            if not all(isinstance(a, str) and a for a in argv):
+                log_error("service.config", f"Script '{script_name}' must be a list of non-empty strings in {path}")
+                return None
+            scripts[script_name] = list(argv)
+
         return cls(
             name=name,
             image=image,
             restart=restart,
             ports=ports,
             volumes=volumes,
+            scripts=scripts,
         )
 
 
@@ -2406,6 +2425,40 @@ def cli_service_recreate(args: argparse.Namespace) -> None:
     print(f"Recreated {args.service}")
 
 
+def cli_service_script(args: argparse.Namespace) -> None:
+    """Run a pre-registered script in a service container"""
+    services = load_services()
+    if args.service not in services:
+        print(f"Unknown service: {args.service}", file=sys.stderr)
+        print(f"Available services: {', '.join(services.keys()) or 'none'}", file=sys.stderr)
+        sys.exit(1)
+    service = services[args.service]
+    if args.script not in service.scripts:
+        print(f"Unknown script '{args.script}' for service {args.service}", file=sys.stderr)
+        print(f"Available scripts: {', '.join(service.scripts.keys()) or 'none'}", file=sys.stderr)
+        sys.exit(1)
+    container = Docker.find_service_container(service.name)
+    if container is None:
+        print(f"No container found for service {service.name} (run 'service up' first)", file=sys.stderr)
+        sys.exit(1)
+    Docker.exec(service.container_name, service.scripts[args.script])
+
+
+def cli_service_scripts(args: argparse.Namespace) -> None:
+    """List pre-registered scripts for a service"""
+    services = load_services()
+    if args.service not in services:
+        print(f"Unknown service: {args.service}", file=sys.stderr)
+        sys.exit(1)
+    service = services[args.service]
+    if not service.scripts:
+        print(f"No scripts configured for service {service.name}")
+        return
+    width = max(len(n) for n in service.scripts) + 2
+    for name, argv in service.scripts.items():
+        print(f"{name:<{width}} {' '.join(argv)}")
+
+
 def cli_services(args: argparse.Namespace) -> None:
     """List configured services and their container status"""
     services = load_services()
@@ -2465,6 +2518,8 @@ def usage() -> int:
         "- containerctl service up <name>        ==> create/start a service",
         "- containerctl service down <name>      ==> stop and remove a service",
         "- containerctl service recreate <name>  ==> recreate a service",
+        "- containerctl service scripts <name>   ==> list pre-registered scripts",
+        "- containerctl service script <name> <script>  ==> run a pre-registered script",
         "- containerctl services                 ==> list configured services",
         "──────────────────────────────────────────────",
         f"Project configs: {PROJECTS_DIR}/<name>.toml",
@@ -2577,6 +2632,15 @@ def main() -> None:
     svc_recreate = service_sub.add_parser("recreate", help="Recreate a service")
     svc_recreate.add_argument("service", help="Service name")
     svc_recreate.set_defaults(func=cli_service_recreate)
+
+    svc_script = service_sub.add_parser("script", help="Run a pre-registered script in a service")
+    svc_script.add_argument("service", help="Service name")
+    svc_script.add_argument("script", help="Script name")
+    svc_script.set_defaults(func=cli_service_script)
+
+    svc_scripts = service_sub.add_parser("scripts", help="List pre-registered scripts for a service")
+    svc_scripts.add_argument("service", help="Service name")
+    svc_scripts.set_defaults(func=cli_service_scripts)
 
     # services (list)
     services_parser = subparsers.add_parser("services", help="List configured services")
