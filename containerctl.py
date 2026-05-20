@@ -561,6 +561,7 @@ class ServiceConfig:
     ports: list[str] = field(default_factory=list)
     volumes: list[str] = field(default_factory=list)
     scripts: dict[str, list[str]] = field(default_factory=dict)
+    env: list[str] = field(default_factory=list)
 
     @property
     def container_name(self) -> str:
@@ -621,6 +622,13 @@ class ServiceConfig:
             # Rebuild with expanded host path
             expanded = f"{host_path}:{':'.join(parts[1:])}"
             volumes.append(expanded)
+
+        env_list = []
+        for e in data.get("env", []):
+            if not isinstance(e, str) or "=" not in e:
+                log_error("service.config", f"Invalid env entry '{e}' in {path}")
+                return None
+            env_list.append(e)
 
         scripts: dict[str, list[str]] = {}
         scripts_data = data.get("scripts", {})
@@ -1347,6 +1355,8 @@ class Docker:
             args.extend(["-p", port])
         for vol in service.volumes:
             args.extend(["-v", vol])
+        for e in service.env:
+            args.extend(["-e", e])
         args.append(service.image)
         result = Docker._run(args)
         if result.returncode != 0:
@@ -2515,12 +2525,12 @@ def usage() -> int:
         "- containerctl destroy <project>        ==> stop and remove project container",
         "- containerctl projects                 ==> list configured projects",
         "──────────────────────────────────────────────",
-        "- containerctl service up <name>        ==> create/start a service",
-        "- containerctl service down <name>      ==> stop and remove a service",
-        "- containerctl service recreate <name>  ==> recreate a service",
-        "- containerctl service scripts <name>   ==> list pre-registered scripts",
+        "- containerctl service up <name>               ==> create/start a service",
+        "- containerctl service down <name>             ==> stop and remove a service",
+        "- containerctl service recreate <name>         ==> recreate a service",
+        "- containerctl service scripts <name>          ==> list pre-registered scripts",
         "- containerctl service script <name> <script>  ==> run a pre-registered script",
-        "- containerctl services                 ==> list configured services",
+        "- containerctl services                        ==> list configured services",
         "──────────────────────────────────────────────",
         f"Project configs: {PROJECTS_DIR}/<name>.toml",
         f"Service configs: {SERVICES_DIR}/<name>.toml",
