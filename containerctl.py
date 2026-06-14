@@ -463,19 +463,49 @@ class EnvFile:
     dest: str
 
 
+# Git branch/ref names may contain slashes (e.g. feature/foo), repo dir names may not
+VALID_REPO_NAME_CHARS = VALID_ID_CHARS + "-._"
+VALID_BRANCH_CHARS = VALID_REPO_NAME_CHARS + "/"
+
+
+@dataclass
+class RepoSpec:
+    """A single git repo to clone into a project's workspace"""
+
+    url: str
+    dir: str = ""  # subdirectory under /home/dev/workspace; derived from url when empty
+    branch: str = ""
+
+    @property
+    def name(self) -> str:
+        """Directory name the repo clones into"""
+        if self.dir:
+            return self.dir
+        return self.url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+
+
 @dataclass
 class ProjectConfig:
     """Project configuration loaded from TOML"""
 
     name: str
     image: str
-    repo: str = ""
+    repos: list[RepoSpec] = field(default_factory=list)
     ssh_key: str = ""
     env_files: list[EnvFile] = field(default_factory=list)
 
     @property
     def container_name(self) -> str:
         return f"{CONTAINER_PREFIX}{self.name}"
+
+    @property
+    def repos_display(self) -> str:
+        """Short summary of repos for list views"""
+        if not self.repos:
+            return "-"
+        if len(self.repos) == 1:
+            return self.repos[0].url
+        return f"{len(self.repos)} repos"
 
     @classmethod
     def from_toml(cls, path: Path) -> "ProjectConfig | None":
@@ -500,10 +530,44 @@ class ProjectConfig:
             log_error("project.config", f"Invalid image ref '{image}' in {path}")
             return None
 
-        repo = data.get("repo", "")
-        if repo and not is_valid_repo_url(repo):
-            log_error("project.config", f"Invalid repo URL '{repo}' in {path}")
+        # Accept legacy single `repo = "url"` OR `repos = [...]`, but not both —
+        # defining both is ambiguous (which order? is it a mistake?), so reject it.
+        # Entries in `repos` may be plain URL strings or tables with url/dir/branch.
+        if data.get("repo") and data.get("repos"):
+            log_error("project.config", f"Define either 'repo' or 'repos', not both, in {path}")
             return None
+        raw_repos: list = []
+        if data.get("repo"):
+            raw_repos.append(data["repo"])
+        raw_repos.extend(data.get("repos", []))
+
+        repos: list[RepoSpec] = []
+        seen_dirs: set[str] = set()
+        for entry in raw_repos:
+            if isinstance(entry, str):
+                url, rdir, branch = entry, "", ""
+            elif isinstance(entry, dict):
+                url = entry.get("url", "")
+                rdir = entry.get("dir", "")
+                branch = entry.get("branch", "")
+            else:
+                log_error("project.config", f"Invalid repo entry '{entry}' in {path}")
+                return None
+            if not url or not is_valid_repo_url(url):
+                log_error("project.config", f"Invalid repo URL '{url}' in {path}")
+                return None
+            if rdir and (not all(c in VALID_REPO_NAME_CHARS for c in rdir) or rdir in (".", "..")):
+                log_error("project.config", f"Invalid repo dir '{rdir}' in {path}")
+                return None
+            if branch and not all(c in VALID_BRANCH_CHARS for c in branch):
+                log_error("project.config", f"Invalid repo branch '{branch}' in {path}")
+                return None
+            spec = RepoSpec(url=url, dir=rdir, branch=branch)
+            if spec.name in seen_dirs:
+                log_error("project.config", f"Duplicate repo dir '{spec.name}' in {path}")
+                return None
+            seen_dirs.add(spec.name)
+            repos.append(spec)
 
         ssh_key = ""
         if data.get("ssh_key"):
@@ -529,7 +593,7 @@ class ProjectConfig:
         return cls(
             name=name,
             image=image,
-            repo=repo,
+            repos=repos,
             ssh_key=ssh_key,
             env_files=env_files,
         )
@@ -1198,8 +1262,8 @@ class Docker:
             "--label",
             f"{LABEL_PROJECT}={project.name}",
         ]
-        if project.repo:
-            args.extend(["--label", f"{LABEL_REPO}={project.repo}"])
+        if project.repos:
+            args.extend(["--label", f"{LABEL_REPO}={','.join(r.url for r in project.repos)}"])
         args.extend([project.image, "sleep", "infinity"])
         result = Docker._run(args)
         if result.returncode != 0:
@@ -1258,19 +1322,26 @@ class Docker:
                 ],
             )
 
-        # Clone repo if configured
-        if project.repo:
-            print(f"Cloning {project.repo}...")
+        # Clone repos if configured (each into its own dir under the workspace)
+        if project.repos:
             Docker.exec_noninteractive(project.container_name, ["mkdir", "-p", "/home/dev/workspace"])
-            result = Docker.exec_noninteractive(
-                project.container_name,
-                ["bash", "-c", f"cd /home/dev/workspace && git clone {project.repo}"],
-            )
-            if result.returncode != 0:
-                print(f"Error: git clone failed: {result.stderr.strip()}", file=sys.stderr)
-                print(f"Cleaning up container {project.container_name}...", file=sys.stderr)
-                Docker.remove_container(project.container_name, force=True)
-                return False
+            for repo in project.repos:
+                print(f"Cloning {repo.url}...")
+                clone = ["git", "clone"]
+                if repo.branch:
+                    clone += ["-b", repo.branch]
+                clone.append(repo.url)
+                if repo.dir:
+                    clone.append(repo.dir)
+                result = Docker.exec_noninteractive(
+                    project.container_name,
+                    ["bash", "-c", f"cd /home/dev/workspace && {' '.join(clone)}"],
+                )
+                if result.returncode != 0:
+                    print(f"Error: git clone failed for {repo.url}: {result.stderr.strip()}", file=sys.stderr)
+                    print(f"Cleaning up container {project.container_name}...", file=sys.stderr)
+                    Docker.remove_container(project.container_name, force=True)
+                    return False
 
         # Copy env files
         for ef in project.env_files:
@@ -1302,16 +1373,19 @@ class Docker:
                 print(f"Starting {project.container_name}...")
                 Docker.start(project.container_name)
 
-        # Attach shell in the repo directory if available
-        VALID_REPO_NAME_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._"
-        if project.repo:
-            repo_name = project.repo.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+        # Pick the landing directory:
+        #   - exactly one repo  -> enter that repo's dir
+        #   - multiple repos     -> enter the shared workspace root
+        #   - no repo            -> home
+        workdir = "/home/dev"
+        if len(project.repos) == 1:
+            repo_name = project.repos[0].name
             if repo_name and all(c in VALID_REPO_NAME_CHARS for c in repo_name):
                 workdir = f"/home/dev/workspace/{repo_name}"
-                cmd = f"cd {workdir} 2>/dev/null || cd /home/dev; exec bash"
-                Docker.exec(project.container_name, ["bash", "-c", cmd])
-            else:
-                Docker.shell(project.container_name, shell="/bin/bash")
+        elif len(project.repos) > 1:
+            workdir = "/home/dev/workspace"
+        cmd = f"cd {workdir} 2>/dev/null || cd /home/dev; exec bash"
+        Docker.exec(project.container_name, ["bash", "-c", cmd])
 
     @staticmethod
     def destroy_project(project: "ProjectConfig") -> bool:
@@ -1474,7 +1548,7 @@ class DataFetcher:
                     "Name": name,
                     "Status": status,
                     "Image": project.image,
-                    "Repo": project.repo or "-",
+                    "Repo": project.repos_display,
                 }
             )
 
@@ -2395,7 +2469,7 @@ def cli_projects(args: argparse.Namespace) -> None:
             status = container.get("State", container.get("Status", "unknown"))
         else:
             status = "not created"
-        repo = project.repo or "-"
+        repo = project.repos_display
         print(f"{name:<20} {status:<15} {project.image:<30} {repo}")
 
 
