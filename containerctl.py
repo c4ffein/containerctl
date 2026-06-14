@@ -447,7 +447,7 @@ class NetworkInspect:
 
 PROJECTS_DIR = Path.home() / ".config" / "containerctl" / "projects"
 SERVICES_DIR = Path.home() / ".config" / "containerctl" / "services"
-CONTAINER_PREFIX = "cctl-"
+CONTAINER_PREFIX = "cctl-prj-"
 SERVICE_PREFIX = "cctl-svc-"
 NETWORK_PREFIX = "cctl-net-"
 LABEL_PROJECT = "cctl.project"
