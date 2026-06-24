@@ -718,6 +718,7 @@ class ServiceConfig:
             ports=ports,
             volumes=volumes,
             scripts=scripts,
+            env=env_list,
         )
 
 
