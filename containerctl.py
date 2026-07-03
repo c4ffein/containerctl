@@ -20,8 +20,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-import tomllib
-
 # =============================================================================
 # Error Registry
 # =============================================================================
@@ -447,6 +445,14 @@ class NetworkInspect:
 
 PROJECTS_DIR = Path.home() / ".config" / "containerctl" / "projects"
 SERVICES_DIR = Path.home() / ".config" / "containerctl" / "services"
+
+# Paths *inside* a spawned container (the dev user's home is /home/dev — see spawn_project).
+CONTAINER_HOME = "/home/dev"
+CONTAINER_WORKSPACE = f"{CONTAINER_HOME}/workspace"
+CONTAINER_BIN = f"{CONTAINER_HOME}/.local/bin"
+CONTAINER_SELF = f"{CONTAINER_BIN}/containerctl"
+CONTAINER_MANIFEST = f"{CONTAINER_HOME}/.config/containerctl/expected.json"
+
 CONTAINER_PREFIX = "cctl-prj-"
 SERVICE_PREFIX = "cctl-svc-"
 NETWORK_PREFIX = "cctl-net-"
@@ -510,6 +516,8 @@ class ProjectConfig:
     @classmethod
     def from_toml(cls, path: Path) -> "ProjectConfig | None":
         """Load project config from a TOML file"""
+        import tomllib  # lazy: keeps the module importable on Python 3.10 (check-local path)
+
         try:
             with open(path, "rb") as f:
                 data = tomllib.load(f)
@@ -634,6 +642,8 @@ class ServiceConfig:
     @classmethod
     def from_toml(cls, path: Path) -> "ServiceConfig | None":
         """Load service config from a TOML file"""
+        import tomllib  # lazy: keeps the module importable on Python 3.10 (check-local path)
+
         try:
             with open(path, "rb") as f:
                 data = tomllib.load(f)
@@ -732,6 +742,254 @@ def load_services() -> dict[str, ServiceConfig]:
         if service:
             services[service.name] = service
     return services
+
+
+# =============================================================================
+# Workspace cleanliness check
+# =============================================================================
+#
+# "Is it safe to destroy this container?" — before you tear a project down, make
+# sure nothing in its workspace would be lost: no uncommitted/unpushed work, no
+# stashes, no detached HEAD, and no directory you cloned by hand but forgot to
+# add to the project's TOML.
+#
+# The logic is written once against two injected callables so it runs both
+# host-side (over `docker exec`) and inside the container (`check-local`, over
+# plain `git`) with zero duplication:
+#   - list_dirs() -> list[str]           names of directories in the workspace
+#   - run_git(dirname, args) -> (rc, out)  run `git -C <workspace>/<dirname> ...`
+
+
+@dataclass
+class RepoStatus:
+    """Cleanliness of a single directory in the workspace."""
+
+    name: str
+    is_git: bool = True
+    uncommitted: bool = False  # staged or modified tracked files
+    untracked: bool = False  # files git doesn't know about
+    detached: bool = False  # HEAD not on a branch
+    has_upstream: bool = True  # branch tracks a remote (else we can't prove it's pushed)
+    ahead: int = 0  # commits present locally but not on the upstream
+    stashes: int = 0
+
+    @property
+    def clean(self) -> bool:
+        """A repo is clean only if everything is committed *and* verifiably pushed."""
+        return (
+            self.is_git
+            and not self.uncommitted
+            and not self.untracked
+            and not self.detached
+            and self.has_upstream
+            and self.ahead == 0
+            and self.stashes == 0
+        )
+
+    def problems(self) -> list[str]:
+        """Human-readable reasons this dir is not clean (empty when clean)."""
+        if not self.is_git:
+            return ["not a git repository"]
+        out = []
+        if self.uncommitted:
+            out.append("uncommitted changes")
+        if self.untracked:
+            out.append("untracked files")
+        if self.detached:
+            out.append("detached HEAD")
+        if not self.has_upstream:
+            out.append("no upstream branch")
+        elif self.ahead:
+            out.append(f"{self.ahead} unpushed commit{'s' if self.ahead != 1 else ''}")
+        if self.stashes:
+            out.append(f"{self.stashes} stash{'es' if self.stashes != 1 else ''}")
+        return out
+
+
+@dataclass
+class WorkspaceReport:
+    """Result of checking a whole workspace against a project's expected repos."""
+
+    statuses: list[RepoStatus] = field(default_factory=list)
+    extra: list[str] = field(default_factory=list)  # dirs present but not in the config
+    missing: list[str] = field(default_factory=list)  # dirs in the config but absent
+
+    @property
+    def clean(self) -> bool:
+        return all(s.clean for s in self.statuses) and not self.extra and not self.missing
+
+
+def inspect_repo(name: str, run_git: Callable[[str, list[str]], tuple[int, str]]) -> RepoStatus:
+    """Build a RepoStatus for one workspace directory using an injected git runner."""
+    status = RepoStatus(name=name)
+
+    rc, _ = run_git(name, ["rev-parse", "--git-dir"])
+    if rc != 0:
+        status.is_git = False
+        return status
+
+    _, porcelain = run_git(name, ["status", "--porcelain"])
+    lines = [ln for ln in porcelain.splitlines() if ln.strip()]
+    status.untracked = any(ln.startswith("??") for ln in lines)
+    status.uncommitted = any(not ln.startswith("??") for ln in lines)
+
+    rc, _ = run_git(name, ["symbolic-ref", "-q", "HEAD"])
+    status.detached = rc != 0
+
+    rc, ahead = run_git(name, ["rev-list", "--count", "@{u}..HEAD"])
+    if rc != 0:
+        status.has_upstream = False
+    else:
+        try:
+            status.ahead = int(ahead.strip() or "0")
+        except ValueError:
+            status.ahead = 0
+
+    _, stash = run_git(name, ["stash", "list"])
+    status.stashes = len([ln for ln in stash.splitlines() if ln.strip()])
+
+    return status
+
+
+def check_workspace(
+    expected: list[str] | None,
+    list_dirs: Callable[[], list[str]],
+    run_git: Callable[[str, list[str]], tuple[int, str]],
+) -> WorkspaceReport:
+    """Compare the workspace on disk against the configured repos.
+
+    ``expected`` is the list of directory names the config says should be there;
+    pass ``None`` to skip extra/missing detection (e.g. no manifest available)
+    and only report per-repo git cleanliness.
+    """
+    present = sorted(list_dirs())
+    report = WorkspaceReport()
+
+    for name in present:
+        report.statuses.append(inspect_repo(name, run_git))
+
+    if expected is not None:
+        expected_set = set(expected)
+        present_set = set(present)
+        report.extra = sorted(present_set - expected_set)
+        report.missing = sorted(expected_set - present_set)
+
+    return report
+
+
+def print_report(label: str, report: WorkspaceReport) -> bool:
+    """Print a workspace report; return True when clean."""
+    print(f"{label}:")
+    if not report.statuses and not report.missing:
+        print("  (workspace is empty)")
+    for status in report.statuses:
+        tag = "extra" if status.name in report.extra else None
+        if status.clean and not tag:
+            print(f"  ✓ {status.name}")
+            continue
+        reasons = status.problems()
+        if tag:
+            reasons = ["not in config", *reasons] if reasons else ["not in config"]
+        print(f"  ✗ {status.name} — {', '.join(reasons)}")
+    for name in report.missing:
+        print(f"  ✗ {name} — configured but absent")
+    print("  clean" if report.clean else "  DIRTY")
+    return report.clean
+
+
+# --- host-side adapters (run over `docker exec`) --------------------------------
+
+
+def _host_list_dirs(container: str) -> list[str]:
+    """List directory names directly under the container's workspace."""
+    script = f'cd {CONTAINER_WORKSPACE} 2>/dev/null && for d in */; do [ -d "$d" ] && printf "%s\\n" "${{d%/}}"; done'
+    result = Docker.exec_noninteractive(container, ["sh", "-c", script])
+    return [ln for ln in result.stdout.splitlines() if ln.strip()]
+
+
+def _host_git(container: str) -> Callable[[str, list[str]], tuple[int, str]]:
+    def run_git(name: str, args: list[str]) -> tuple[int, str]:
+        result = Docker.exec_noninteractive(container, ["git", "-C", f"{CONTAINER_WORKSPACE}/{name}", *args])
+        return result.returncode, result.stdout
+
+    return run_git
+
+
+# --- local adapters (run inside the container, plain git) -----------------------
+
+
+def _local_workspace() -> Path:
+    return Path.home() / "workspace"
+
+
+def _local_list_dirs() -> list[str]:
+    ws = _local_workspace()
+    if not ws.is_dir():
+        return []
+    return [p.name for p in ws.iterdir() if p.is_dir()]
+
+
+def _local_git(name: str, args: list[str]) -> tuple[int, str]:
+    result = subprocess.run(
+        ["git", "-C", str(_local_workspace() / name), *args],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode, result.stdout
+
+
+def read_manifest() -> list[str] | None:
+    """Read the injected expected-repos manifest inside a container, if present."""
+    path = Path.home() / ".config" / "containerctl" / "expected.json"
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if isinstance(data, list) and all(isinstance(x, str) for x in data):
+        return data
+    return None
+
+
+def install_self(container: str, expected: list[str]) -> bool:
+    """Copy containerctl + the expected-repos manifest into a container.
+
+    Makes ``containerctl check-local`` available on the dev user's PATH. Best
+    effort: failures are logged, never fatal to the spawn/enter flow.
+    """
+    self_path = Path(__file__).resolve()
+    ok = True
+
+    Docker.exec_noninteractive(container, ["mkdir", "-p", CONTAINER_BIN, f"{CONTAINER_HOME}/.config/containerctl"])
+    if not Docker.cp(str(self_path), container, CONTAINER_SELF):
+        return False
+    Docker.exec_noninteractive(container, ["chmod", "+x", CONTAINER_SELF])
+
+    # Write the manifest atomically to a temp file, then copy it in.
+    import tempfile
+
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    try:
+        json.dump(expected, tmp)
+        tmp.flush()
+        tmp.close()
+        if not Docker.cp(tmp.name, container, CONTAINER_MANIFEST):
+            ok = False
+    finally:
+        os.unlink(tmp.name)
+
+    Docker.exec_noninteractive(
+        container,
+        ["chown", "-R", "dev:dev", f"{CONTAINER_HOME}/.local", f"{CONTAINER_HOME}/.config"],
+    )
+    # Ensure ~/.local/bin is on PATH for future interactive shells (idempotent).
+    bashrc = f"{CONTAINER_HOME}/.bashrc"
+    path_line = 'export PATH="$HOME/.local/bin:$PATH"'
+    Docker.exec_noninteractive(
+        container,
+        ["sh", "-c", f"grep -qs '.local/bin' {bashrc} || echo '{path_line}' >> {bashrc}"],
+    )
+    return ok
 
 
 # =============================================================================
@@ -1355,6 +1613,11 @@ class Docker:
             else:
                 print(f"Warning: env file {ef.src} not found, skipping", file=sys.stderr)
 
+        # Install containerctl + the expected-repos manifest so `containerctl
+        # check-local` is available from inside the container. Best-effort.
+        if not install_self(project.container_name, [r.name for r in project.repos]):
+            log_error("project.install_self", f"Failed to install containerctl into {project.container_name}")
+
         print(f"Container {project.container_name} ready!")
         return True
 
@@ -1373,6 +1636,9 @@ class Docker:
             if state != "running":
                 print(f"Starting {project.container_name}...")
                 Docker.start(project.container_name)
+            # Keep the in-container checker + manifest fresh (config may have changed,
+            # or the container predates this feature). Best-effort.
+            install_self(project.container_name, [r.name for r in project.repos])
 
         # Pick the landing directory:
         #   - exactly one repo  -> enter that repo's dir
@@ -2474,6 +2740,60 @@ def cli_projects(args: argparse.Namespace) -> None:
         print(f"{name:<20} {status:<15} {project.image:<30} {repo}")
 
 
+def _check_one(project: "ProjectConfig") -> bool | None:
+    """Check a single project's workspace over docker exec.
+
+    Returns True if clean, False if dirty, None if there is no container.
+    """
+    container = Docker.find_project_container(project.name)
+    if container is None:
+        print(f"{project.name}: no container (nothing to check)")
+        return None
+    expected = [r.name for r in project.repos]
+    name = project.container_name
+    report = check_workspace(expected, lambda: _host_list_dirs(name), _host_git(name))
+    return print_report(f"{project.name} ({name})", report)
+
+
+def cli_check(args: argparse.Namespace) -> None:
+    """Check whether project workspaces are safe to destroy (host-side)."""
+    projects = load_projects()
+    if args.all:
+        targets = list(projects.values())
+        if not targets:
+            print(f"No projects configured. Add TOML files to {PROJECTS_DIR}/")
+            return
+    else:
+        if args.project is None:
+            print("Usage: containerctl check <project> | containerctl check --all", file=sys.stderr)
+            sys.exit(2)
+        if args.project not in projects:
+            print(f"Unknown project: {args.project}", file=sys.stderr)
+            sys.exit(1)
+        targets = [projects[args.project]]
+
+    dirty = False
+    for i, project in enumerate(targets):
+        if i:
+            print()
+        result = _check_one(project)
+        if result is False:
+            dirty = True
+    if dirty:
+        sys.exit(1)
+
+
+def cli_check_local(args: argparse.Namespace) -> None:
+    """Check the current workspace from inside a container (no docker)."""
+    expected = read_manifest()
+    if expected is None:
+        print("Warning: no manifest found; skipping extra/missing detection", file=sys.stderr)
+    report = check_workspace(expected, _local_list_dirs, _local_git)
+    clean = print_report("workspace", report)
+    if not clean:
+        sys.exit(1)
+
+
 def cli_service_up(args: argparse.Namespace) -> None:
     """Bring a service up"""
     services = load_services()
@@ -2600,6 +2920,10 @@ def usage() -> int:
         "- containerctl destroy <project>        ==> stop and remove project container",
         "- containerctl projects                 ==> list configured projects",
         "──────────────────────────────────────────────",
+        "- containerctl check <project>          ==> is the workspace safe to destroy? (uncommitted/unpushed/extra)",
+        "- containerctl check --all              ==> check every configured project",
+        "- containerctl check-local              ==> run the same check from inside a container",
+        "──────────────────────────────────────────────",
         "- containerctl service up <name>               ==> create/start a service",
         "- containerctl service down <name>             ==> stop and remove a service",
         "- containerctl service recreate <name>         ==> recreate a service",
@@ -2697,6 +3021,16 @@ def main() -> None:
     destroy_parser = subparsers.add_parser("destroy", help="Destroy a project container")
     destroy_parser.add_argument("project", help="Project name")
     destroy_parser.set_defaults(func=cli_destroy)
+
+    # check
+    check_parser = subparsers.add_parser("check", help="Check if a project workspace is safe to destroy")
+    check_parser.add_argument("project", nargs="?", help="Project name")
+    check_parser.add_argument("-a", "--all", action="store_true", help="Check all configured projects")
+    check_parser.set_defaults(func=cli_check)
+
+    # check-local (runs inside a container; installed to ~/.local/bin on spawn)
+    check_local_parser = subparsers.add_parser("check-local", help="Check current workspace (inside a container)")
+    check_local_parser.set_defaults(func=cli_check_local)
 
     # projects
     projects_parser = subparsers.add_parser("projects", help="List configured projects")
