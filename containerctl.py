@@ -1335,14 +1335,19 @@ class Docker:
         subprocess.run(["docker"] + args)
 
     @staticmethod
-    def exec(container_id: str, command: list[str], interactive: bool = True) -> None:
+    def exec(container_id: str, command: list[str], interactive: bool = True, user: str | None = None) -> None:
         """Execute command in container"""
         if not is_valid_id(container_id):
             log_error("docker.invalid_id", f"Invalid container ID: {container_id}")
             return
+        if user is not None and (not user or not is_valid_id(user)):
+            log_error("docker.invalid_user", f"Invalid user: {user}")
+            return
         args = ["exec"]
         if interactive:
             args.extend(["-it"])
+        if user is not None:
+            args.extend(["-u", user])
         args.append(container_id)
         args.extend(command)
         subprocess.run(["docker"] + args)
@@ -1622,7 +1627,7 @@ class Docker:
         return True
 
     @staticmethod
-    def enter_project(project: "ProjectConfig") -> None:
+    def enter_project(project: "ProjectConfig", user: str | None = None) -> None:
         """Enter a project: spawn if needed, start if stopped, then attach shell"""
         container = Docker.find_project_container(project.name)
 
@@ -1652,7 +1657,7 @@ class Docker:
         elif len(project.repos) > 1:
             workdir = "/home/dev/workspace"
         cmd = f"cd {workdir} 2>/dev/null || cd /home/dev; exec bash"
-        Docker.exec(project.container_name, ["bash", "-c", cmd])
+        Docker.exec(project.container_name, ["bash", "-c", cmd], user=user)
 
     @staticmethod
     def destroy_project(project: "ProjectConfig") -> bool:
@@ -2693,7 +2698,17 @@ def cli_enter(args: argparse.Namespace) -> None:
         print(f"Available projects: {', '.join(projects.keys()) or 'none'}", file=sys.stderr)
         print(f"Add project configs to {PROJECTS_DIR}/", file=sys.stderr)
         sys.exit(1)
-    Docker.enter_project(projects[args.project])
+    user = None
+    for option in args.options:
+        key, sep, value = option.partition("=")
+        if not sep or key != "user":
+            print(f"Unknown option: {option} (supported: user=<user>)", file=sys.stderr)
+            sys.exit(1)
+        if not value or not is_valid_id(value):
+            print(f"Invalid user: {value}", file=sys.stderr)
+            sys.exit(1)
+        user = value
+    Docker.enter_project(projects[args.project], user=user)
 
 
 def cli_spawn(args: argparse.Namespace) -> None:
@@ -2916,6 +2931,7 @@ def usage() -> int:
         "- containerctl shell <id> -s /bin/bash  ==> open bash in container",
         "──────────────────────────────────────────────",
         "- containerctl enter <project>          ==> enter project (spawn or attach)",
+        "- containerctl enter <proj> user=root   ==> enter project as another user",
         "- containerctl spawn <project>          ==> force-create project container",
         "- containerctl destroy <project>        ==> stop and remove project container",
         "- containerctl projects                 ==> list configured projects",
@@ -3010,6 +3026,7 @@ def main() -> None:
     # enter
     enter_parser = subparsers.add_parser("enter", help="Enter a project (spawn or attach)")
     enter_parser.add_argument("project", help="Project name")
+    enter_parser.add_argument("options", nargs="*", metavar="key=value", help="Modifiers: user=<user>")
     enter_parser.set_defaults(func=cli_enter)
 
     # spawn

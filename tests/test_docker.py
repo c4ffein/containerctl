@@ -139,6 +139,16 @@ class StreamingCommandTests(unittest.TestCase):
         Docker.exec("abc", ["ls", "-la"], interactive=True)
         self.assertEqual(self.rec.last, ["docker", "exec", "-it", "abc", "ls", "-la"])
 
+    def test_exec_with_user_inserts_flag(self):
+        Docker.exec("abc", ["ls"], user="root")
+        self.assertEqual(self.rec.last, ["docker", "exec", "-it", "-u", "root", "abc", "ls"])
+
+    def test_exec_rejects_bad_user(self):
+        for bad in ("ro;ot", ""):
+            Docker.exec("abc", ["ls"], user=bad)
+        self.assertEqual(self.rec.calls, [])
+        self.assertEqual({e["cat"] for e in get_errors()}, {"docker.invalid_user"})
+
     def test_shell_delegates_to_exec(self):
         Docker.shell("abc", shell="/bin/bash")
         self.assertEqual(self.rec.last, ["docker", "exec", "-it", "abc", "/bin/bash"])

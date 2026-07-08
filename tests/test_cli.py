@@ -1,8 +1,9 @@
 """Smoke tests for the CLI surface: help output and argparse wiring."""
 
+import argparse
 import io
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 import containerctl
@@ -32,6 +33,37 @@ class MainHelpDispatchTests(unittest.TestCase):
                     with self.assertRaises(SystemExit) as ctx:
                         containerctl.main()
             self.assertEqual(ctx.exception.code, 0)
+
+
+class CliEnterOptionTests(unittest.TestCase):
+    """cli_enter parses key=value modifiers before delegating to Docker."""
+
+    def setUp(self):
+        reset_errors()
+        self.project = object()
+        self._load = mock.patch.object(containerctl, "load_projects", return_value={"proj": self.project})
+        self._load.start()
+
+    def tearDown(self):
+        self._load.stop()
+
+    def _enter(self, options):
+        with mock.patch.object(containerctl.Docker, "enter_project") as enter:
+            containerctl.cli_enter(argparse.Namespace(project="proj", options=options))
+        return enter
+
+    def test_no_options_defaults_user(self):
+        self._enter([]).assert_called_once_with(self.project, user=None)
+
+    def test_user_option_is_forwarded(self):
+        self._enter(["user=root"]).assert_called_once_with(self.project, user="root")
+
+    def test_bad_options_exit_nonzero(self):
+        for options in (["shell=zsh"], ["user"], ["user="], ["user=ro;ot"]):
+            with redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as ctx:
+                    containerctl.cli_enter(argparse.Namespace(project="proj", options=options))
+            self.assertEqual(ctx.exception.code, 1)
 
 
 if __name__ == "__main__":
