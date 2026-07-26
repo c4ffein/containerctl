@@ -1188,11 +1188,13 @@ class Docker:
         return items
 
     @staticmethod
-    def containers(all_containers: bool = True) -> list[dict]:
+    def containers(all_containers: bool = True, include_size: bool = False) -> list[dict]:
         """List containers"""
         args = ["ps", "--format", "{{json .}}"]
         if all_containers:
             args.insert(1, "-a")
+        if not include_size:
+            args.insert(1, "--size=false")
         raw = Docker._run_json(args)
         # Claude did this, not me - we should directly use these objects in the long-term, but since it works...
         return [c.to_dict() for c in (Container.from_dict(r) for r in raw) if c is not None]
