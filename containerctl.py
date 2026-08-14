@@ -983,12 +983,19 @@ def install_self(container: str, expected: list[str]) -> bool:
         ["chown", "-R", "dev:dev", f"{CONTAINER_HOME}/.local", f"{CONTAINER_HOME}/.config"],
     )
     # Ensure ~/.local/bin is on PATH for future interactive shells (idempotent).
+    # Shell required here: the conditional append (`grep -qs ... || echo ... >>`) has
+    # no argv equivalent. Both interpolated values are module-level constants, but
+    # charset-check them at the call site anyway (defense in depth) since they land
+    # in a shell string; the single-quote check guards the `'...'` quoting below.
     bashrc = f"{CONTAINER_HOME}/.bashrc"
     path_line = 'export PATH="$HOME/.local/bin:$PATH"'
-    Docker.exec_noninteractive(
-        container,
-        ["sh", "-c", f"grep -qs '.local/bin' {bashrc} || echo '{path_line}' >> {bashrc}"],
-    )
+    if all(c in VALID_PATH_CHARS for c in bashrc) and "'" not in path_line:
+        Docker.exec_noninteractive(
+            container,
+            ["sh", "-c", f"grep -qs '.local/bin' '{bashrc}' || echo '{path_line}' >> '{bashrc}'"],
+        )
+    else:
+        log_error("install_self.unsafe_shell_value", f"Refusing shell interpolation for {bashrc!r}")
     return ok
 
 
@@ -1188,13 +1195,11 @@ class Docker:
         return items
 
     @staticmethod
-    def containers(all_containers: bool = True, include_size: bool = False) -> list[dict]:
+    def containers(all_containers: bool = True) -> list[dict]:
         """List containers"""
         args = ["ps", "--format", "{{json .}}"]
         if all_containers:
             args.insert(1, "-a")
-        if not include_size:
-            args.insert(1, "--size=false")
         raw = Docker._run_json(args)
         # Claude did this, not me - we should directly use these objects in the long-term, but since it works...
         return [c.to_dict() for c in (Container.from_dict(r) for r in raw) if c is not None]
@@ -1337,7 +1342,13 @@ class Docker:
         subprocess.run(["docker"] + args)
 
     @staticmethod
-    def exec(container_id: str, command: list[str], interactive: bool = True, user: str | None = None) -> None:
+    def exec(
+        container_id: str,
+        command: list[str],
+        interactive: bool = True,
+        user: str | None = None,
+        workdir: str | None = None,
+    ) -> None:
         """Execute command in container"""
         if not is_valid_id(container_id):
             log_error("docker.invalid_id", f"Invalid container ID: {container_id}")
@@ -1345,11 +1356,16 @@ class Docker:
         if user is not None and (not user or not is_valid_id(user)):
             log_error("docker.invalid_user", f"Invalid user: {user}")
             return
+        if workdir is not None and (not workdir or not all(c in VALID_PATH_CHARS for c in workdir)):
+            log_error("docker.invalid_workdir", f"Invalid workdir: {workdir}")
+            return
         args = ["exec"]
         if interactive:
             args.extend(["-it"])
         if user is not None:
             args.extend(["-u", user])
+        if workdir is not None:
+            args.extend(["-w", workdir])
         args.append(container_id)
         args.extend(command)
         subprocess.run(["docker"] + args)
@@ -1547,9 +1563,15 @@ class Docker:
         return True
 
     @staticmethod
-    def exec_noninteractive(container_id: str, command: list[str]) -> subprocess.CompletedProcess:
+    def exec_noninteractive(
+        container_id: str, command: list[str], workdir: str | None = None
+    ) -> subprocess.CompletedProcess:
         """Execute command in container non-interactively (capture output)"""
-        return Docker._run(["exec", container_id] + command)
+        args = ["exec"]
+        if workdir is not None:
+            args.extend(["-w", workdir])
+        args.append(container_id)
+        return Docker._run(args + command)
 
     @staticmethod
     def spawn_project(project: "ProjectConfig") -> bool:
@@ -1596,13 +1618,12 @@ class Docker:
                 clone = ["git", "clone"]
                 if repo.branch:
                     clone += ["-b", repo.branch]
+                # `--` ends option parsing so a URL starting with `-` can't be read as a git option
+                clone.append("--")
                 clone.append(repo.url)
                 if repo.dir:
                     clone.append(repo.dir)
-                result = Docker.exec_noninteractive(
-                    project.container_name,
-                    ["bash", "-c", f"cd /home/dev/workspace && {' '.join(clone)}"],
-                )
+                result = Docker.exec_noninteractive(project.container_name, clone, workdir="/home/dev/workspace")
                 if result.returncode != 0:
                     print(f"Error: git clone failed for {repo.url}: {result.stderr.strip()}", file=sys.stderr)
                     print(f"Cleaning up container {project.container_name}...", file=sys.stderr)
@@ -1658,8 +1679,14 @@ class Docker:
                 workdir = f"/home/dev/workspace/{repo_name}"
         elif len(project.repos) > 1:
             workdir = "/home/dev/workspace"
-        cmd = f"cd {workdir} 2>/dev/null || cd /home/dev; exec bash"
-        Docker.exec(project.container_name, ["bash", "-c", cmd], user=user)
+        # cd into the landing dir if it exists, else fall back home - done atomically inside the
+        # container (no TOCTOU, unlike a separate `test -d` probe then `-w`). workdir rides in as
+        # $1 (data, never interpolated as code); `--` stops cd option-parsing a leading dash.
+        Docker.exec(
+            project.container_name,
+            ["bash", "-c", 'cd -- "$1" 2>/dev/null || cd /home/dev; exec bash', "bash", workdir],
+            user=user,
+        )
 
     @staticmethod
     def destroy_project(project: "ProjectConfig") -> bool:

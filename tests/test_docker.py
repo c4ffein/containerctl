@@ -4,7 +4,9 @@ No real daemon: ``Docker._run`` and ``subprocess.run`` are replaced with
 recorders so we assert on the argv that *would* be executed.
 """
 
+import io
 import unittest
+from contextlib import redirect_stdout
 from unittest import mock
 
 import containerctl
@@ -53,6 +55,14 @@ class CommandConstructionTests(unittest.TestCase):
     def test_returncode_propagates_to_bool(self):
         self.rec.returncode = 1
         self.assertFalse(Docker.start("abc"))
+
+    def test_exec_noninteractive_plain(self):
+        Docker.exec_noninteractive("abc", ["ls", "-la"])
+        self.assertEqual(self.rec.last, ["exec", "abc", "ls", "-la"])
+
+    def test_exec_noninteractive_workdir_inserts_flag(self):
+        Docker.exec_noninteractive("abc", ["ls"], workdir="/home/dev/workspace")
+        self.assertEqual(self.rec.last, ["exec", "-w", "/home/dev/workspace", "abc", "ls"])
 
 
 class IdGuardTests(unittest.TestCase):
@@ -149,6 +159,16 @@ class StreamingCommandTests(unittest.TestCase):
         self.assertEqual(self.rec.calls, [])
         self.assertEqual({e["cat"] for e in get_errors()}, {"docker.invalid_user"})
 
+    def test_exec_with_workdir_inserts_flag(self):
+        Docker.exec("abc", ["bash"], workdir="/home/dev/workspace")
+        self.assertEqual(self.rec.last, ["docker", "exec", "-it", "-w", "/home/dev/workspace", "abc", "bash"])
+
+    def test_exec_rejects_bad_workdir(self):
+        for bad in ("/home;rm -rf /", ""):
+            Docker.exec("abc", ["bash"], workdir=bad)
+        self.assertEqual(self.rec.calls, [])
+        self.assertEqual({e["cat"] for e in get_errors()}, {"docker.invalid_workdir"})
+
     def test_shell_delegates_to_exec(self):
         Docker.shell("abc", shell="/bin/bash")
         self.assertEqual(self.rec.last, ["docker", "exec", "-it", "abc", "/bin/bash"])
@@ -205,6 +225,85 @@ class ProjectAndServiceRunTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("-v") + 1], "/data:/data:ro")
         self.assertEqual(argv[argv.index("-e") + 1], "FOO=bar")
         self.assertEqual(argv[-1], "nginx:latest")
+
+
+class SpawnAndEnterShellFreeTests(unittest.TestCase):
+    """spawn clones through argv (no shell); enter uses a *constant* `bash -c` with the landing
+    dir passed as $1 — never an interpolated string-join, so no injection and no TOCTOU."""
+
+    def setUp(self):
+        reset_errors()
+        self.rec = RunRecorder()
+        self._run_patch = mock.patch.object(Docker, "_run", self.rec)
+        self._run_patch.start()
+        self.sub = SubprocessRecorder()
+        self._sub_patch = mock.patch.object(containerctl.subprocess, "run", self.sub)
+        self._sub_patch.start()
+        self._install_patch = mock.patch.object(containerctl, "install_self", return_value=True)
+        self._install_patch.start()
+        self.project = ProjectConfig(
+            name="demo",
+            image="ubuntu:22.04",
+            repos=[RepoSpec("https://github.com/u/repo.git")],
+        )
+
+    def tearDown(self):
+        self._install_patch.stop()
+        self._sub_patch.stop()
+        self._run_patch.stop()
+
+    def test_spawn_clones_via_workdir_argv_with_option_terminator(self):
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(Docker.spawn_project(self.project))
+        tail = ["git", "clone", "--", "https://github.com/u/repo.git"]
+        self.assertIn(["exec", "-w", "/home/dev/workspace", "cctl-prj-demo"] + tail, self.rec.calls)
+        self.assertTrue(all("bash" not in call for call in self.rec.calls))
+
+    def test_spawn_clone_branch_and_dir_stay_before_and_after_terminator(self):
+        self.project.repos = [RepoSpec("https://github.com/u/repo.git", dir="d", branch="main")]
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(Docker.spawn_project(self.project))
+        tail = ["git", "clone", "-b", "main", "--", "https://github.com/u/repo.git", "d"]
+        self.assertIn(["exec", "-w", "/home/dev/workspace", "cctl-prj-demo"] + tail, self.rec.calls)
+
+    # enter attaches with a constant bash -c; the landing dir rides in as $1 (data, never
+    # interpolated), and `cd -- "$1" || cd /home/dev` does the fallback atomically in-container.
+    ENTER_SCRIPT = 'cd -- "$1" 2>/dev/null || cd /home/dev; exec bash'
+
+    def _enter(self):
+        with mock.patch.object(Docker, "find_project_container", return_value={"State": "running"}):
+            with redirect_stdout(io.StringIO()):
+                Docker.enter_project(self.project)
+
+    def _expected(self, workdir):
+        return ["docker", "exec", "-it", "cctl-prj-demo", "bash", "-c", self.ENTER_SCRIPT, "bash", workdir]
+
+    def test_enter_single_repo_attaches_atomically_without_probe(self):
+        self._enter()
+        self.assertEqual(self.rec.calls, [])  # no `test -d` probe — the cd-or-home fallback is atomic, in-container
+        self.assertEqual(self.sub.last, self._expected("/home/dev/workspace/repo"))
+
+    def test_enter_multi_repo_lands_in_workspace_root(self):
+        self.project.repos = [RepoSpec("https://github.com/u/a.git"), RepoSpec("https://github.com/u/b.git")]
+        self._enter()
+        self.assertEqual(self.sub.last, self._expected("/home/dev/workspace"))
+
+    def test_enter_without_repos_lands_in_home(self):
+        self.project.repos = []
+        self._enter()
+        self.assertEqual(self.rec.calls, [])
+        self.assertEqual(self.sub.last, self._expected("/home/dev"))
+
+    def test_enter_dir_is_passed_as_data_not_interpolated(self):
+        # The script is a constant; the dir is the LAST argv element ($1), and it is quoted +
+        # option-terminated so it can never be parsed as shell code or a cd option.
+        self._enter()
+        script = self.sub.last[self.sub.last.index("-c") + 1]
+        self.assertEqual(script, self.ENTER_SCRIPT)
+        self.assertIn('"$1"', script)
+        self.assertIn("cd --", script)
+        self.assertIn("|| cd /home/dev", script)
+        self.assertEqual(self.sub.last[-1], "/home/dev/workspace/repo")
 
 
 if __name__ == "__main__":

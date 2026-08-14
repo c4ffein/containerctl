@@ -4,6 +4,7 @@ import argparse
 import io
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
 from unittest import mock
 
 import containerctl
@@ -20,6 +21,31 @@ class UsageTests(unittest.TestCase):
         out = buf.getvalue()
         self.assertIn("containerctl - KISS containers CLI/TUI manager", out)
         self.assertIn("service up", out)
+
+    def test_readme_help_block_matches_usage(self):
+        """The README '## Help' code block must match usage() output byte-for-byte.
+
+        The config-dir lines depend on $HOME, so the dirs are patched to their
+        canonical `~` form — the form the README is generated with.
+        """
+        buf = io.StringIO()
+        with (
+            mock.patch.object(containerctl, "PROJECTS_DIR", "~/.config/containerctl/projects"),
+            mock.patch.object(containerctl, "SERVICES_DIR", "~/.config/containerctl/services"),
+            redirect_stdout(buf),
+        ):
+            usage()
+        expected = buf.getvalue().strip()
+
+        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text()
+        help_start = readme.find("## Help")
+        self.assertNotEqual(help_start, -1, "README should have a '## Help' section")
+        block_start = readme.find("```", help_start)
+        self.assertNotEqual(block_start, -1, "README should have a code block after ## Help")
+        block_end = readme.find("```", block_start + 3)
+        self.assertNotEqual(block_end, -1, "README code block should be closed")
+        readme_block = readme[block_start + 3 : block_end].strip()
+        self.assertEqual(readme_block, expected, "README help block drifted from usage() — regenerate it")
 
 
 class MainHelpDispatchTests(unittest.TestCase):
