@@ -16,13 +16,13 @@ test:
 verify: lint-check format-check test
 
 lint-check:
-	uvx ruff check .
+	uvx ruff@0.5.1 check .
 
 lint-fix:
-	uvx ruff check --fix .
+	uvx ruff@0.5.1 check --fix .
 
 format-check:
-	uvx ruff format --check .
+	uvx ruff@0.5.1 format --check .
 
 format-fix:
-	uvx ruff format .
+	uvx ruff@0.5.1 format .

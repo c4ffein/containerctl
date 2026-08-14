@@ -3,8 +3,8 @@ name = "containerctl"
 version = "0.1.0"
 requires-python = ">=3.11"
 
-[tool.uv]
-dev-dependencies = ["ruff"]
+[dependency-groups]
+dev = ["ruff==0.5.1"]
 
 [tool.ruff]
 line-length = 120
