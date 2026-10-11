@@ -176,6 +176,52 @@ class ServiceConfigTests(unittest.TestCase):
         self.assertEqual(cfg.ports, ["8080:80", "4000-5000:4000-5000/tcp"])
         self.assertEqual(cfg.volumes, ["/home/dev/data:/data:ro"])
         self.assertEqual(cfg.scripts["migrate"], ["python", "manage.py", "migrate"])
+        # hardening + networks default off
+        self.assertEqual(cfg.networks, [])
+        self.assertFalse(cfg.read_only)
+        self.assertEqual((cfg.tmpfs, cfg.cap_drop, cfg.cap_add, cfg.pids_limit), ([], [], [], 0))
+
+    def test_networks_and_hardening_parsed(self):
+        content = (
+            'image = "nginx"\n'
+            'networks = ["proxy", "cctl-net-x"]\n'
+            "read_only = true\n"
+            'tmpfs = ["/tmp", "/run:rw,noexec,size=16m,mode=1777"]\n'
+            'cap_drop = ["ALL"]\n'
+            'cap_add = ["NET_BIND_SERVICE", "CHOWN"]\n'
+            "pids_limit = 256\n"
+        )
+        cfg = ServiceConfig.from_toml(write_toml(self.dir, "web", content))
+        self.assertIsNotNone(cfg, get_errors())
+        self.assertEqual(cfg.networks, ["proxy", "cctl-net-x"])
+        self.assertTrue(cfg.read_only)
+        self.assertEqual(cfg.tmpfs, ["/tmp", "/run:rw,noexec,size=16m,mode=1777"])
+        self.assertEqual(cfg.cap_drop, ["ALL"])
+        self.assertEqual(cfg.cap_add, ["NET_BIND_SERVICE", "CHOWN"])
+        self.assertEqual(cfg.pids_limit, 256)
+
+    def test_networks_and_hardening_rejected(self):
+        for body in (
+            'networks = ["bad net"]\n',
+            'networks = ["a;b"]\n',
+            'networks = [""]\n',
+            "networks = [1]\n",
+            'read_only = "yes"\n',
+            'tmpfs = ["tmp"]\n',  # relative
+            'tmpfs = ["/tmp/../etc"]\n',
+            'tmpfs = ["/tmp:size=16m; rm -rf /"]\n',
+            "tmpfs = [1]\n",
+            'cap_drop = ["ALL CAPS"]\n',
+            'cap_add = [""]\n',
+            'pids_limit = "256"\n',
+            "pids_limit = -1\n",
+            "pids_limit = true\n",
+            "pids_limit = 2.5\n",
+        ):
+            reset_errors()
+            path = write_toml(self.dir, "web", 'image = "nginx"\n' + body)
+            self.assertIsNone(ServiceConfig.from_toml(path), body)
+            self.assertEqual(get_errors()[0]["cat"], "service.config", body)
 
     def test_env_is_parsed_into_config(self):
         path = write_toml(self.dir, "web", 'image = "nginx"\nenv = ["FOO=bar"]\n')

@@ -10,6 +10,7 @@ from containerctl import (
     is_valid_port_spec,
     is_valid_rel_dir,
     is_valid_repo_url,
+    is_valid_tmpfs_spec,
 )
 
 
@@ -102,6 +103,16 @@ class IsValidRepoUrlTests(unittest.TestCase):
     def test_rejects_traversal_and_spaces(self):
         self.assertFalse(is_valid_repo_url("https://x/../y"))
         self.assertFalse(is_valid_repo_url("https://x/ y"))
+
+
+class IsValidTmpfsSpecTests(unittest.TestCase):
+    def test_accepts_path_with_optional_options(self):
+        for good in ["/tmp", "/run:size=16m", "/var/cache/app:rw,noexec,nosuid,size=64m,mode=1777,uid=1000"]:
+            self.assertTrue(is_valid_tmpfs_spec(good), good)
+
+    def test_rejects_relative_traversal_and_metachars(self):
+        for bad in ["", "tmp", "/tmp/../x", "/tmp:size=1m;id", "/tmp:$(x)", "/tmp:a b", "/tmp:size=1m:extra"]:
+            self.assertFalse(is_valid_tmpfs_spec(bad), bad)
 
 
 if __name__ == "__main__":

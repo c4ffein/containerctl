@@ -702,6 +702,15 @@ def resolve_enter_target(name: str, projects: dict[str, ProjectConfig]) -> tuple
 
 VALID_RESTART_POLICIES = {"no", "always", "unless-stopped", "on-failure"}
 VALID_VOLUME_SUFFIX = {"ro", "rw"}
+VALID_TMPFS_OPTION_CHARS = VALID_ID_CHARS + ",="  # e.g. "rw,noexec,nosuid,size=64m,mode=1777,uid=1000"
+
+
+def is_valid_tmpfs_spec(spec_str: str) -> bool:
+    """`/path` or `/path:opt,opt=value,...` for `--tmpfs`: absolute path, charset-checked options"""
+    path, _, options = spec_str.partition(":")
+    if not path.startswith("/") or not is_valid_path(path):
+        return False
+    return not options or all(c in VALID_TMPFS_OPTION_CHARS for c in options)
 
 
 @dataclass
@@ -715,6 +724,13 @@ class ServiceConfig:
     volumes: list[str] = field(default_factory=list)
     scripts: dict[str, list[str]] = field(default_factory=dict)
     env: list[str] = field(default_factory=list)
+    networks: list[str] = field(default_factory=list)  # created if missing; `up` connects an existing container
+    # Hardening (all optional, off by default): --read-only, --tmpfs, --cap-drop/--cap-add, --pids-limit
+    read_only: bool = False
+    tmpfs: list[str] = field(default_factory=list)
+    cap_drop: list[str] = field(default_factory=list)
+    cap_add: list[str] = field(default_factory=list)
+    pids_limit: int = 0  # 0 = docker default (unlimited)
 
     @property
     def container_name(self) -> str:
@@ -785,6 +801,38 @@ class ServiceConfig:
                 return None
             env_list.append(e)
 
+        networks = []
+        for n in data.get("networks", []):
+            if not isinstance(n, str) or not n or not is_valid_id(n):
+                log_error("service.config", f"Invalid network name '{n}' in {path}")
+                return None
+            networks.append(n)
+
+        read_only = data.get("read_only", False)
+        if not isinstance(read_only, bool):
+            log_error("service.config", f"Invalid 'read_only' (must be true/false) in {path}")
+            return None
+
+        tmpfs = []
+        for t in data.get("tmpfs", []):
+            if not isinstance(t, str) or not is_valid_tmpfs_spec(t):
+                log_error("service.config", f"Invalid tmpfs spec '{t}' in {path}")
+                return None
+            tmpfs.append(t)
+
+        caps: dict[str, list[str]] = {"cap_drop": [], "cap_add": []}
+        for key in caps:
+            for c in data.get(key, []):
+                if not isinstance(c, str) or not c or not is_valid_id(c):
+                    log_error("service.config", f"Invalid capability '{c}' in '{key}' in {path}")
+                    return None
+                caps[key].append(c)
+
+        pids_limit = data.get("pids_limit", 0)
+        if isinstance(pids_limit, bool) or not isinstance(pids_limit, int) or pids_limit < 0:
+            log_error("service.config", f"Invalid 'pids_limit' (must be a positive integer) in {path}")
+            return None
+
         scripts: dict[str, list[str]] = {}
         scripts_data = data.get("scripts", {})
         if not isinstance(scripts_data, dict):
@@ -810,6 +858,12 @@ class ServiceConfig:
             volumes=volumes,
             scripts=scripts,
             env=env_list,
+            networks=networks,
+            read_only=read_only,
+            tmpfs=tmpfs,
+            cap_drop=caps["cap_drop"],
+            cap_add=caps["cap_add"],
+            pids_limit=pids_limit,
         )
 
 
@@ -1801,6 +1855,11 @@ class Docker:
     @staticmethod
     def create_service_container(service: "ServiceConfig") -> bool:
         """Create and start a container for a service"""
+        # `docker run` takes a single --network; the rest are connected right after creation
+        for network in service.networks:
+            if not Docker.ensure_network(network):
+                log_error("service.create", f"Failed to ensure network {network}")
+                return False
         args = [
             "run",
             "-d",
@@ -1811,6 +1870,18 @@ class Docker:
             "--label",
             f"{LABEL_SERVICE}={service.name}",
         ]
+        if service.networks:
+            args.extend(["--network", service.networks[0]])
+        if service.read_only:
+            args.append("--read-only")
+        for t in service.tmpfs:
+            args.extend(["--tmpfs", t])
+        for c in service.cap_drop:
+            args.extend(["--cap-drop", c])
+        for c in service.cap_add:
+            args.extend(["--cap-add", c])
+        if service.pids_limit:
+            args.extend(["--pids-limit", str(service.pids_limit)])
         for port in service.ports:
             args.extend(["-p", port])
         for vol in service.volumes:
@@ -1825,7 +1896,27 @@ class Docker:
                 f"Failed to create container: {result.stderr.strip()}",
             )
             return False
-        return True
+        return Docker.apply_service_networks(service, already=set(service.networks[:1]))
+
+    @staticmethod
+    def apply_service_networks(service: "ServiceConfig", already: set[str] | None = None) -> bool:
+        """Connect the service container to every configured network it is not on yet.
+
+        `already` skips the inspect (used right after `run --network`). Networks the container
+        is on but the config no longer lists are left alone: `recreate` is the way to drop them."""
+        if already is None:
+            info = Docker.inspect_container(service.container_name)
+            if info is None:
+                return False
+            already = set((info.NetworkSettings.get("Networks") or {}).keys())
+        ok = True
+        for network in service.networks:
+            if network in already:
+                continue
+            if not Docker.ensure_network(network) or not Docker.connect_network(network, service.container_name):
+                log_error("service.network", f"Failed to connect {service.container_name} to {network}")
+                ok = False
+        return ok
 
     @staticmethod
     def service_up(service: "ServiceConfig") -> bool:
@@ -1837,9 +1928,13 @@ class Docker:
         state = container.get("State", "").lower()
         if state != "running":
             print(f"Starting {service.container_name}...")
-            return Docker.start(service.container_name)
-        print(f"Service {service.container_name} is already running")
-        return True
+            if not Docker.start(service.container_name):
+                return False
+        else:
+            print(f"Service {service.container_name} is already running")
+        # Networks added to the config since creation get connected; the hardening flags can't
+        # be changed on a live container, use `service recreate` for those.
+        return Docker.apply_service_networks(service)
 
     @staticmethod
     def service_down(service: "ServiceConfig") -> bool:
@@ -3045,8 +3140,8 @@ def cli_services(args: argparse.Namespace) -> None:
         print(f"No services configured. Add TOML files to {SERVICES_DIR}/ (see: containerctl help config)")
         return
 
-    print(f"{'SERVICE':<20} {'STATUS':<15} {'IMAGE':<30} {'PORTS'}")
-    print("-" * 90)
+    print(f"{'SERVICE':<20} {'STATUS':<15} {'IMAGE':<30} {'PORTS':<30} {'NETWORKS'}")
+    print("-" * 110)
     for name, service in services.items():
         container = Docker.find_service_container(name)
         if container:
@@ -3056,7 +3151,8 @@ def cli_services(args: argparse.Namespace) -> None:
         ports = ", ".join(service.ports[:3])
         if len(service.ports) > 3:
             ports += f" +{len(service.ports) - 3}"
-        print(f"{name:<20} {status:<15} {service.image:<30} {ports}")
+        networks = ", ".join(service.networks) or "-"
+        print(f"{name:<20} {status:<15} {service.image:<30} {ports:<30} {networks}")
 
 
 def usage() -> int:
@@ -3139,6 +3235,12 @@ def config_usage() -> int:
         'ports = ["127.0.0.1:8080:80"]             # [host_ip:]host:container[/udp]; no ip = all interfaces',
         'volumes = ["~/srv/www:/usr/share/nginx/html:ro"]',
         'env = ["TZ=UTC"]',
+        'networks = ["proxy"]                      # created if missing; `up` also connects an existing container',
+        "read_only = true                          # read-only root fs: writable paths must be tmpfs or volumes",
+        'tmpfs = ["/tmp", "/run:size=16m"]         # path[:options]',
+        'cap_drop = ["ALL"]                        # hardening flags apply on create/recreate, not on `up`',
+        'cap_add = ["NET_BIND_SERVICE"]',
+        "pids_limit = 256",
         "[scripts]                                 # `containerctl service script <name> reload`",
         'reload = ["nginx", "-s", "reload"]',
     ]

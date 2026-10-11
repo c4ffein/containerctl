@@ -72,6 +72,9 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(len(project.repos), 2)
         self.assertEqual(service.ports, ["127.0.0.1:8080:80"])
         self.assertIn("reload", service.scripts)
+        self.assertEqual(service.networks, ["proxy"])
+        self.assertTrue(service.read_only)
+        self.assertEqual((service.cap_drop, service.cap_add, service.pids_limit), (["ALL"], ["NET_BIND_SERVICE"], 256))
 
 
 class MainHelpDispatchTests(unittest.TestCase):

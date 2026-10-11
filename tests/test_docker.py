@@ -225,6 +225,111 @@ class ProjectAndServiceRunTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("-v") + 1], "/data:/data:ro")
         self.assertEqual(argv[argv.index("-e") + 1], "FOO=bar")
         self.assertEqual(argv[-1], "nginx:latest")
+        # no networks / hardening configured -> none of their flags, and no network commands at all
+        for flag in ("--network", "--read-only", "--tmpfs", "--cap-drop", "--cap-add", "--pids-limit"):
+            self.assertNotIn(flag, argv)
+        self.assertEqual(len(self.rec.calls), 1)
+
+    def test_create_service_container_hardening_flags(self):
+        service = ServiceConfig(
+            name="web",
+            image="nginx",
+            read_only=True,
+            tmpfs=["/tmp", "/run:size=16m"],
+            cap_drop=["ALL"],
+            cap_add=["NET_BIND_SERVICE"],
+            pids_limit=256,
+        )
+        self.assertTrue(Docker.create_service_container(service))
+        argv = self.rec.last
+        self.assertIn("--read-only", argv)
+        self.assertEqual([argv[i + 1] for i, a in enumerate(argv) if a == "--tmpfs"], ["/tmp", "/run:size=16m"])
+        self.assertEqual(argv[argv.index("--cap-drop") + 1], "ALL")
+        self.assertEqual(argv[argv.index("--cap-add") + 1], "NET_BIND_SERVICE")
+        self.assertEqual(argv[argv.index("--pids-limit") + 1], "256")
+        self.assertEqual(argv[-1], "nginx")
+
+    def test_create_service_container_networks_first_on_run_rest_connected(self):
+        service = ServiceConfig(name="web", image="nginx", networks=["proxy", "backend"])
+        self.assertTrue(Docker.create_service_container(service))
+        calls = self.rec.calls
+        # every network is ensured (inspect succeeds with the recorder, so no create) before the run
+        run_idx = next(i for i, c in enumerate(calls) if c[0] == "run")
+        self.assertEqual(calls[:run_idx], [["network", "inspect", "proxy"], ["network", "inspect", "backend"]])
+        argv = calls[run_idx]
+        self.assertEqual(argv[argv.index("--network") + 1], "proxy")
+        self.assertEqual(argv.count("--network"), 1)
+        # the second network is connected after creation, the first is not connected twice
+        self.assertEqual(
+            calls[run_idx + 1 :], [["network", "inspect", "backend"], ["network", "connect", "backend", "cctl-svc-web"]]
+        )
+
+    def test_create_service_container_fails_when_network_cannot_be_ensured(self):
+        self.rec.returncode = 1  # inspect fails and so does create
+        service = ServiceConfig(name="web", image="nginx", networks=["proxy"])
+        self.assertFalse(Docker.create_service_container(service))
+        self.assertTrue(all(c[0] != "run" for c in self.rec.calls))
+
+
+class ServiceUpNetworkTests(unittest.TestCase):
+    """`service up` on an existing container connects networks added to the config since creation."""
+
+    def setUp(self):
+        reset_errors()
+        self.rec = RunRecorder()
+        self._run = mock.patch.object(Docker, "_run", self.rec)
+        self._run.start()
+        self.service = ServiceConfig(name="web", image="nginx", networks=["proxy", "backend"])
+
+    def tearDown(self):
+        self._run.stop()
+
+    def _inspect(self, *networks):
+        info = containerctl.ContainerInspect(
+            Id="abc",
+            Name="/cctl-svc-web",
+            Created="",
+            State={},
+            Image="nginx",
+            Config={},
+            NetworkSettings={"Networks": {n: {} for n in networks}},
+        )
+        return mock.patch.object(Docker, "inspect_container", return_value=info)
+
+    def test_running_container_gets_missing_networks_only(self):
+        with mock.patch.object(Docker, "find_service_container", return_value={"State": "running"}):
+            with self._inspect("proxy"), redirect_stdout(io.StringIO()):
+                self.assertTrue(Docker.service_up(self.service))
+        self.assertEqual(
+            self.rec.calls, [["network", "inspect", "backend"], ["network", "connect", "backend", "cctl-svc-web"]]
+        )
+
+    def test_already_connected_everywhere_is_a_noop(self):
+        with mock.patch.object(Docker, "find_service_container", return_value={"State": "running"}):
+            with self._inspect("proxy", "backend", "bridge"), redirect_stdout(io.StringIO()):
+                self.assertTrue(Docker.service_up(self.service))
+        self.assertEqual(self.rec.calls, [])  # extra networks (bridge) are left alone
+
+    def test_stopped_container_is_started_then_connected(self):
+        with mock.patch.object(Docker, "find_service_container", return_value={"State": "exited"}):
+            with self._inspect(), redirect_stdout(io.StringIO()):
+                self.assertTrue(Docker.service_up(self.service))
+        self.assertEqual(self.rec.calls[0], ["start", "cctl-svc-web"])
+        self.assertIn(["network", "connect", "proxy", "cctl-svc-web"], self.rec.calls)
+        self.assertIn(["network", "connect", "backend", "cctl-svc-web"], self.rec.calls)
+
+    def test_missing_container_is_created(self):
+        with mock.patch.object(Docker, "find_service_container", return_value=None):
+            with redirect_stdout(io.StringIO()):
+                self.assertTrue(Docker.service_up(self.service))
+        self.assertTrue(any(c[0] == "run" for c in self.rec.calls))
+
+    def test_connect_failure_is_reported(self):
+        with mock.patch.object(Docker, "find_service_container", return_value={"State": "running"}):
+            with self._inspect("proxy"), redirect_stdout(io.StringIO()):
+                self.rec.returncode = 1
+                self.assertFalse(Docker.service_up(self.service))
+        self.assertEqual(get_errors()[-1]["cat"], "service.network")
 
 
 class SpawnAndEnterShellFreeTests(unittest.TestCase):
