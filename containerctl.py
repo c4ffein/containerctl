@@ -9,6 +9,7 @@ WARNING: I don't recommand using this as-is. This a PoC, and usable by me becaus
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -24,19 +25,14 @@ from typing import Callable
 # Error Registry
 # =============================================================================
 
-_errors: list[dict] = []
+_errors: list[dict] = []  # every occurrence, oldest first: {"ts", "cat", "msg", "ctx"}
+ERROR_MAX_ENTRIES = 10_000  # a broken config logs once per TUI tick; keep memory bounded, newest kept
 
 
 def log_error(category: str, message: str, context: dict | None = None) -> None:
-    """Log a non-fatal error to the global registry"""
-    _errors.append(
-        {
-            "ts": time.time(),
-            "cat": category,
-            "msg": message,
-            "ctx": context or {},
-        }
-    )
+    """Log a non-fatal error to the global registry (every occurrence; the TUI dedups on display)"""
+    _errors.append({"ts": time.time(), "cat": category, "msg": message, "ctx": context or {}})
+    del _errors[:-ERROR_MAX_ENTRIES]
 
 
 def get_errors() -> list[dict]:
@@ -64,18 +60,20 @@ def clear_errors(category: str) -> int:
 
 
 def fetch_errors() -> list[dict]:
-    """Fetch errors formatted for the TUI tab"""
+    """Fetch errors formatted for the TUI tab: one row per category, latest message with its repeat count"""
     grouped = get_errors_by_category()
     if not grouped:
         return [{"Category": "No errors", "Count": "", "Latest": "", "_category": ""}]
     result = []
     for cat, errs in sorted(grouped.items()):
         latest = errs[-1]
+        repeats = sum(1 for e in errs if e["msg"] == latest["msg"])
+        suffix = f" (x{repeats})" if repeats > 1 else ""
         result.append(
             {
                 "Category": cat,
                 "Count": str(len(errs)),
-                "Latest": latest["msg"][:50],
+                "Latest": latest["msg"][:50] + suffix,
                 "_category": cat,  # Hidden field for clearing
             }
         )
@@ -87,10 +85,10 @@ def fetch_errors() -> list[dict]:
 # =============================================================================
 
 VALID_ID_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
-VALID_IMAGE_REF_CHARS = VALID_ID_CHARS + "/:."  # Images can have repo/name:tag and registry.domain
+VALID_IMAGE_REF_CHARS = VALID_ID_CHARS + "/:.@"  # repo/name:tag, registry.domain, name@sha256:<digest>
 VALID_PATH_CHARS = VALID_ID_CHARS + "/:.~+ "  # Paths can have slashes, dots, tildes, etc.
 VALID_REPO_URL_CHARS = VALID_ID_CHARS + "/:@."  # Git URLs: git@github.com:user/repo.git or https://...
-VALID_PORT_SPEC_CHARS = "0123456789:-/udptcp"  # Port specs: 8080:80, 8080:80/tcp, 4000-5000:4000-5000
+VALID_PORT_PROTOCOLS = {"tcp", "udp"}
 
 
 def is_valid_id(id_str: str) -> bool:
@@ -116,6 +114,39 @@ def is_valid_path(path_str: str) -> bool:
 def is_valid_repo_url(url_str: str) -> bool:
     """Check if repo URL contains only valid characters and no traversal"""
     return all(c in VALID_REPO_URL_CHARS for c in url_str) and not has_path_traversal(url_str)
+
+
+def _is_uint(text: str, upper: int) -> bool:
+    """ASCII decimal digits only (str.isdigit also takes unicode digits), within [0, upper]"""
+    return text.isascii() and text.isdigit() and int(text) <= upper
+
+
+def _is_port_range(text: str) -> bool:
+    """`80` or `4000-4010`"""
+    parts = text.split("-")
+    return len(parts) in (1, 2) and all(_is_uint(p, 65535) for p in parts)
+
+
+def _is_ipv4(text: str) -> bool:
+    parts = text.split(".")
+    return len(parts) == 4 and all(_is_uint(p, 255) for p in parts)
+
+
+def is_valid_port_spec(spec_str: str) -> bool:
+    """Check a `-p` publish spec: [host_ip:]host_port[-host_port]:container_port[-container_port][/tcp|udp]
+
+    Also accepts just the container port (docker then picks a free host port). Host ip is IPv4 only, KISS."""
+    body, _, proto = spec_str.rpartition("/")
+    if not body:  # no "/": rpartition put the whole string in `proto`
+        body, proto = proto, "tcp"
+    if proto not in VALID_PORT_PROTOCOLS:
+        return False
+    parts = body.split(":")
+    if len(parts) == 3:
+        if not _is_ipv4(parts[0]):
+            return False
+        parts = parts[1:]
+    return len(parts) in (1, 2) and all(_is_port_range(p) for p in parts)
 
 
 @dataclass
@@ -472,6 +503,17 @@ class EnvFile:
 # Git branch/ref names may contain slashes (e.g. feature/foo), repo dir names may not
 VALID_REPO_NAME_CHARS = VALID_ID_CHARS + "-._"
 VALID_BRANCH_CHARS = VALID_REPO_NAME_CHARS + "/"
+VALID_REL_DIR_CHARS = VALID_REPO_NAME_CHARS + "/"  # shortcut targets: dirs relative to the workspace
+
+
+def is_valid_rel_dir(dir_str: str) -> bool:
+    """A relative directory under the workspace: no leading slash, no '..', plain charset"""
+    return (
+        bool(dir_str)
+        and not dir_str.startswith("/")
+        and all(c in VALID_REL_DIR_CHARS for c in dir_str)
+        and not has_path_traversal(dir_str)
+    )
 
 
 @dataclass
@@ -499,6 +541,7 @@ class ProjectConfig:
     repos: list[RepoSpec] = field(default_factory=list)
     ssh_key: str = ""
     env_files: list[EnvFile] = field(default_factory=list)
+    shortcuts: dict[str, str] = field(default_factory=dict)  # alias -> dir relative to the workspace
 
     @property
     def container_name(self) -> str:
@@ -598,12 +641,28 @@ class ProjectConfig:
                     return None
                 env_files.append(EnvFile(src=src_expanded, dest=dest))
 
+        # [shortcuts]: `containerctl enter <alias>` lands in <workspace>/<dir> of this project
+        shortcuts: dict[str, str] = {}
+        raw_shortcuts = data.get("shortcuts", {})
+        if not isinstance(raw_shortcuts, dict):
+            log_error("project.config", f"Invalid 'shortcuts' (must be a table) in {path}")
+            return None
+        for alias, rel_dir in raw_shortcuts.items():
+            if not alias or not is_valid_id(alias):
+                log_error("project.config", f"Invalid shortcut name '{alias}' in {path}")
+                return None
+            if not isinstance(rel_dir, str) or not is_valid_rel_dir(rel_dir):
+                log_error("project.config", f"Invalid shortcut dir '{rel_dir}' for '{alias}' in {path}")
+                return None
+            shortcuts[alias] = rel_dir
+
         return cls(
             name=name,
             image=image,
             repos=repos,
             ssh_key=ssh_key,
             env_files=env_files,
+            shortcuts=shortcuts,
         )
 
 
@@ -616,7 +675,29 @@ def load_projects() -> dict[str, ProjectConfig]:
         project = ProjectConfig.from_toml(path)
         if project:
             projects[project.name] = project
+    # Shortcuts resolve globally, so flag the two collisions that make `enter <name>` surprising
+    owners: dict[str, list[str]] = {}
+    for project in projects.values():
+        for alias in project.shortcuts:
+            owners.setdefault(alias, []).append(project.name)
+    for alias, names in owners.items():
+        if alias in projects:
+            log_error("project.shortcut", f"Shortcut '{alias}' ({', '.join(names)}) is shadowed by project '{alias}'")
+        elif len(names) > 1:
+            log_error("project.shortcut", f"Shortcut '{alias}' is defined by several projects: {', '.join(names)}")
     return projects
+
+
+def resolve_enter_target(name: str, projects: dict[str, ProjectConfig]) -> tuple[ProjectConfig, str | None] | None:
+    """What `enter <name>` means: a project (land in the default dir), else a shortcut that
+    exactly one project declares (land in that dir). None when unknown or ambiguous."""
+    if name in projects:
+        return projects[name], None
+    hits = [(p, rel) for p in projects.values() for alias, rel in p.shortcuts.items() if alias == name]
+    if len(hits) != 1:
+        return None
+    project, rel_dir = hits[0]
+    return project, f"{CONTAINER_WORKSPACE}/{rel_dir}"
 
 
 VALID_RESTART_POLICIES = {"no", "always", "unless-stopped", "on-failure"}
@@ -671,7 +752,7 @@ class ServiceConfig:
 
         ports = []
         for p in data.get("ports", []):
-            if not isinstance(p, str) or not all(c in VALID_PORT_SPEC_CHARS for c in p):
+            if not isinstance(p, str) or not is_valid_port_spec(p):
                 log_error("service.config", f"Invalid port spec '{p}' in {path}")
                 return None
             ports.append(p)
@@ -1537,6 +1618,7 @@ class Docker:
         args = [
             "run",
             "-d",
+            "--init",  # PID 1 is `sleep infinity`, which never reaps the children `docker exec` leaves behind
             "--name",
             project.container_name,
             "--network",
@@ -1650,8 +1732,10 @@ class Docker:
         return True
 
     @staticmethod
-    def enter_project(project: "ProjectConfig", user: str | None = None) -> None:
-        """Enter a project: spawn if needed, start if stopped, then attach shell"""
+    def enter_project(project: "ProjectConfig", user: str | None = None, workdir: str | None = None) -> None:
+        """Enter a project: spawn if needed, start if stopped, then attach a shell.
+
+        `workdir` (a shortcut target) overrides the default landing directory."""
         container = Docker.find_project_container(project.name)
 
         if container is None:
@@ -1672,13 +1756,14 @@ class Docker:
         #   - exactly one repo  -> enter that repo's dir
         #   - multiple repos     -> enter the shared workspace root
         #   - no repo            -> home
-        workdir = "/home/dev"
-        if len(project.repos) == 1:
-            repo_name = project.repos[0].name
-            if repo_name and all(c in VALID_REPO_NAME_CHARS for c in repo_name):
-                workdir = f"/home/dev/workspace/{repo_name}"
-        elif len(project.repos) > 1:
-            workdir = "/home/dev/workspace"
+        if workdir is None:
+            workdir = "/home/dev"
+            if len(project.repos) == 1:
+                repo_name = project.repos[0].name
+                if repo_name and all(c in VALID_REPO_NAME_CHARS for c in repo_name):
+                    workdir = f"/home/dev/workspace/{repo_name}"
+            elif len(project.repos) > 1:
+                workdir = "/home/dev/workspace"
         # cd into the landing dir if it exists, else fall back home - done atomically inside the
         # container (no TOCTOU, unlike a separate `test -d` probe then `-w`). workdir rides in as
         # $1 (data, never interpolated as code); `--` stops cd option-parsing a leading dash.
@@ -1980,9 +2065,9 @@ class UI:
             value = str(item.get(key, ""))
             text = value[:col_width].ljust(col_width)
 
-            # Apply status colors
-            if status_colors and key in status_colors:
-                status = item.get(key, "").lower()
+            # Apply status colors (the map is keyed by status substring; it applies to the Status column)
+            if status_colors and key == "Status":
+                status = str(item.get(key, "")).lower()
                 for status_key, color in status_colors.items():
                     if status_key in status:
                         text = color + text + Term.RESET
@@ -2602,6 +2687,41 @@ class App:
 # =============================================================================
 
 
+TABLE_MIN_COL = 8
+
+
+def format_table(headers: list[str], rows: list[list[str]], width: int | None, shrink: list[int]) -> list[str]:
+    """Render left-aligned columns sized to their content.
+
+    With a `width`, the columns listed in `shrink` give up space until the widest line fits:
+    always the widest of them first (ties: earlier in `shrink`), one character at a time, so
+    long columns end up balanced instead of one being crushed. None goes under TABLE_MIN_COL.
+    Clipped cells end with '…'. `width=None` never clips (piped output, `--wide`)."""
+    widths = [max(len(h), *(len(r[i]) for r in rows)) if rows else len(h) for i, h in enumerate(headers)]
+    if width is not None:
+        while sum(widths) + len(widths) - 1 > width:
+            candidates = [i for i in shrink if widths[i] > TABLE_MIN_COL]
+            if not candidates:
+                break
+            widths[max(candidates, key=lambda i: widths[i])] -= 1
+
+    def cell(text: str, w: int) -> str:
+        return text if len(text) <= w else text[: w - 1] + "…"
+
+    lines = [" ".join(f"{cell(h, w):<{w}}" for h, w in zip(headers, widths)).rstrip()]
+    lines.append("-" * (sum(widths) + len(widths) - 1))
+    for row in rows:
+        lines.append(" ".join(f"{cell(c, w):<{w}}" for c, w in zip(row, widths)).rstrip())
+    return lines
+
+
+def _table_width(wide: bool) -> int | None:
+    """Terminal width to fit tables into; None (no clipping) when asked or when not on a tty"""
+    if wide or not sys.stdout.isatty():
+        return None
+    return shutil.get_terminal_size().columns
+
+
 def cli_ps(args: argparse.Namespace) -> None:
     """List containers"""
     containers = Docker.containers(all_containers=not args.running)
@@ -2611,15 +2731,20 @@ def cli_ps(args: argparse.Namespace) -> None:
             print(c.get("ID", ""))
         return
 
-    # Print table
-    print(f"{'NAME':<25} {'STATUS':<20} {'IMAGE':<30} {'PORTS'}")
-    print("-" * 80)
-    for c in containers:
-        name = c.get("Names", "")[:24]
-        status = c.get("Status", "")[:19]
-        image = c.get("Image", "")[:29]
-        ports = c.get("Ports", "")
-        print(f"{name:<25} {status:<20} {image:<30} {ports}")
+    headers = ["ID", "NAME", "STATUS", "IMAGE", "PORTS", "NETWORKS"]
+    rows = [
+        [
+            c.get("ID", "")[:12],
+            c.get("Names", ""),
+            c.get("Status", ""),
+            c.get("Image", ""),
+            c.get("Ports", ""),
+            c.get("Networks", ""),
+        ]
+        for c in containers
+    ]
+    # Give up NETWORKS first, then PORTS, IMAGE, NAME, STATUS; the ID is never clipped
+    print("\n".join(format_table(headers, rows, _table_width(args.wide), shrink=[5, 4, 3, 1, 2])))
 
 
 def cli_images(args: argparse.Namespace) -> None:
@@ -2722,11 +2847,15 @@ def cli_shell(args: argparse.Namespace) -> None:
 def cli_enter(args: argparse.Namespace) -> None:
     """Enter a project (spawn or attach)"""
     projects = load_projects()
-    if args.project not in projects:
-        print(f"Unknown project: {args.project}", file=sys.stderr)
+    target = resolve_enter_target(args.project, projects)
+    if target is None:
+        shortcuts = sorted({alias for p in projects.values() for alias in p.shortcuts})
+        print(f"Unknown project or shortcut: {args.project}", file=sys.stderr)
         print(f"Available projects: {', '.join(projects.keys()) or 'none'}", file=sys.stderr)
-        print(f"Add project configs to {PROJECTS_DIR}/", file=sys.stderr)
+        print(f"Available shortcuts: {', '.join(shortcuts) or 'none'}", file=sys.stderr)
+        print(f"Add project configs to {PROJECTS_DIR}/ (see: containerctl help config)", file=sys.stderr)
         sys.exit(1)
+    project, workdir = target
     user = None
     for option in args.options:
         key, sep, value = option.partition("=")
@@ -2737,7 +2866,7 @@ def cli_enter(args: argparse.Namespace) -> None:
             print(f"Invalid user: {value}", file=sys.stderr)
             sys.exit(1)
         user = value
-    Docker.enter_project(projects[args.project], user=user)
+    Docker.enter_project(project, user=user, workdir=workdir)
 
 
 def cli_spawn(args: argparse.Namespace) -> None:
@@ -2769,11 +2898,11 @@ def cli_projects(args: argparse.Namespace) -> None:
     """List configured projects and their container status"""
     projects = load_projects()
     if not projects:
-        print(f"No projects configured. Add TOML files to {PROJECTS_DIR}/")
+        print(f"No projects configured. Add TOML files to {PROJECTS_DIR}/ (see: containerctl help config)")
         return
 
-    print(f"{'PROJECT':<20} {'STATUS':<15} {'IMAGE':<30} {'REPO'}")
-    print("-" * 90)
+    print(f"{'PROJECT':<20} {'STATUS':<15} {'IMAGE':<30} {'REPO':<30} {'SHORTCUTS'}")
+    print("-" * 110)
     for name, project in projects.items():
         container = Docker.find_project_container(name)
         if container:
@@ -2781,7 +2910,8 @@ def cli_projects(args: argparse.Namespace) -> None:
         else:
             status = "not created"
         repo = project.repos_display
-        print(f"{name:<20} {status:<15} {project.image:<30} {repo}")
+        shortcuts = ", ".join(project.shortcuts) or "-"
+        print(f"{name:<20} {status:<15} {project.image:<30} {repo:<30} {shortcuts}")
 
 
 def _check_one(project: "ProjectConfig") -> bool | None:
@@ -2805,7 +2935,7 @@ def cli_check(args: argparse.Namespace) -> None:
     if args.all:
         targets = list(projects.values())
         if not targets:
-            print(f"No projects configured. Add TOML files to {PROJECTS_DIR}/")
+            print(f"No projects configured. Add TOML files to {PROJECTS_DIR}/ (see: containerctl help config)")
             return
     else:
         if args.project is None:
@@ -2912,7 +3042,7 @@ def cli_services(args: argparse.Namespace) -> None:
     """List configured services and their container status"""
     services = load_services()
     if not services:
-        print(f"No services configured. Add TOML files to {SERVICES_DIR}/")
+        print(f"No services configured. Add TOML files to {SERVICES_DIR}/ (see: containerctl help config)")
         return
 
     print(f"{'SERVICE':<20} {'STATUS':<15} {'IMAGE':<30} {'PORTS'}")
@@ -2936,10 +3066,12 @@ def usage() -> int:
         "──────────────────────────────────────────────",
         "- containerctl                          ==> launch TUI",
         "- containerctl help                     ==> show this help",
+        "- containerctl help config              ==> example project and service TOML",
         "──────────────────────────────────────────────",
         "- containerctl ps                       ==> list containers",
         "- containerctl ps -q                    ==> list container IDs only",
         "- containerctl ps -r                    ==> list running containers only",
+        "- containerctl ps -w                    ==> wide: never clip columns to the terminal width",
         "- containerctl images                   ==> list images",
         "- containerctl images -q                ==> list image IDs only",
         "- containerctl volumes                  ==> list volumes",
@@ -2961,6 +3093,7 @@ def usage() -> int:
         "──────────────────────────────────────────────",
         "- containerctl enter <project>          ==> enter project (spawn or attach)",
         "- containerctl enter <proj> user=root   ==> enter project as another user",
+        "- containerctl enter <shortcut>         ==> enter project, landing in a [shortcuts] dir",
         "- containerctl spawn <project>          ==> force-create project container",
         "- containerctl destroy <project>        ==> stop and remove project container",
         "- containerctl projects                 ==> list configured projects",
@@ -2983,10 +3116,42 @@ def usage() -> int:
     return 0
 
 
+def config_usage() -> int:
+    """Display example project and service configs (every supported field)"""
+    output_lines = [
+        f"# {PROJECTS_DIR}/<name>.toml  -  the file name is the project name",
+        'image = "ubuntu:24.04"                    # or pin by digest: "ubuntu@sha256:..."',
+        'ssh_key = "~/.ssh/id_ed25519"             # copied to /home/dev/.ssh/id_ed25519 (optional)',
+        "repos = [                                 # cloned under /home/dev/workspace (optional)",
+        '  "git@github.com:you/app.git",',
+        '  { url = "https://github.com/you/lib.git", dir = "lib", branch = "main" },',
+        "]",
+        "env_files = [                             # copied into the container (optional)",
+        '  { src = "~/.secrets/app.env", dest = "/home/dev/workspace/app/.env" },',
+        "]",
+        "[shortcuts]                               # `containerctl enter <alias>` lands there (optional)",
+        'app = "app"                               # relative to /home/dev/workspace',
+        'lib = "lib/src"',
+        "",
+        f"# {SERVICES_DIR}/<name>.toml  -  the file name is the service name",
+        'image = "nginx:1.27"',
+        'restart = "unless-stopped"                # no | always | unless-stopped | on-failure',
+        'ports = ["127.0.0.1:8080:80"]             # [host_ip:]host:container[/udp]; no ip = all interfaces',
+        'volumes = ["~/srv/www:/usr/share/nginx/html:ro"]',
+        'env = ["TZ=UTC"]',
+        "[scripts]                                 # `containerctl service script <name> reload`",
+        'reload = ["nginx", "-s", "reload"]',
+    ]
+    print("\n" + "\n".join(output_lines) + "\n")
+    return 0
+
+
 def main() -> None:
     """Main entry point"""
     # Check for help before argparse
     if len(sys.argv) > 1 and sys.argv[1] in ("help", "-h", "--help"):
+        if sys.argv[2:] == ["config"]:
+            sys.exit(config_usage())
         sys.exit(usage())
 
     parser = argparse.ArgumentParser(
@@ -3001,6 +3166,7 @@ def main() -> None:
     ps_parser = subparsers.add_parser("ps", help="List containers")
     ps_parser.add_argument("-q", "--quiet", action="store_true", help="Only show IDs")
     ps_parser.add_argument("-r", "--running", action="store_true", help="Only running")
+    ps_parser.add_argument("-w", "--wide", action="store_true", help="Never clip columns to the terminal width")
     ps_parser.set_defaults(func=cli_ps)
 
     # images

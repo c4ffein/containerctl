@@ -7,10 +7,12 @@ containerctl - KISS containers CLI/TUI manager
 ──────────────────────────────────────────────
 - containerctl                          ==> launch TUI
 - containerctl help                     ==> show this help
+- containerctl help config              ==> example project and service TOML
 ──────────────────────────────────────────────
 - containerctl ps                       ==> list containers
 - containerctl ps -q                    ==> list container IDs only
 - containerctl ps -r                    ==> list running containers only
+- containerctl ps -w                    ==> wide: never clip columns to the terminal width
 - containerctl images                   ==> list images
 - containerctl images -q                ==> list image IDs only
 - containerctl volumes                  ==> list volumes
@@ -32,6 +34,7 @@ containerctl - KISS containers CLI/TUI manager
 ──────────────────────────────────────────────
 - containerctl enter <project>          ==> enter project (spawn or attach)
 - containerctl enter <proj> user=root   ==> enter project as another user
+- containerctl enter <shortcut>         ==> enter project, landing in a [shortcuts] dir
 - containerctl spawn <project>          ==> force-create project container
 - containerctl destroy <project>        ==> stop and remove project container
 - containerctl projects                 ==> list configured projects

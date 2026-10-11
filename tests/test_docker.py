@@ -200,7 +200,7 @@ class ProjectAndServiceRunTests(unittest.TestCase):
         # ensure_network runs `network inspect` (ok) then we expect the run line.
         self.assertTrue(Docker.create_project_container(project))
         argv = self.rec.last
-        self.assertEqual(argv[:2], ["run", "-d"])
+        self.assertEqual(argv[:3], ["run", "-d", "--init"])  # --init reaps what `docker exec` leaves behind
         self.assertIn("--name", argv)
         self.assertIn("cctl-prj-demo", argv)
         self.assertIn("cctl-net-demo", argv)
@@ -270,10 +270,10 @@ class SpawnAndEnterShellFreeTests(unittest.TestCase):
     # interpolated), and `cd -- "$1" || cd /home/dev` does the fallback atomically in-container.
     ENTER_SCRIPT = 'cd -- "$1" 2>/dev/null || cd /home/dev; exec bash'
 
-    def _enter(self):
+    def _enter(self, **kwargs):
         with mock.patch.object(Docker, "find_project_container", return_value={"State": "running"}):
             with redirect_stdout(io.StringIO()):
-                Docker.enter_project(self.project)
+                Docker.enter_project(self.project, **kwargs)
 
     def _expected(self, workdir):
         return ["docker", "exec", "-it", "cctl-prj-demo", "bash", "-c", self.ENTER_SCRIPT, "bash", workdir]
@@ -293,6 +293,10 @@ class SpawnAndEnterShellFreeTests(unittest.TestCase):
         self._enter()
         self.assertEqual(self.rec.calls, [])
         self.assertEqual(self.sub.last, self._expected("/home/dev"))
+
+    def test_enter_workdir_override_wins_over_repo_landing(self):
+        self._enter(workdir="/home/dev/workspace/repo/sub")
+        self.assertEqual(self.sub.last, self._expected("/home/dev/workspace/repo/sub"))
 
     def test_enter_dir_is_passed_as_data_not_interpolated(self):
         # The script is a constant; the dir is the LAST argv element ($1), and it is quoted +

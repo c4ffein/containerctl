@@ -1,6 +1,7 @@
 """Tests for the in-process error registry used by the TUI 'errors' tab."""
 
 import unittest
+import unittest.mock
 
 import containerctl
 from containerctl import (
@@ -58,6 +59,31 @@ class ErrorRegistryTests(unittest.TestCase):
         self.assertEqual(rows[0]["Category"], "cat.a")
         self.assertEqual(rows[0]["Count"], "1")
         self.assertEqual(len(rows[0]["Latest"]), 50)
+
+    def test_every_occurrence_is_recorded_in_order(self):
+        log_error("cat.a", "boom", {"first": 1})
+        log_error("cat.a", "other")
+        log_error("cat.a", "boom", {"second": 2})
+        errors = get_errors()
+        self.assertEqual([e["msg"] for e in errors], ["boom", "other", "boom"])
+        self.assertEqual([e["ctx"] for e in errors if e["msg"] == "boom"], [{"first": 1}, {"second": 2}])
+        self.assertLessEqual(errors[0]["ts"], errors[-1]["ts"])
+
+    def test_registry_is_capped_keeping_the_newest(self):
+        with unittest.mock.patch.object(containerctl, "ERROR_MAX_ENTRIES", 3):
+            for i in range(5):
+                log_error("cat.a", "boom", {"i": i})
+        self.assertEqual([e["ctx"]["i"] for e in get_errors()], [2, 3, 4])
+
+    def test_fetch_errors_counts_repeats_and_marks_latest(self):
+        log_error("cat.a", "boom")
+        log_error("cat.a", "boom")
+        log_error("cat.a", "boom")
+        log_error("cat.a", "other")
+        log_error("cat.a", "other")
+        rows = fetch_errors()
+        self.assertEqual(rows[0]["Count"], "5")  # every occurrence in the category
+        self.assertEqual(rows[0]["Latest"], "other (x2)")  # repeats of the latest message only
 
     def test_clear_rebind_is_observable_through_module(self):
         # clear_errors() rebinds the module global; get_errors() must still

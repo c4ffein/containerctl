@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from containerctl import ProjectConfig, RepoSpec, ServiceConfig, get_errors
+from containerctl import ProjectConfig, RepoSpec, ServiceConfig, get_errors, resolve_enter_target
 from tests.helper import reset_errors
 
 
@@ -102,6 +102,52 @@ class ProjectConfigTests(unittest.TestCase):
         self.assertEqual(len(cfg.env_files), 1)
         self.assertEqual(cfg.env_files[0].dest, "/home/dev/.env")
 
+    def test_image_digest_accepted(self):
+        path = write_toml(self.dir, "p", f'image = "ubuntu@sha256:{"a" * 64}"\n')
+        self.assertIsNotNone(ProjectConfig.from_toml(path))
+
+    def test_shortcuts_parsed(self):
+        content = 'image = "ubuntu"\n[shortcuts]\napp = "app"\nlib = "lib/src"\n'
+        cfg = ProjectConfig.from_toml(write_toml(self.dir, "p", content))
+        self.assertEqual(cfg.shortcuts, {"app": "app", "lib": "lib/src"})
+
+    def test_shortcuts_default_empty(self):
+        cfg = ProjectConfig.from_toml(write_toml(self.dir, "p", 'image = "ubuntu"\n'))
+        self.assertEqual(cfg.shortcuts, {})
+
+    def test_shortcuts_rejected(self):
+        for body in (
+            'shortcuts = "app"\n',  # not a table
+            '[shortcuts]\n"bad name" = "app"\n',
+            '[shortcuts]\napp = "/abs"\n',
+            '[shortcuts]\napp = "../up"\n',
+            '[shortcuts]\napp = ""\n',
+            "[shortcuts]\napp = 1\n",
+        ):
+            path = write_toml(self.dir, "p", 'image = "ubuntu"\n' + body)
+            self.assertIsNone(ProjectConfig.from_toml(path), body)
+
+
+class ResolveEnterTargetTests(unittest.TestCase):
+    def setUp(self):
+        self.a = ProjectConfig(name="a", image="ubuntu", shortcuts={"x": "x", "both": "a-both"})
+        self.b = ProjectConfig(name="b", image="ubuntu", shortcuts={"y": "y/sub", "both": "b-both", "a": "a"})
+        self.projects = {"a": self.a, "b": self.b}
+
+    def test_project_name_lands_in_default_dir(self):
+        self.assertEqual(resolve_enter_target("a", self.projects), (self.a, None))
+
+    def test_project_name_wins_over_shortcut(self):
+        # b declares a shortcut "a", but "a" is a project
+        self.assertEqual(resolve_enter_target("a", self.projects), (self.a, None))
+
+    def test_unique_shortcut_lands_in_its_dir(self):
+        self.assertEqual(resolve_enter_target("y", self.projects), (self.b, "/home/dev/workspace/y/sub"))
+
+    def test_ambiguous_or_unknown_is_none(self):
+        self.assertIsNone(resolve_enter_target("both", self.projects))
+        self.assertIsNone(resolve_enter_target("nope", self.projects))
+
 
 class ServiceConfigTests(unittest.TestCase):
     def setUp(self):
@@ -143,6 +189,10 @@ class ServiceConfigTests(unittest.TestCase):
     def test_invalid_port_spec(self):
         path = write_toml(self.dir, "web", 'image = "nginx"\nports = ["8080:80; echo"]\n')
         self.assertIsNone(ServiceConfig.from_toml(path))
+
+    def test_port_spec_with_host_ip(self):
+        path = write_toml(self.dir, "web", 'image = "nginx"\nports = ["127.0.0.1:8080:80"]\n')
+        self.assertEqual(ServiceConfig.from_toml(path).ports, ["127.0.0.1:8080:80"])
 
     def test_invalid_volume_part_count(self):
         path = write_toml(self.dir, "web", 'image = "nginx"\nvolumes = ["/onlyhost"]\n')
