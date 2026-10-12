@@ -44,6 +44,8 @@ class UsageTests(unittest.TestCase):
         with (
             mock.patch.object(containerctl, "PROJECTS_DIR", "~/.config/containerctl/projects"),
             mock.patch.object(containerctl, "SERVICES_DIR", "~/.config/containerctl/services"),
+            mock.patch.object(containerctl, "CONFIG_FILE", "~/.config/containerctl/config.toml"),
+            mock.patch.object(containerctl, "SECRETS_FILE", "~/.config/containerctl/secrets.toml"),
             redirect_stdout(buf),
         ):
             usage()
@@ -52,23 +54,45 @@ class UsageTests(unittest.TestCase):
 
     def test_config_examples_parse_as_valid_configs(self):
         """`help config` is the only place the config shape is documented (the README stays a mirror
-        of `help`), so the samples must stay loadable: split on the service header, write each out, parse."""
+        of `help`), so the samples must stay loadable: split on the `# <path>` headers, write each out, parse."""
         import tempfile
 
         buf = io.StringIO()
         with redirect_stdout(buf):
             config_usage()
-        project_part, service_part = buf.getvalue().strip().split(f"# {containerctl.SERVICES_DIR}")
+        headers = [f"# {p}" for p in (containerctl.SERVICES_DIR, containerctl.CONFIG_FILE, containerctl.SECRETS_FILE)]
+        parts, rest = [], buf.getvalue().strip()
+        for header in headers:
+            head, rest = rest.split(header)
+            parts.append(head)
+        parts.append(rest.split("\n", 1)[1])
+        project_part, service_part, config_part, secrets_part = parts
         with tempfile.TemporaryDirectory() as d:
             prj = Path(d) / "demo.toml"
             prj.write_text(project_part)
             svc = Path(d) / "web.toml"
             svc.write_text(service_part.split("\n", 1)[1])
+            cfg = Path(d) / "config.toml"
+            cfg.write_text(config_part.split("\n", 1)[1])
+            sec = Path(d) / "secrets.toml"
+            sec.write_text(secrets_part)
+            sec.chmod(0o600)
             project = ProjectConfig.from_toml(prj)
             service = containerctl.ServiceConfig.from_toml(svc)
+            with (
+                mock.patch.object(containerctl, "CONFIG_FILE", cfg),
+                mock.patch.object(containerctl, "SECRETS_FILE", sec),
+            ):
+                env = {e.name: e for e in containerctl.resolve_env(project)}
         self.assertIsNotNone(project, containerctl.get_errors())
         self.assertIsNotNone(service, containerctl.get_errors())
         self.assertEqual(sorted(project.shortcuts), ["app", "lib"])
+        self.assertEqual(sorted(env), ["CLAUDE_CODE_OAUTH_TOKEN", "DEBUG", "TZ"])
+        self.assertEqual((env["TZ"].value, env["DEBUG"].value), ("UTC", "1"))
+        self.assertEqual(env["CLAUDE_CODE_OAUTH_TOKEN"].value, "sk-ant-oat01-...")
+        self.assertEqual(env["CLAUDE_CODE_OAUTH_TOKEN"].rotate_days, 30)
+        self.assertEqual(str(env["CLAUDE_CODE_OAUTH_TOKEN"].added), "2026-10-12")
+        self.assertEqual([e["cat"] for e in containerctl.get_errors() if e["cat"] != "env.stale"], [])
         self.assertEqual(len(project.repos), 2)
         self.assertEqual(service.ports, ["127.0.0.1:8080:80"])
         self.assertIn("reload", service.scripts)
@@ -272,3 +296,63 @@ class ProjectsShortcutsColumnTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CliEnvTests(unittest.TestCase):
+    """`env [project]` lists names, kind, age and status - and never a value."""
+
+    def setUp(self):
+        reset_errors()
+
+    def _run(self, project=None, entries=()):
+        out = io.StringIO()
+        with (
+            mock.patch.object(containerctl, "resolve_env", return_value=list(entries)) as resolve,
+            redirect_stdout(out),
+        ):
+            containerctl.cli_env(argparse.Namespace(project=project))
+        return resolve, out.getvalue()
+
+    def test_no_env_points_at_config_file(self):
+        resolve, out = self._run()
+        resolve.assert_called_once_with(None)
+        self.assertIn("No env configured", out)
+        self.assertIn(str(containerctl.CONFIG_FILE), out)
+
+    def test_table_never_shows_values(self):
+        today = containerctl.date.today()
+        entries = [
+            containerctl.EnvEntry(name="TZ", value="UTC"),
+            containerctl.EnvEntry(name="TOK", value="s3cret", secret=True, rotate_days=30, added=today),
+            containerctl.EnvEntry(name="MISSING", secret=True),
+        ]
+        _, out = self._run(entries=entries)
+        lines = out.strip().splitlines()
+        self.assertEqual(lines[0].split(), ["NAME", "KIND", "ADDED", "STATUS"])
+        self.assertEqual(lines[2].split(), ["MISSING", "secret", "-", "missing"])
+        self.assertEqual(lines[3].split(), ["TOK", "secret", f"{today.isoformat()}", "(0d)", "ok"])
+        self.assertEqual(lines[4].split(), ["TZ", "plain", "-", "ok"])
+        self.assertNotIn("UTC", out)
+        self.assertNotIn("s3cret", out)
+
+    def test_project_is_resolved_and_forwarded(self):
+        project = ProjectConfig(name="proj", image="i")
+        with mock.patch.object(containerctl, "load_projects", return_value={"proj": project}):
+            resolve, _ = self._run(project="proj")
+        resolve.assert_called_once_with(project)
+
+    def test_unknown_project_exits_nonzero(self):
+        with mock.patch.object(containerctl, "load_projects", return_value={}):
+            with redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as ctx:
+                    containerctl.cli_env(argparse.Namespace(project="nope"))
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_argparse_wiring(self):
+        for argv, expected in ((["env"], None), (["env", "proj"], "proj")):
+            with (
+                mock.patch.object(containerctl.sys, "argv", ["containerctl", *argv]),
+                mock.patch.object(containerctl, "cli_env") as cli_env,
+            ):
+                containerctl.main()
+            self.assertEqual(cli_env.call_args.args[0].project, expected)

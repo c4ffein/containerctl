@@ -7,7 +7,7 @@ containerctl - KISS containers CLI/TUI manager
 ──────────────────────────────────────────────
 - containerctl                          ==> launch TUI
 - containerctl help                     ==> show this help
-- containerctl help config              ==> example project and service TOML
+- containerctl help config              ==> example project, service and shared env TOML
 ──────────────────────────────────────────────
 - containerctl ps                       ==> list containers
 - containerctl ps -q                    ==> list container IDs only
@@ -39,6 +39,8 @@ containerctl - KISS containers CLI/TUI manager
 - containerctl destroy <project>        ==> stop and remove project container
 - containerctl projects                 ==> list configured projects
 - containerctl projects -w              ==> wide: full shortcut lists, never clip
+- containerctl env                      ==> list the env injected at enter (names, never values)
+- containerctl env <project>            ==> same, with the project's own [env] applied
 ──────────────────────────────────────────────
 - containerctl check <project>          ==> is the workspace safe to destroy? (uncommitted/unpushed/extra)
 - containerctl check --all              ==> check every configured project
@@ -54,4 +56,5 @@ containerctl - KISS containers CLI/TUI manager
 ──────────────────────────────────────────────
 Project configs: ~/.config/containerctl/projects/<name>.toml
 Service configs: ~/.config/containerctl/services/<name>.toml
+Shared env:      ~/.config/containerctl/config.toml (declares) + ~/.config/containerctl/secrets.toml (secret values, 0600)
 ```

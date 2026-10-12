@@ -50,12 +50,14 @@ class SubprocessRecorder:
 
     def __init__(self, returncode=0, stdout="", stderr=""):
         self.calls = []
+        self.kwargs = []  # one dict per call: the env= of an `exec -e NAME` lands here
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
 
     def __call__(self, cmd, *args, **kwargs):
         self.calls.append(list(cmd))
+        self.kwargs.append(dict(kwargs))
         return subprocess.CompletedProcess(
             args=list(cmd),
             returncode=self.returncode,

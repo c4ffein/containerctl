@@ -6,7 +6,7 @@ recorders so we assert on the argv that *would* be executed.
 
 import io
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 import containerctl
@@ -349,6 +349,8 @@ class SpawnAndEnterShellFreeTests(unittest.TestCase):
         self._sub_patch.start()
         self._install_patch = mock.patch.object(containerctl, "install_self", return_value=True)
         self._install_patch.start()
+        self._env_patch = mock.patch.object(containerctl, "resolve_env", return_value=[])  # never the real ~/.config
+        self._env_patch.start()
         self.project = ProjectConfig(
             name="demo",
             image="ubuntu:22.04",
@@ -356,6 +358,7 @@ class SpawnAndEnterShellFreeTests(unittest.TestCase):
         )
 
     def tearDown(self):
+        self._env_patch.stop()
         self._install_patch.stop()
         self._sub_patch.stop()
         self._run_patch.stop()
@@ -420,3 +423,67 @@ class SpawnAndEnterShellFreeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExecEnvTests(unittest.TestCase):
+    """Shared env reaches `docker exec` as bare `-e NAME` flags; the value only rides in our own environment."""
+
+    def setUp(self):
+        reset_errors()
+        self.sub = SubprocessRecorder()
+        self._sub_patch = mock.patch.object(containerctl.subprocess, "run", self.sub)
+        self._sub_patch.start()
+
+    def tearDown(self):
+        self._sub_patch.stop()
+
+    def test_exec_env_is_bare_flag_plus_process_environment(self):
+        Docker.exec("abc", ["bash"], env={"TOK": "s3cret", "TZ": "UTC"})
+        self.assertEqual(self.sub.last, ["docker", "exec", "-it", "-e", "TOK", "-e", "TZ", "abc", "bash"])
+        self.assertNotIn("s3cret", " ".join(self.sub.last))
+        env = self.sub.kwargs[-1]["env"]
+        self.assertEqual((env["TOK"], env["TZ"]), ("s3cret", "UTC"))
+        self.assertEqual(env["PATH"], containerctl.os.environ["PATH"])  # ours, extended - not replaced
+
+    def test_exec_without_env_leaves_environment_alone(self):
+        Docker.exec("abc", ["bash"])
+        Docker.exec("abc", ["bash"], env={})
+        self.assertEqual(self.sub.kwargs, [{}, {}])
+
+    def test_exec_rejects_bad_env_name(self):
+        for bad in ("1TOK", "A-B", "A=B", ""):
+            Docker.exec("abc", ["bash"], env={bad: "x"})
+        self.assertEqual(self.sub.calls, [])
+        self.assertEqual({e["cat"] for e in get_errors()}, {"docker.invalid_env"})
+
+    def _enter(self, entries, logged=()):
+        def fake_resolve(project):
+            for cat, msg in logged:
+                containerctl.log_error(cat, msg)
+            return entries
+
+        err = io.StringIO()
+        with (
+            mock.patch.object(Docker, "find_project_container", return_value={"State": "running"}),
+            mock.patch.object(containerctl, "install_self", return_value=True),
+            mock.patch.object(containerctl, "resolve_env", side_effect=fake_resolve) as resolve,
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(err),
+        ):
+            Docker.enter_project(ProjectConfig(name="demo", image="i"))
+        return resolve, err.getvalue()
+
+    def test_enter_injects_resolved_env(self):
+        entries = [containerctl.EnvEntry(name="TOK", value="s3cret", secret=True), containerctl.EnvEntry("TZ", "UTC")]
+        resolve, stderr = self._enter(entries)
+        self.assertEqual(resolve.call_args.args[0].name, "demo")
+        self.assertEqual(self.sub.last[:7], ["docker", "exec", "-it", "-e", "TOK", "-e", "TZ"])
+        self.assertEqual(self.sub.kwargs[-1]["env"]["TOK"], "s3cret")
+        self.assertEqual(stderr, "")
+
+    def test_enter_skips_unresolved_secrets_and_echoes_env_problems(self):
+        entries = [containerctl.EnvEntry(name="TOK", secret=True)]
+        problems = [("env.secret", "TOK is declared secret but has no value in secrets.toml"), ("other.cat", "nope")]
+        _, stderr = self._enter(entries, logged=problems)
+        self.assertNotIn("-e", self.sub.last)
+        self.assertEqual(stderr, "env: TOK is declared secret but has no value in secrets.toml\n")

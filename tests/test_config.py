@@ -2,9 +2,22 @@
 
 import tempfile
 import unittest
+from datetime import date, timedelta
 from pathlib import Path
+from unittest import mock
 
-from containerctl import ProjectConfig, RepoSpec, ServiceConfig, get_errors, resolve_enter_target
+import containerctl
+from containerctl import (
+    EnvEntry,
+    ProjectConfig,
+    RepoSpec,
+    ServiceConfig,
+    env_values,
+    get_errors,
+    parse_env_table,
+    resolve_enter_target,
+    resolve_env,
+)
 from tests.helper import reset_errors
 
 
@@ -259,3 +272,200 @@ class ServiceConfigTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EnvTableTests(unittest.TestCase):
+    """`[env]` parsing, shared by config.toml and the per-project TOML."""
+
+    def setUp(self):
+        reset_errors()
+        self.path = Path("/cfg/x.toml")
+
+    def test_absent_is_empty(self):
+        self.assertEqual(parse_env_table(None, self.path), {})
+
+    def test_plain_and_secret_entries(self):
+        env = parse_env_table({"TZ": "UTC", "TOK": {"secret": True, "rotate_days": 30}}, self.path)
+        self.assertEqual(env["TZ"], EnvEntry(name="TZ", value="UTC"))
+        self.assertEqual(env["TOK"], EnvEntry(name="TOK", secret=True, rotate_days=30))
+        self.assertEqual(env["TOK"].value, None)
+
+    def test_invalid_names_rejected(self):
+        for name in ("1ABC", "A-B", "", "A B", "A=B"):
+            reset_errors()
+            self.assertIsNone(parse_env_table({name: "x"}, self.path), name)
+            self.assertEqual(get_errors()[0]["cat"], "env.config")
+
+    def test_not_a_table_rejected(self):
+        self.assertIsNone(parse_env_table(["A=B"], self.path))
+
+    def test_table_entry_must_say_secret_true(self):
+        for spec in ({}, {"secret": False}, {"secret": "yes"}, 3, ["x"]):
+            reset_errors()
+            self.assertIsNone(parse_env_table({"TOK": spec}, self.path), spec)
+
+    def test_secret_value_in_config_is_refused(self):
+        """The whole point of the split: a value next to `secret = true` would land in a versioned file."""
+        self.assertIsNone(parse_env_table({"TOK": {"secret": True, "value": "sk-..."}}, self.path))
+        self.assertIn("secrets.toml holds the value", get_errors()[0]["msg"])
+
+    def test_rotate_days_must_be_a_non_negative_int(self):
+        for bad in (-1, True, "30", 1.5):
+            reset_errors()
+            self.assertIsNone(parse_env_table({"TOK": {"secret": True, "rotate_days": bad}}, self.path), bad)
+        self.assertEqual(parse_env_table({"TOK": {"secret": True, "rotate_days": 0}}, self.path)["TOK"].rotate_days, 0)
+
+    def test_nul_in_plain_value_rejected(self):
+        self.assertIsNone(parse_env_table({"A": "x\x00y"}, self.path))
+
+    def test_project_toml_env_table(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = write_toml(d, "p", 'image = "ubuntu"\n[env]\nDEBUG = "1"\nTOK = { secret = true }\n')
+            cfg = ProjectConfig.from_toml(path)
+            self.assertEqual(sorted(cfg.env), ["DEBUG", "TOK"])
+            bad = write_toml(d, "q", 'image = "ubuntu"\n[env]\nTOK = { value = "x" }\n')
+            self.assertIsNone(ProjectConfig.from_toml(bad))
+
+    def test_project_without_env_table(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(ProjectConfig.from_toml(write_toml(d, "p", 'image = "ubuntu"\n')).env, {})
+
+
+class ResolveEnvTests(unittest.TestCase):
+    """Global [env] + secrets.toml + a project's own [env] -> what `enter` injects; problems -> env.*."""
+
+    def setUp(self):
+        reset_errors()
+        self._tmp = tempfile.TemporaryDirectory()
+        d = Path(self._tmp.name)
+        self.cfg = d / "config.toml"
+        self.sec = d / "secrets.toml"
+        self._patches = [
+            mock.patch.object(containerctl, "CONFIG_FILE", self.cfg),
+            mock.patch.object(containerctl, "SECRETS_FILE", self.sec),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        self._tmp.cleanup()
+
+    def write(self, config=None, secrets=None, mode=0o600):
+        if config is not None:
+            self.cfg.write_text(config)
+        if secrets is not None:
+            self.sec.write_text(secrets)
+            self.sec.chmod(mode)
+
+    def by_name(self, project=None):
+        return {e.name: e for e in resolve_env(project)}
+
+    def cats(self):
+        return [e["cat"] for e in get_errors()]
+
+    def test_no_files_no_env_no_errors(self):
+        self.assertEqual(resolve_env(None), [])
+        self.assertEqual(resolve_env(ProjectConfig(name="p", image="i")), [])
+        self.assertEqual(self.cats(), [])
+
+    def test_plain_and_secret_resolved(self):
+        self.write('[env]\nTZ = "UTC"\nTOK = { secret = true, rotate_days = 30 }\n')
+        self.write(secrets=f'TOK = {{ value = "s3cret", added = {date.today().isoformat()} }}\n')
+        env = self.by_name()
+        self.assertEqual((env["TZ"].value, env["TZ"].status), ("UTC", "ok"))
+        self.assertEqual((env["TOK"].value, env["TOK"].added, env["TOK"].status), ("s3cret", date.today(), "ok"))
+        self.assertEqual(env["TOK"].age_days, 0)
+        self.assertEqual(env_values(resolve_env(None)), {"TZ": "UTC", "TOK": "s3cret"})
+        self.assertEqual(self.cats(), [])
+
+    def test_secret_as_plain_string_without_date(self):
+        self.write("[env]\nTOK = { secret = true }\n", 'TOK = "s3cret"\n')
+        env = self.by_name()
+        self.assertEqual((env["TOK"].value, env["TOK"].added, env["TOK"].status), ("s3cret", None, "ok"))
+
+    def test_missing_secret_is_kept_but_not_injected(self):
+        self.write('[env]\nTOK = { secret = true }\nTZ = "UTC"\n', "")
+        entries = resolve_env(None)
+        self.assertEqual({e.name: e.status for e in entries}, {"TOK": "missing", "TZ": "ok"})
+        self.assertEqual(env_values(entries), {"TZ": "UTC"})
+        self.assertEqual(self.cats(), ["env.secret"])
+        self.assertIn("TOK is declared secret but has no value", get_errors()[0]["msg"])
+
+    def test_stale_secret_is_injected_but_flagged(self):
+        old = (date.today() - timedelta(days=45)).isoformat()
+        self.write("[env]\nTOK = { secret = true, rotate_days = 30 }\n", f'TOK = {{ value = "s", added = {old} }}\n')
+        env = self.by_name()
+        self.assertEqual(env["TOK"].status, "stale (45d > 30d)")
+        self.assertEqual(env_values(resolve_env(None)), {"TOK": "s"})
+        self.assertEqual(self.cats(), ["env.stale", "env.stale"])  # once per resolve
+        self.assertIn("45 days old (rotate_days = 30)", get_errors()[0]["msg"])
+
+    def test_rotate_days_without_added_date(self):
+        self.write("[env]\nTOK = { secret = true, rotate_days = 30 }\n", 'TOK = "s"\n')
+        self.assertEqual(self.by_name()["TOK"].status, "no added date")
+        self.assertEqual(self.cats(), ["env.stale"])
+
+    def test_no_rotate_days_never_stale(self):
+        self.write("[env]\nTOK = { secret = true }\n", 'TOK = { value = "s", added = 2000-01-01 }\n')
+        self.assertEqual(self.by_name()["TOK"].status, "ok")
+        self.assertEqual(self.cats(), [])
+
+    def test_added_as_datetime_accepted(self):
+        self.write("[env]\nTOK = { secret = true }\n", 'TOK = { value = "s", added = 2026-01-02T03:04:05Z }\n')
+        self.assertEqual(self.by_name()["TOK"].added, date(2026, 1, 2))
+
+    def test_added_must_be_a_date(self):
+        self.write("[env]\nTOK = { secret = true }\n", 'TOK = { value = "s", added = "2026-01-02" }\n')
+        self.assertEqual(self.by_name()["TOK"].status, "missing")
+        self.assertEqual(self.cats(), ["env.secret", "env.secret"])  # bad entry, then missing
+
+    def test_secret_values_must_be_non_empty_strings(self):
+        for raw in ('TOK = ""', "TOK = 3", "TOK = { added = 2026-01-01 }", "TOK = { value = 3 }"):
+            reset_errors()
+            self.write("[env]\nTOK = { secret = true }\n", raw + "\n")
+            self.assertIsNone(self.by_name()["TOK"].value, raw)
+            self.assertEqual(self.cats()[0], "env.secret", raw)
+
+    def test_world_readable_secrets_file_is_reported(self):
+        self.write("[env]\nTOK = { secret = true }\n", 'TOK = "s"\n', mode=0o644)
+        env = self.by_name()
+        self.assertEqual(env["TOK"].value, "s")  # still works, but
+        self.assertEqual(self.cats(), ["env.secret"])
+        self.assertIn("mode 0644, readable by others: chmod 600", get_errors()[0]["msg"])
+
+    def test_malformed_files_are_logged(self):
+        self.write("[env\n", "TOK = \n")
+        self.assertEqual(resolve_env(None), [])
+        self.assertEqual(self.cats(), ["env.config"])
+        reset_errors()
+        self.write("[env]\nTOK = { secret = true }\n")
+        self.assertEqual(self.by_name()["TOK"].status, "missing")
+        self.assertEqual(self.cats(), ["env.secret", "env.secret"])  # load failure, then missing
+
+    def test_undeclared_secret_is_never_injected(self):
+        self.write('[env]\nTZ = "UTC"\n', 'TOK = "s"\n')
+        self.assertEqual(env_values(resolve_env(None)), {"TZ": "UTC"})
+
+    def test_project_env_adds_and_overrides(self):
+        self.write('[env]\nTZ = "UTC"\nTOK = { secret = true }\n', 'TOK = "s"\nPTOK = "p"\n')
+        project = ProjectConfig(
+            name="p",
+            image="i",
+            env={"TZ": EnvEntry(name="TZ", value="Europe/Paris"), "PTOK": EnvEntry(name="PTOK", secret=True)},
+        )
+        self.assertEqual(env_values(resolve_env(project)), {"TZ": "Europe/Paris", "TOK": "s", "PTOK": "p"})
+        self.assertEqual(env_values(resolve_env(None)), {"TZ": "UTC", "TOK": "s"})
+
+    def test_config_objects_are_not_mutated(self):
+        self.write('[env]\nTZ = "UTC"\n', 'PTOK = "p"\n')
+        entry = EnvEntry(name="PTOK", secret=True)
+        project = ProjectConfig(name="p", image="i", env={"PTOK": entry})
+        self.assertEqual(env_values(resolve_env(project)), {"TZ": "UTC", "PTOK": "p"})
+        self.assertIsNone(entry.value)
+
+    def test_secrets_file_not_read_when_nothing_is_secret(self):
+        self.write('[env]\nTZ = "UTC"\n', "garbage = [\n")  # would log if parsed
+        self.assertEqual(env_values(resolve_env(None)), {"TZ": "UTC"})
+        self.assertEqual(self.cats(), [])
