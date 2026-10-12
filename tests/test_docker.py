@@ -349,7 +349,7 @@ class SpawnAndEnterShellFreeTests(unittest.TestCase):
         self._sub_patch.start()
         self._install_patch = mock.patch.object(containerctl, "install_self", return_value=True)
         self._install_patch.start()
-        self._env_patch = mock.patch.object(containerctl, "resolve_env", return_value=[])  # never the real ~/.config
+        self._env_patch = mock.patch.object(containerctl, "resolve_env", return_value={})  # never the real ~/.config
         self._env_patch.start()
         self.project = ProjectConfig(
             name="demo",
@@ -456,11 +456,11 @@ class ExecEnvTests(unittest.TestCase):
         self.assertEqual(self.sub.calls, [])
         self.assertEqual({e["cat"] for e in get_errors()}, {"docker.invalid_env"})
 
-    def _enter(self, entries, logged=()):
+    def _enter(self, env, logged=()):
         def fake_resolve(project):
             for cat, msg in logged:
                 containerctl.log_error(cat, msg)
-            return entries
+            return env
 
         err = io.StringIO()
         with (
@@ -474,16 +474,14 @@ class ExecEnvTests(unittest.TestCase):
         return resolve, err.getvalue()
 
     def test_enter_injects_resolved_env(self):
-        entries = [containerctl.EnvEntry(name="TOK", value="s3cret", secret=True), containerctl.EnvEntry("TZ", "UTC")]
-        resolve, stderr = self._enter(entries)
+        resolve, stderr = self._enter({"TOK": "s3cret", "TZ": "UTC"})
         self.assertEqual(resolve.call_args.args[0].name, "demo")
         self.assertEqual(self.sub.last[:7], ["docker", "exec", "-it", "-e", "TOK", "-e", "TZ"])
         self.assertEqual(self.sub.kwargs[-1]["env"]["TOK"], "s3cret")
         self.assertEqual(stderr, "")
 
-    def test_enter_skips_unresolved_secrets_and_echoes_env_problems(self):
-        entries = [containerctl.EnvEntry(name="TOK", secret=True)]
-        problems = [("env.secret", "TOK is declared secret but has no value in secrets.toml"), ("other.cat", "nope")]
-        _, stderr = self._enter(entries, logged=problems)
+    def test_enter_echoes_env_problems_only(self):
+        problems = [("env.secret", "TOK: no 'tok' in secrets.toml"), ("other.cat", "nope")]
+        _, stderr = self._enter({}, logged=problems)
         self.assertNotIn("-e", self.sub.last)
-        self.assertEqual(stderr, "env: TOK is declared secret but has no value in secrets.toml\n")
+        self.assertEqual(stderr, "env: TOK: no 'tok' in secrets.toml\n")

@@ -18,8 +18,7 @@ import termios
 import threading
 import time
 import tty
-from dataclasses import dataclass, field, replace
-from datetime import date, datetime
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -479,8 +478,7 @@ class NetworkInspect:
 CONFIG_DIR = Path.home() / ".config" / "containerctl"
 PROJECTS_DIR = CONFIG_DIR / "projects"
 SERVICES_DIR = CONFIG_DIR / "services"
-CONFIG_FILE = CONFIG_DIR / "config.toml"  # shared by every project: the global [env]
-SECRETS_FILE = CONFIG_DIR / "secrets.toml"  # values of `{ secret = true }` env entries; 0600, never versioned
+SECRETS_FILE = CONFIG_DIR / "secrets.toml"  # flat `key = "value"`, 0600, never versioned; [secrets] picks keys from it
 
 # Paths *inside* a spawned container (the dev user's home is /home/dev — see spawn_project).
 CONTAINER_HOME = "/home/dev"
@@ -529,68 +527,33 @@ def is_valid_env_name(name: str) -> bool:
     return bool(name) and not name[0].isdigit() and all(c in VALID_ENV_NAME_CHARS for c in name)
 
 
-@dataclass
-class EnvEntry:
-    """One `[env]` declaration: a plain value, or a secret whose value (and `added` date) live in secrets.toml.
-
-    Env is injected into the `enter` shell only (process environment), never written inside the container."""
-
-    name: str
-    value: str | None = None  # None until a secret is resolved; stays None when it is missing
-    secret: bool = False
-    rotate_days: int = 0  # secrets only: nag once the value is older than this (0 = never)
-    added: date | None = None  # secrets only: when the value was generated, from secrets.toml
-
-    @property
-    def age_days(self) -> int | None:
-        return None if self.added is None else (date.today() - self.added).days
-
-    @property
-    def status(self) -> str:
-        """ok | missing | no added date | stale (<age>d > <rotate>d)"""
-        if self.secret and self.value is None:
-            return "missing"
-        if self.secret and self.rotate_days:
-            if self.added is None:
-                return "no added date"
-            if self.age_days > self.rotate_days:
-                return f"stale ({self.age_days}d > {self.rotate_days}d)"
-        return "ok"
-
-
-def parse_env_table(raw, path: Path) -> dict[str, EnvEntry] | None:
-    """Parse an `[env]` table: `NAME = "value"` or `NAME = { secret = true, rotate_days = 30 }`.
-    None (after logging) when anything is malformed: a half-applied env is worse than none.
-    A secret's value is refused here on purpose, so it cannot land in a versioned config file."""
+def _parse_name_table(raw, path: Path, table: str, value_ok: Callable[[str], bool]) -> dict[str, str] | None:
+    """A `[table]` of `ENV_NAME = "string"`. None (after logging) when anything is malformed: a half-applied
+    environment is worse than none."""
     if raw is None:
         return {}
     if not isinstance(raw, dict):
-        log_error("env.config", f"Invalid 'env' (must be a table) in {path}")
+        log_error("project.config", f"Invalid '{table}' (must be a table) in {path}")
         return None
-    entries: dict[str, EnvEntry] = {}
-    for name, spec in raw.items():
+    for name, value in raw.items():
         if not is_valid_env_name(name):
-            log_error("env.config", f"Invalid env name '{name}' in {path}")
+            log_error("project.config", f"Invalid env name '{name}' in [{table}] of {path}")
             return None
-        if isinstance(spec, str):
-            if "\x00" in spec:
-                log_error("env.config", f"Invalid env value for '{name}' in {path}: contains NUL")
-                return None
-            entries[name] = EnvEntry(name=name, value=spec)
-            continue
-        if not isinstance(spec, dict) or spec.get("secret") is not True:
-            log_error("env.config", f"Invalid env entry '{name}' in {path}: expect a string or {{ secret = true }}")
+        if not isinstance(value, str) or not value_ok(value):
+            log_error("project.config", f"Invalid value for '{name}' in [{table}] of {path}")
             return None
-        unknown = sorted(set(spec) - {"secret", "rotate_days"})
-        if unknown:
-            log_error("env.config", f"Unknown keys {unknown} for env '{name}' in {path}: secrets.toml holds the value")
-            return None
-        rotate_days = spec.get("rotate_days", 0)
-        if isinstance(rotate_days, bool) or not isinstance(rotate_days, int) or rotate_days < 0:
-            log_error("env.config", f"Invalid rotate_days for '{name}' in {path}: must be a non-negative integer")
-            return None
-        entries[name] = EnvEntry(name=name, secret=True, rotate_days=rotate_days)
-    return entries
+    return dict(raw)
+
+
+def parse_env_table(raw, path: Path) -> dict[str, str] | None:
+    """`[env]`: `NAME = "value"`, plain values for the `enter` shell's environment"""
+    return _parse_name_table(raw, path, "env", lambda v: "\x00" not in v)
+
+
+def parse_secrets_table(raw, path: Path) -> dict[str, str] | None:
+    """`[secrets]`: `NAME = "key"`, the key of a secrets.toml entry whose value is looked up at `enter`.
+    Only names and keys live here, so a value can never land in a versioned project file."""
+    return _parse_name_table(raw, path, "secrets", is_valid_env_name)
 
 
 @dataclass
@@ -619,7 +582,8 @@ class ProjectConfig:
     ssh_key: str = ""
     env_files: list[EnvFile] = field(default_factory=list)
     shortcuts: dict[str, str] = field(default_factory=dict)  # alias -> dir relative to the workspace
-    env: dict[str, EnvEntry] = field(default_factory=dict)  # per-project additions/overrides of the global [env]
+    env: dict[str, str] = field(default_factory=dict)  # [env]: plain values for the `enter` shell's environment
+    secrets: dict[str, str] = field(default_factory=dict)  # [secrets]: env name -> key in secrets.toml
 
     @property
     def container_name(self) -> str:
@@ -734,9 +698,15 @@ class ProjectConfig:
                 return None
             shortcuts[alias] = rel_dir
 
-        # [env]: same shape as the global table in config.toml; a project entry overrides a global one
+        # [env] plain values and [secrets] env name -> secrets.toml key: both reach the `enter` shell's environment
         env = parse_env_table(data.get("env"), path)
         if env is None:
+            return None
+        secrets = parse_secrets_table(data.get("secrets"), path)
+        if secrets is None:
+            return None
+        if both := sorted(set(env) & set(secrets)):
+            log_error("project.config", f"Names in both [env] and [secrets] in {path}: {', '.join(both)}")
             return None
 
         return cls(
@@ -747,6 +717,7 @@ class ProjectConfig:
             env_files=env_files,
             shortcuts=shortcuts,
             env=env,
+            secrets=secrets,
         )
 
 
@@ -785,37 +756,22 @@ def resolve_enter_target(name: str, projects: dict[str, ProjectConfig]) -> tuple
 
 
 # =============================================================================
-# Shared env: config.toml [env] + secrets.toml
+# Secrets: ~/.config/containerctl/secrets.toml
 # =============================================================================
 
 
-def _load_toml(path: Path, category: str) -> dict | None:
-    """Load a TOML file: {} when absent, None (after logging) when unreadable or malformed"""
+def load_secrets() -> dict[str, str]:
+    """secrets.toml: flat `key = "value"`. Values are never logged; a malformed entry is skipped, a malformed
+    file yields nothing. A file readable by others is reported: a token is only as private as the file's mode."""
     import tomllib  # lazy: keeps the module importable on Python 3.10 (check-local path)
 
-    if not path.is_file():
+    if not SECRETS_FILE.is_file():
         return {}
     try:
-        with open(path, "rb") as f:
-            return tomllib.load(f)
+        with open(SECRETS_FILE, "rb") as f:
+            data = tomllib.load(f)
     except (OSError, tomllib.TOMLDecodeError) as e:
-        log_error(category, f"Failed to load {path}: {e}")
-        return None
-
-
-def load_global_env() -> dict[str, EnvEntry]:
-    """The `[env]` table of config.toml: declared for every project's `enter` shell"""
-    data = _load_toml(CONFIG_FILE, "env.config")
-    if data is None:
-        return {}
-    return parse_env_table(data.get("env"), CONFIG_FILE) or {}
-
-
-def load_secrets() -> dict[str, tuple[str, date | None]]:
-    """secrets.toml: `NAME = "value"` or `NAME = { value = "...", added = 2026-10-12 }`. Values are never
-    logged. A file readable by others is reported: the token inside is only as private as the file's mode."""
-    data = _load_toml(SECRETS_FILE, "env.secret")
-    if not data:
+        log_error("env.secret", f"Failed to load {SECRETS_FILE}: {e}")
         return {}
     try:
         mode = stat.S_IMODE(SECRETS_FILE.stat().st_mode)
@@ -823,54 +779,32 @@ def load_secrets() -> dict[str, tuple[str, date | None]]:
         mode = 0
     if mode & 0o077:
         log_error("env.secret", f"{SECRETS_FILE} is mode {mode:04o}, readable by others: chmod 600")
-    secrets: dict[str, tuple[str, date | None]] = {}
-    for name, spec in data.items():
-        if not is_valid_env_name(name):
-            log_error("env.secret", f"Invalid env name '{name}' in {SECRETS_FILE}")
+    secrets: dict[str, str] = {}
+    for key, value in data.items():
+        if not is_valid_env_name(key):
+            log_error("env.secret", f"Invalid key '{key}' in {SECRETS_FILE}")
             continue
-        added = None
-        if isinstance(spec, dict):
-            added = spec.get("added")
-            spec = spec.get("value")
-            if isinstance(added, datetime):  # tomllib: a bare date is a `date`, a timestamp a `datetime`
-                added = added.date()
-            if added is not None and not isinstance(added, date):
-                log_error("env.secret", f"Invalid 'added' for '{name}' in {SECRETS_FILE}: must be a TOML date")
-                continue
-        if not isinstance(spec, str) or not spec or "\x00" in spec:
-            log_error("env.secret", f"Invalid value for '{name}' in {SECRETS_FILE}: must be a non-empty string")
+        if not isinstance(value, str) or not value or "\x00" in value:
+            log_error("env.secret", f"Invalid value for '{key}' in {SECRETS_FILE}: must be a non-empty string")
             continue
-        secrets[name] = (spec, added)
+        secrets[key] = value
     return secrets
 
 
-def resolve_env(project: "ProjectConfig | None") -> list[EnvEntry]:
-    """Effective env for `enter`: the global [env], overridden by the project's own, secrets filled in from
-    secrets.toml. Every entry stays in the result (status says `missing` / `stale` / ...), and every
-    problem is also recorded under env.* so both the CLI and the TUI's Errors tab can surface it."""
-    declared = dict(load_global_env())
-    if project is not None:
-        declared.update(project.env)
-    entries = [replace(e) for e in declared.values()]  # copies: the config objects stay untouched
-    secrets = load_secrets() if any(e.secret for e in entries) else {}
-    for e in entries:
-        if not e.secret:
+def resolve_env(project: "ProjectConfig") -> dict[str, str]:
+    """What `enter` injects: the project's [env], plus each [secrets] entry found in secrets.toml. A missing
+    secret is recorded under env.secret and left out; the rest still goes in. secrets.toml is only read when
+    the project names a secret, and only the keys it names are used."""
+    env = dict(project.env)
+    if not project.secrets:
+        return env
+    secrets = load_secrets()
+    for name, key in project.secrets.items():
+        if key not in secrets:
+            log_error("env.secret", f"{name}: no '{key}' in {SECRETS_FILE}")
             continue
-        if e.name not in secrets:
-            log_error("env.secret", f"{e.name} is declared secret but has no value in {SECRETS_FILE}")
-            continue
-        e.value, e.added = secrets[e.name]
-        status = e.status
-        if status.startswith("stale"):
-            log_error("env.stale", f"{e.name} is {e.age_days} days old (rotate_days = {e.rotate_days}): regenerate it")
-        elif status == "no added date":
-            log_error("env.stale", f"{e.name} has rotate_days but no 'added' date in {SECRETS_FILE}")
-    return entries
-
-
-def env_values(entries: list[EnvEntry]) -> dict[str, str]:
-    """The injectable subset: every entry whose value is known"""
-    return {e.name: e.value for e in entries if e.value is not None}
+        env[name] = secrets[key]
+    return env
 
 
 VALID_RESTART_POLICIES = {"no", "always", "unless-stopped", "on-failure"}
@@ -2014,11 +1948,11 @@ class Docker:
                     workdir = f"/home/dev/workspace/{repo_name}"
             elif len(project.repos) > 1:
                 workdir = "/home/dev/workspace"
-        # Shared env (config.toml [env] + secrets.toml, plus the project's own [env]) rides into this
-        # shell's process environment only. Problems are in the registry; echo them so they're seen
-        # right before the prompt instead of only in the TUI's Errors tab.
+        # [env] values and [secrets] looked up in secrets.toml ride into this shell's process environment
+        # only. Problems are in the registry; echo them so they're seen right before the prompt instead
+        # of only in the TUI's Errors tab.
         seen = len(get_errors())
-        env = env_values(resolve_env(project))
+        env = resolve_env(project)
         for err in get_errors()[seen:]:
             if err["cat"].startswith("env."):
                 print(f"env: {err['msg']}", file=sys.stderr)
@@ -3230,27 +3164,6 @@ def cli_projects(args: argparse.Namespace) -> None:
     print("\n".join(format_table(headers, rows, width, shrink)))
 
 
-def cli_env(args: argparse.Namespace) -> None:
-    """List the env injected at `enter`: names, kind, age and status. Never the values."""
-    project = None
-    if args.project:
-        projects = load_projects()
-        if args.project not in projects:
-            print(f"Unknown project: {args.project}", file=sys.stderr)
-            sys.exit(1)
-        project = projects[args.project]
-    entries = resolve_env(project)
-    if not entries:
-        print(f"No env configured. Add an [env] table to {CONFIG_FILE} (see: containerctl help config)")
-        return
-    headers = ["NAME", "KIND", "ADDED", "STATUS"]
-    rows = []
-    for e in sorted(entries, key=lambda e: e.name):
-        added = f"{e.added.isoformat()} ({e.age_days}d)" if e.added else "-"
-        rows.append([e.name, "secret" if e.secret else "plain", added, e.status])
-    print("\n".join(format_table(headers, rows, None, [])))
-
-
 def _check_one(project: "ProjectConfig") -> bool | None:
     """Check a single project's workspace over docker exec.
 
@@ -3405,7 +3318,7 @@ def usage() -> int:
         "──────────────────────────────────────────────",
         "- containerctl                          ==> launch TUI",
         "- containerctl help                     ==> show this help",
-        "- containerctl help config              ==> example project, service and shared env TOML",
+        "- containerctl help config              ==> example project, service and secrets TOML",
         "──────────────────────────────────────────────",
         "- containerctl ps                       ==> list containers",
         "- containerctl ps -q                    ==> list container IDs only",
@@ -3437,8 +3350,6 @@ def usage() -> int:
         "- containerctl destroy <project>        ==> stop and remove project container",
         "- containerctl projects                 ==> list configured projects",
         "- containerctl projects -w              ==> wide: full shortcut lists, never clip",
-        "- containerctl env                      ==> list the env injected at enter (names, never values)",
-        "- containerctl env <project>            ==> same, with the project's own [env] applied",
         "──────────────────────────────────────────────",
         "- containerctl check <project>          ==> is the workspace safe to destroy? (uncommitted/unpushed/extra)",
         "- containerctl check --all              ==> check every configured project",
@@ -3454,7 +3365,7 @@ def usage() -> int:
         "──────────────────────────────────────────────",
         f"Project configs: {PROJECTS_DIR}/<name>.toml",
         f"Service configs: {SERVICES_DIR}/<name>.toml",
-        f"Shared env:      {CONFIG_FILE} (declares) + {SECRETS_FILE} (secret values, 0600)",
+        f"Secrets:         {SECRETS_FILE} (chmod 600; a project's [secrets] picks keys from it)",
     ]
     print("\n" + "\n".join(output_lines) + "\n")
     return 0
@@ -3476,8 +3387,10 @@ def config_usage() -> int:
         "[shortcuts]                               # `containerctl enter <alias>` lands there (optional)",
         'app = "app"                               # relative to /home/dev/workspace',
         'lib = "lib/src"',
-        "[env]                                     # adds to / overrides the global [env] below (optional)",
-        'DEBUG = "1"',
+        "[env]                                     # plain values for the `enter` shell's environment (optional)",
+        'TZ = "UTC"',
+        "[secrets]                                 # env name = key in secrets.toml, looked up at `enter` (optional)",
+        'CLAUDE_CODE_OAUTH_TOKEN = "claude_token"  # another project may expose the same key under another name',
         "",
         f"# {SERVICES_DIR}/<name>.toml  -  the file name is the service name",
         'image = "nginx:1.27"',
@@ -3494,14 +3407,9 @@ def config_usage() -> int:
         "[scripts]                                 # `containerctl service script <name> reload`",
         'reload = ["nginx", "-s", "reload"]',
         "",
-        f"# {CONFIG_FILE}  -  shared by every project (optional)",
-        "[env]                                     # injected into the `enter` shell's environment, never on disk",
-        'TZ = "UTC"                                # plain value',
+        f"# {SECRETS_FILE}  -  chmod 600, never versioned; only the keys a project names are read",
         "# Claude Code subscription token: `claude setup-token` on a trusted machine, valid ~1 year.",
-        "CLAUDE_CODE_OAUTH_TOKEN = { secret = true, rotate_days = 30 }   # the value lives in secrets.toml",
-        "",
-        f"# {SECRETS_FILE}  -  chmod 600, never versioned; only declared secrets are read",
-        'CLAUDE_CODE_OAUTH_TOKEN = { value = "sk-ant-oat01-...", added = 2026-10-12 }   # `env` shows the age',
+        'claude_token = "sk-ant-oat01-..."',
     ]
     print("\n" + "\n".join(output_lines) + "\n")
     return 0
@@ -3609,11 +3517,6 @@ def main() -> None:
     projects_parser = subparsers.add_parser("projects", help="List configured projects")
     projects_parser.add_argument("-w", "--wide", action="store_true", help="Full shortcut lists, never clip")
     projects_parser.set_defaults(func=cli_projects)
-
-    # env
-    env_parser = subparsers.add_parser("env", help="List the env injected at enter (names, never values)")
-    env_parser.add_argument("project", nargs="?", help="Also apply this project's own [env]")
-    env_parser.set_defaults(func=cli_env)
 
     # service (with sub-subcommands)
     service_parser = subparsers.add_parser("service", help="Manage services")
