@@ -46,11 +46,14 @@ class CommandConstructionTests(unittest.TestCase):
         Docker.remove_network("net1")
         self.assertEqual(self.rec.last, ["network", "rm", "net1"])
 
-    def test_containers_passes_all_flag(self):
+    def test_containers_passes_all_flag_and_never_computes_size_by_default(self):
+        # --size=false was dropped once by accident and `ps` went from 75ms to seconds; keep it pinned
         Docker.containers(all_containers=True)
-        self.assertEqual(self.rec.last, ["ps", "-a", "--format", "{{json .}}"])
+        self.assertEqual(self.rec.last, ["ps", "--size=false", "-a", "--format", "{{json .}}"])
         Docker.containers(all_containers=False)
-        self.assertEqual(self.rec.last, ["ps", "--format", "{{json .}}"])
+        self.assertEqual(self.rec.last, ["ps", "--size=false", "--format", "{{json .}}"])
+        Docker.containers(include_size=True)
+        self.assertEqual(self.rec.last, ["ps", "-a", "--format", "{{json .}}"])
 
     def test_returncode_propagates_to_bool(self):
         self.rec.returncode = 1

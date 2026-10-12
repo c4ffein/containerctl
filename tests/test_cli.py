@@ -9,7 +9,7 @@ from unittest import mock
 
 import containerctl
 from containerctl import ProjectConfig, config_usage, format_table, usage
-from tests.helper import reset_errors
+from tests.helper import RunRecorder, reset_errors
 
 
 def readme_block(section):
@@ -179,6 +179,95 @@ class CliEnterOptionTests(unittest.TestCase):
                 with self.assertRaises(SystemExit) as ctx:
                     containerctl.cli_enter(argparse.Namespace(project="proj", options=options))
             self.assertEqual(ctx.exception.code, 1)
+
+
+class ListingsQueryDockerOnceTests(unittest.TestCase):
+    """`projects` / `services` must not run one `docker ps` per configured item (13 projects = 13 calls)."""
+
+    PS = ["ps", "--size=false", "-a", "--format", "{{json .}}"]
+
+    def _ps_rows(self, *names):
+        return "\n".join(
+            f'{{"ID": "id{i}", "Names": "{n}", "Image": "i", "Status": "Up", "State": "running"}}'
+            for i, n in enumerate(names)
+        )
+
+    def test_projects_lists_status_with_a_single_docker_ps(self):
+        projects = {n: ProjectConfig(name=n, image="img", shortcuts={"x": "x"} if n == "b" else {}) for n in "abc"}
+        rec = RunRecorder(stdout=self._ps_rows("cctl-prj-a", "cctl-prj-c"))
+        out = io.StringIO()
+        with (
+            mock.patch.object(containerctl, "load_projects", return_value=projects),
+            mock.patch.object(containerctl.Docker, "_run", rec),
+            redirect_stdout(out),
+        ):
+            containerctl.cli_projects(argparse.Namespace(wide=False))
+        self.assertEqual(rec.calls, [self.PS])
+        rows = {ln.split()[0]: ln for ln in out.getvalue().splitlines()[2:]}
+        self.assertIn("running", rows["a"])
+        self.assertIn("not created", rows["b"])
+        self.assertIn("x", rows["b"].split()[-1])
+        self.assertIn("running", rows["c"])
+
+    def test_services_lists_status_with_a_single_docker_ps(self):
+        services = {n: containerctl.ServiceConfig(name=n, image="img", networks=["proxy"]) for n in "ab"}
+        rec = RunRecorder(stdout=self._ps_rows("cctl-svc-b"))
+        out = io.StringIO()
+        with (
+            mock.patch.object(containerctl, "load_services", return_value=services),
+            mock.patch.object(containerctl.Docker, "_run", rec),
+            redirect_stdout(out),
+        ):
+            containerctl.cli_services(argparse.Namespace(wide=False))
+        self.assertEqual(rec.calls, [self.PS])
+        rows = {ln.split()[0]: ln for ln in out.getvalue().splitlines()[2:]}
+        self.assertIn("not created", rows["a"])
+        self.assertIn("running", rows["b"])
+        self.assertTrue(rows["b"].endswith("proxy"))
+
+
+class ProjectsShortcutsColumnTests(unittest.TestCase):
+    """Long shortcut lists collapse to a count when the row would not fit the terminal."""
+
+    def setUp(self):
+        many = {f"alias-{i}": f"dir{i}" for i in range(14)}
+        self.projects = {
+            "big": ProjectConfig(name="big", image="dev:latest", shortcuts=many),
+            "small": ProjectConfig(name="small", image="dev:latest", shortcuts={"a": "a", "b": "b"}),
+            "none": ProjectConfig(name="none", image="dev:latest"),
+        }
+
+    def _run(self, width, wide=False):
+        out = io.StringIO()
+        with (
+            mock.patch.object(containerctl, "load_projects", return_value=self.projects),
+            mock.patch.object(containerctl.Docker, "_run", RunRecorder()),
+            mock.patch.object(containerctl, "_table_width", return_value=None if wide else width),
+            redirect_stdout(out),
+        ):
+            containerctl.cli_projects(argparse.Namespace(wide=wide))
+        return out.getvalue().splitlines()
+
+    def test_narrow_terminal_collapses_only_the_long_list(self):
+        lines = self._run(80)
+        self.assertTrue(all(len(ln) <= 80 for ln in lines), lines)
+        rows = {ln.split()[0]: ln for ln in lines[2:]}
+        self.assertTrue(rows["big"].endswith("(14 shortcuts)"))
+        self.assertTrue(rows["small"].endswith("a, b"))
+        self.assertTrue(rows["none"].endswith("-"))
+
+    def test_wide_terminal_shows_everything(self):
+        lines = self._run(300)
+        self.assertIn("alias-13", lines[2])
+
+    def test_wide_flag_or_pipe_never_collapses(self):
+        lines = self._run(80, wide=True)
+        self.assertIn("alias-13", lines[2])
+
+    def test_singular_shortcut(self):
+        self.projects["big"].shortcuts = {"only-one-very-long-alias-name-" + "x" * 60: "d"}
+        rows = {ln.split()[0]: ln for ln in self._run(80)[2:]}
+        self.assertTrue(rows["big"].endswith("(1 shortcut)"))
 
 
 if __name__ == "__main__":

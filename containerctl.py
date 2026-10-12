@@ -1330,11 +1330,16 @@ class Docker:
         return items
 
     @staticmethod
-    def containers(all_containers: bool = True) -> list[dict]:
-        """List containers"""
+    def containers(all_containers: bool = True, include_size: bool = False) -> list[dict]:
+        """List containers.
+
+        `--size=false` matters: with the `{{json .}}` template the docker CLI otherwise computes every
+        container's disk usage, which walks their filesystems and turns a 75ms `ps` into seconds."""
         args = ["ps", "--format", "{{json .}}"]
         if all_containers:
             args.insert(1, "-a")
+        if not include_size:
+            args.insert(1, "--size=false")
         raw = Docker._run_json(args)
         # Claude did this, not me - we should directly use these objects in the long-term, but since it works...
         return [c.to_dict() for c in (Container.from_dict(r) for r in raw) if c is not None]
@@ -1651,6 +1656,11 @@ class Docker:
             result["details"].append("Likely started via: docker run ...")
 
         return result
+
+    @staticmethod
+    def containers_by_name() -> dict[str, dict]:
+        """One `docker ps -a`, keyed by container name: for listings that look up many containers"""
+        return {c.get("Names", ""): c for c in Docker.containers(all_containers=True)}
 
     @staticmethod
     def find_project_container(project_name: str) -> dict | None:
@@ -2785,13 +2795,11 @@ class App:
 TABLE_MIN_COL = 8
 
 
-def format_table(headers: list[str], rows: list[list[str]], width: int | None, shrink: list[int]) -> list[str]:
-    """Render left-aligned columns sized to their content.
-
-    With a `width`, the columns listed in `shrink` give up space until the widest line fits:
-    always the widest of them first (ties: earlier in `shrink`), one character at a time, so
-    long columns end up balanced instead of one being crushed. None goes under TABLE_MIN_COL.
-    Clipped cells end with '…'. `width=None` never clips (piped output, `--wide`)."""
+def fit_widths(headers: list[str], rows: list[list[str]], width: int | None, shrink: list[int]) -> list[int]:
+    """Column widths for a table: each column's content width, then, given a `width`, the columns
+    listed in `shrink` give up space until the widest line fits: always the widest of them first
+    (ties: earlier in `shrink`), one character at a time, so long columns end up balanced instead
+    of one being crushed. None goes under TABLE_MIN_COL."""
     widths = [max(len(h), *(len(r[i]) for r in rows)) if rows else len(h) for i, h in enumerate(headers)]
     if width is not None:
         while sum(widths) + len(widths) - 1 > width:
@@ -2799,6 +2807,13 @@ def format_table(headers: list[str], rows: list[list[str]], width: int | None, s
             if not candidates:
                 break
             widths[max(candidates, key=lambda i: widths[i])] -= 1
+    return widths
+
+
+def format_table(headers: list[str], rows: list[list[str]], width: int | None, shrink: list[int]) -> list[str]:
+    """Render left-aligned columns sized by `fit_widths`; clipped cells end with '…'.
+    `width=None` never clips (piped output, `--wide`)."""
+    widths = fit_widths(headers, rows, width, shrink)
 
     def cell(text: str, w: int) -> str:
         return text if len(text) <= w else text[: w - 1] + "…"
@@ -2996,17 +3011,28 @@ def cli_projects(args: argparse.Namespace) -> None:
         print(f"No projects configured. Add TOML files to {PROJECTS_DIR}/ (see: containerctl help config)")
         return
 
-    print(f"{'PROJECT':<20} {'STATUS':<15} {'IMAGE':<30} {'REPO':<30} {'SHORTCUTS'}")
-    print("-" * 110)
+    headers = ["PROJECT", "STATUS", "IMAGE", "REPO", "SHORTCUTS"]
+    containers = Docker.containers_by_name()  # once, not one `docker ps` per project
+    rows = []
     for name, project in projects.items():
-        container = Docker.find_project_container(name)
+        container = containers.get(project.container_name)
         if container:
             status = container.get("State", container.get("Status", "unknown"))
         else:
             status = "not created"
-        repo = project.repos_display
-        shortcuts = ", ".join(project.shortcuts) or "-"
-        print(f"{name:<20} {status:<15} {project.image:<30} {repo:<30} {shortcuts}")
+        rows.append([name, status, project.image, project.repos_display, ", ".join(project.shortcuts) or "-"])
+    width = _table_width(args.wide)
+    shrink = [3, 2, 0, 1]  # REPO, IMAGE, PROJECT, STATUS
+    if width is not None:
+        # A shortcut list longer than the balanced share the fitter would give that column collapses
+        # to its count rather than being clipped mid-name (the full list is `projects -w`). The
+        # second fit below then hands the freed space back to the other columns.
+        share = fit_widths(headers, rows, width, shrink + [4])[4]
+        for row, project in zip(rows, projects.values()):
+            n = len(project.shortcuts)
+            if n and len(row[-1]) > share:
+                row[-1] = f"({n} shortcut{'s' if n > 1 else ''})"
+    print("\n".join(format_table(headers, rows, width, shrink)))
 
 
 def _check_one(project: "ProjectConfig") -> bool | None:
@@ -3140,10 +3166,11 @@ def cli_services(args: argparse.Namespace) -> None:
         print(f"No services configured. Add TOML files to {SERVICES_DIR}/ (see: containerctl help config)")
         return
 
-    print(f"{'SERVICE':<20} {'STATUS':<15} {'IMAGE':<30} {'PORTS':<30} {'NETWORKS'}")
-    print("-" * 110)
+    headers = ["SERVICE", "STATUS", "IMAGE", "PORTS", "NETWORKS"]
+    containers = Docker.containers_by_name()  # once, not one `docker ps` per service
+    rows = []
     for name, service in services.items():
-        container = Docker.find_service_container(name)
+        container = containers.get(service.container_name)
         if container:
             status = container.get("State", container.get("Status", "unknown"))
         else:
@@ -3151,8 +3178,8 @@ def cli_services(args: argparse.Namespace) -> None:
         ports = ", ".join(service.ports[:3])
         if len(service.ports) > 3:
             ports += f" +{len(service.ports) - 3}"
-        networks = ", ".join(service.networks) or "-"
-        print(f"{name:<20} {status:<15} {service.image:<30} {ports:<30} {networks}")
+        rows.append([name, status, service.image, ports, ", ".join(service.networks) or "-"])
+    print("\n".join(format_table(headers, rows, _table_width(args.wide), shrink=[4, 3, 2, 0, 1])))
 
 
 def usage() -> int:
@@ -3193,6 +3220,7 @@ def usage() -> int:
         "- containerctl spawn <project>          ==> force-create project container",
         "- containerctl destroy <project>        ==> stop and remove project container",
         "- containerctl projects                 ==> list configured projects",
+        "- containerctl projects -w              ==> wide: full shortcut lists, never clip",
         "──────────────────────────────────────────────",
         "- containerctl check <project>          ==> is the workspace safe to destroy? (uncommitted/unpushed/extra)",
         "- containerctl check --all              ==> check every configured project",
@@ -3204,6 +3232,7 @@ def usage() -> int:
         "- containerctl service scripts <name>          ==> list pre-registered scripts",
         "- containerctl service script <name> <script>  ==> run a pre-registered script",
         "- containerctl services                        ==> list configured services",
+        "- containerctl services -w                     ==> wide: never clip columns",
         "──────────────────────────────────────────────",
         f"Project configs: {PROJECTS_DIR}/<name>.toml",
         f"Service configs: {SERVICES_DIR}/<name>.toml",
@@ -3348,6 +3377,7 @@ def main() -> None:
 
     # projects
     projects_parser = subparsers.add_parser("projects", help="List configured projects")
+    projects_parser.add_argument("-w", "--wide", action="store_true", help="Full shortcut lists, never clip")
     projects_parser.set_defaults(func=cli_projects)
 
     # service (with sub-subcommands)
@@ -3377,6 +3407,7 @@ def main() -> None:
 
     # services (list)
     services_parser = subparsers.add_parser("services", help="List configured services")
+    services_parser.add_argument("-w", "--wide", action="store_true", help="Never clip columns")
     services_parser.set_defaults(func=cli_services)
 
     args = parser.parse_args()

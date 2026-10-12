@@ -38,6 +38,7 @@ containerctl - KISS containers CLI/TUI manager
 - containerctl spawn <project>          ==> force-create project container
 - containerctl destroy <project>        ==> stop and remove project container
 - containerctl projects                 ==> list configured projects
+- containerctl projects -w              ==> wide: full shortcut lists, never clip
 ──────────────────────────────────────────────
 - containerctl check <project>          ==> is the workspace safe to destroy? (uncommitted/unpushed/extra)
 - containerctl check --all              ==> check every configured project
@@ -49,6 +50,7 @@ containerctl - KISS containers CLI/TUI manager
 - containerctl service scripts <name>          ==> list pre-registered scripts
 - containerctl service script <name> <script>  ==> run a pre-registered script
 - containerctl services                        ==> list configured services
+- containerctl services -w                     ==> wide: never clip columns
 ──────────────────────────────────────────────
 Project configs: ~/.config/containerctl/projects/<name>.toml
 Service configs: ~/.config/containerctl/services/<name>.toml
