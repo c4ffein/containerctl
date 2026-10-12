@@ -489,7 +489,7 @@ CONTAINER_MANIFEST = f"{CONTAINER_HOME}/.config/containerctl/expected.json"
 
 CONTAINER_PREFIX = "cctl-prj-"
 SERVICE_PREFIX = "cctl-svc-"
-NETWORK_PREFIX = "cctl-net-"
+NETWORK_PREFIX = "cctl-net-prj-"  # one per project; mirrors CONTAINER_PREFIX
 LABEL_PROJECT = "cctl.project"
 LABEL_REPO = "cctl.repo"
 LABEL_SERVICE = "cctl.service"

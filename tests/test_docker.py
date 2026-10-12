@@ -206,7 +206,7 @@ class ProjectAndServiceRunTests(unittest.TestCase):
         self.assertEqual(argv[:3], ["run", "-d", "--init"])  # --init reaps what `docker exec` leaves behind
         self.assertIn("--name", argv)
         self.assertIn("cctl-prj-demo", argv)
-        self.assertIn("cctl-net-demo", argv)
+        self.assertIn("cctl-net-prj-demo", argv)
         self.assertIn("cctl.project=demo", argv)
         self.assertEqual(argv[-3:], ["ubuntu:22.04", "sleep", "infinity"])
 
