@@ -5,8 +5,10 @@ recorders so we assert on the argv that *would* be executed.
 """
 
 import io
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
 from unittest import mock
 
 import containerctl
@@ -228,10 +230,16 @@ class ProjectAndServiceRunTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("-v") + 1], "/data:/data:ro")
         self.assertEqual(argv[argv.index("-e") + 1], "FOO=bar")
         self.assertEqual(argv[-1], "nginx:latest")
-        # no networks / hardening configured -> none of their flags, and no network commands at all
+        # no networks / hardening configured -> none of their flags, and no network commands at all;
+        # the only call before the run is the image presence check (present with the recorder: no build)
         for flag in ("--network", "--read-only", "--tmpfs", "--cap-drop", "--cap-add", "--pids-limit"):
             self.assertNotIn(flag, argv)
-        self.assertEqual(len(self.rec.calls), 1)
+        self.assertEqual(self.rec.calls[:-1], [["image", "inspect", "nginx:latest"]])
+
+    def test_create_service_container_command_follows_the_image(self):
+        service = ServiceConfig(name="h", image="hermes:latest", command=["gateway", "run"])
+        self.assertTrue(Docker.create_service_container(service))
+        self.assertEqual(self.rec.last[-3:], ["hermes:latest", "gateway", "run"])
 
     def test_create_service_container_hardening_flags(self):
         service = ServiceConfig(
@@ -256,9 +264,12 @@ class ProjectAndServiceRunTests(unittest.TestCase):
         service = ServiceConfig(name="web", image="nginx", networks=["proxy", "backend"])
         self.assertTrue(Docker.create_service_container(service))
         calls = self.rec.calls
-        # every network is ensured (inspect succeeds with the recorder, so no create) before the run
+        # every network is ensured (inspect succeeds with the recorder, so no create), then the image, before the run
         run_idx = next(i for i, c in enumerate(calls) if c[0] == "run")
-        self.assertEqual(calls[:run_idx], [["network", "inspect", "proxy"], ["network", "inspect", "backend"]])
+        self.assertEqual(
+            calls[:run_idx],
+            [["network", "inspect", "proxy"], ["network", "inspect", "backend"], ["image", "inspect", "nginx"]],
+        )
         argv = calls[run_idx]
         self.assertEqual(argv[argv.index("--network") + 1], "proxy")
         self.assertEqual(argv.count("--network"), 1)
@@ -485,3 +496,100 @@ class ExecEnvTests(unittest.TestCase):
         _, stderr = self._enter({}, logged=problems)
         self.assertNotIn("-e", self.sub.last)
         self.assertEqual(stderr, "env: TOK: no 'tok' in secrets.toml\n")
+
+
+class ImageBuildTests(unittest.TestCase):
+    """`docker build` argv, the no-context stdin path, and the auto-build before `docker run`."""
+
+    def setUp(self):
+        reset_errors()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        (self.dir / "hermes.toml").write_text("")
+        (self.dir / "hermes.Dockerfile").write_text("FROM debian:12\n")
+        self.image = containerctl.ImageConfig.from_toml(self.dir / "hermes.toml")
+        self.rec = RunRecorder()
+        self._patches = [
+            mock.patch.object(Docker, "_run", self.rec),
+            mock.patch.object(containerctl, "IMAGES_DIR", self.dir),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        self._tmp.cleanup()
+
+    def test_build_without_context_feeds_dockerfile_on_stdin(self):
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(Docker.build_image(self.image))
+        argv = self.rec.last
+        self.assertEqual(argv[:5], ["build", "-t", "hermes:cctl-local-000000", "-t", "hermes:latest"])
+        self.assertIn("cctl.image=hermes", argv)
+        self.assertIn(f"cctl.recipe={self.image.recipe_hash()}", argv)
+        self.assertEqual(argv[-1], "-")
+        self.assertNotIn("-f", argv)
+        self.assertEqual(self.rec.stdins[-1].name, str(self.dir / "hermes.Dockerfile"))
+
+    def test_build_with_context_sends_the_directory(self):
+        (self.dir / "hermes").mkdir()
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(Docker.build_image(self.image))
+        argv = self.rec.last
+        self.assertEqual(argv[-3:], ["-f", str(self.dir / "hermes.Dockerfile"), str(self.dir / "hermes")])
+        self.assertIsNone(self.rec.stdins[-1])
+
+    def test_build_numbers_after_the_highest_existing_version(self):
+        self.rec.stdout = "cctl-local-000007 aaa\nlatest aaa\ncctl-local-000002 bbb\n<none> ccc\n"
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(Docker.build_image(self.image))
+        self.assertEqual(self.rec.calls[0], ["images", "--format", "{{.Tag}} {{.ID}}", "hermes"])
+        self.assertEqual(self.rec.last[1:5], ["-t", "hermes:cctl-local-000008", "-t", "hermes:latest"])
+
+    def test_image_versions(self):
+        self.rec.stdout = "cctl-local-000007 aaa\nlatest aaa\ncctl-local-000002 bbb\ncctl-local-x ddd\n<none> ccc\n"
+        self.assertEqual(Docker.image_versions(self.image), ([2, 7], 7, True))
+        self.rec.stdout = "cctl-local-000002 bbb\nlatest zzz\n"  # tag points at something that is not a local build
+        self.assertEqual(Docker.image_versions(self.image), ([2], None, True))
+        self.rec.stdout = ""
+        self.assertEqual(Docker.image_versions(self.image), ([], None, False))
+        self.rec.returncode = 1
+        self.assertEqual(Docker.image_versions(self.image), ([], None, False))
+        self.assertEqual(get_errors()[-1]["cat"], "docker.command")
+
+    def test_version_tag_keeps_registry_and_port(self):
+        image = containerctl.ImageConfig(
+            name="h", dockerfile=self.dir / "x", context=self.dir / "y", tag="reg:5000/h:1"
+        )
+        self.assertEqual((image.repository, image.version_tag(23)), ("reg:5000/h", "reg:5000/h:cctl-local-000023"))
+
+    def test_build_failure_is_logged(self):
+        self.rec.returncode = 1
+        self.assertFalse(Docker.build_image(self.image))
+        self.assertEqual(get_errors()[-1]["cat"], "image.build")
+
+    def test_ensure_image_skips_when_present(self):
+        self.assertTrue(Docker.ensure_image("hermes:latest"))
+        self.assertEqual(self.rec.calls, [["image", "inspect", "hermes:latest"]])
+
+    def test_ensure_image_builds_when_missing_and_recipe_claims_it(self):
+        self.rec.returncode = 1  # inspect fails: absent
+        calls = []
+
+        def build(image):
+            calls.append(image.name)
+            return True
+
+        with mock.patch.object(Docker, "build_image", side_effect=build), redirect_stdout(io.StringIO()):
+            self.assertTrue(Docker.ensure_image("hermes"))
+            self.assertTrue(Docker.ensure_image("ubuntu:24.04"))  # no recipe: docker will pull
+        self.assertEqual(calls, ["hermes"])
+
+    def test_create_containers_ensure_the_image_first(self):
+        self.rec.returncode = 1  # every docker call fails, including `image inspect`
+        with mock.patch.object(Docker, "build_image", return_value=False), redirect_stdout(io.StringIO()):
+            self.assertFalse(Docker.create_project_container(ProjectConfig(name="p", image="hermes")))
+            self.assertFalse(Docker.create_service_container(ServiceConfig(name="s", image="hermes")))
+        self.assertNotIn("run", [c[0] for c in self.rec.calls])
+        self.assertLessEqual({"project.create", "service.create"}, {e["cat"] for e in get_errors()})

@@ -2,6 +2,7 @@
 
 import argparse
 import io
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -44,6 +45,7 @@ class UsageTests(unittest.TestCase):
         with (
             mock.patch.object(containerctl, "PROJECTS_DIR", "~/.config/containerctl/projects"),
             mock.patch.object(containerctl, "SERVICES_DIR", "~/.config/containerctl/services"),
+            mock.patch.object(containerctl, "IMAGES_DIR", "~/.config/containerctl/images"),
             mock.patch.object(containerctl, "SECRETS_FILE", "~/.config/containerctl/secrets.toml"),
             redirect_stdout(buf),
         ):
@@ -60,21 +62,29 @@ class UsageTests(unittest.TestCase):
         with redirect_stdout(buf):
             config_usage()
         project_part, rest = buf.getvalue().strip().split(f"# {containerctl.SERVICES_DIR}")
-        service_part, secrets_part = rest.split(f"# {containerctl.SECRETS_FILE}")
+        service_part, rest = rest.split(f"# {containerctl.IMAGES_DIR}")
+        image_part, secrets_part = rest.split(f"# {containerctl.SECRETS_FILE}")
         with tempfile.TemporaryDirectory() as d:
             prj = Path(d) / "demo.toml"
             prj.write_text(project_part)
             svc = Path(d) / "web.toml"
             svc.write_text(service_part.split("\n", 1)[1])
+            img = Path(d) / "hermes.toml"
+            img.write_text(image_part.split("\n", 1)[1])
+            (Path(d) / "hermes.Dockerfile").write_text("FROM scratch\n")
             sec = Path(d) / "secrets.toml"
             sec.write_text(secrets_part.split("\n", 1)[1])
             sec.chmod(0o600)
             project = ProjectConfig.from_toml(prj)
             service = containerctl.ServiceConfig.from_toml(svc)
+            image = containerctl.ImageConfig.from_toml(img)
             with mock.patch.object(containerctl, "SECRETS_FILE", sec):
                 env = containerctl.resolve_env(project)
         self.assertIsNotNone(project, containerctl.get_errors())
         self.assertIsNotNone(service, containerctl.get_errors())
+        self.assertIsNotNone(image, containerctl.get_errors())
+        self.assertEqual(image.tag, "hermes:latest")
+        self.assertTrue(image.upstream.startswith("https://"))
         self.assertEqual(sorted(project.shortcuts), ["app", "lib"])
         self.assertEqual(project.secrets, {"CLAUDE_CODE_OAUTH_TOKEN": "claude_token"})
         self.assertEqual(env, {"TZ": "UTC", "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-..."})
@@ -282,3 +292,130 @@ class ProjectsShortcutsColumnTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CliImageTests(unittest.TestCase):
+    """`image ls` / `image build` / `image check` over a recipe dir; docker and the network are faked."""
+
+    def setUp(self):
+        reset_errors()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self._patch = mock.patch.object(containerctl, "IMAGES_DIR", self.dir)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self._tmp.cleanup()
+
+    def recipe(self, name="hermes", toml="", dockerfile="FROM debian:12\n"):
+        (self.dir / f"{name}.toml").write_text(toml)
+        (self.dir / f"{name}.Dockerfile").write_text(dockerfile)
+
+    def run_cli(self, func, image=None, versions=([], None, False), label=None, fetch=None):
+        """Fake docker: `versions` is image_versions()' answer; `label` the cctl.recipe label on the tagged image."""
+
+        def inspect(ref):
+            return mock.Mock(Config={"Labels": {"cctl.recipe": label} if label else {}})
+
+        out = io.StringIO()
+        with (
+            mock.patch.object(containerctl.Docker, "image_versions", return_value=versions),
+            mock.patch.object(containerctl.Docker, "inspect_image", side_effect=inspect) as inspected,
+            mock.patch.object(containerctl, "fetch_upstream", side_effect=fetch or (lambda url: None)) as fetched,
+            redirect_stdout(out),
+        ):
+            try:
+                func(argparse.Namespace(image=image))
+                code = 0
+            except SystemExit as e:
+                code = e.code
+        return code, out.getvalue(), inspected, fetched
+
+    def test_no_recipes(self):
+        code, out, _, _ = self.run_cli(containerctl.cli_image_check)
+        self.assertEqual(code, 0)
+        self.assertIn("No image recipes", out)
+
+    def test_not_built_no_upstream(self):
+        self.recipe()
+        code, out, inspected, fetched = self.run_cli(containerctl.cli_image_check)
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            out.strip().splitlines()[-1].split(), ["hermes", "hermes:latest", "-", "0", "not", "built", "-"]
+        )
+        inspected.assert_not_called()  # no tag: nothing to inspect
+        fetched.assert_not_called()
+
+    def test_up_to_date_and_in_sync(self):
+        self.recipe(toml='upstream = "https://example.com/Dockerfile"\n')
+        recipe = containerctl.load_images()["hermes"].recipe_hash()
+        versions = ([0, 1, 2], 2, True)
+        code, out, _, _ = self.run_cli(
+            containerctl.cli_image_check, versions=versions, label=recipe, fetch=lambda url: "FROM debian:12\n"
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            out.strip().splitlines()[-1].split()[2:], ["cctl-local-000002", "3", "up", "to", "date", "in", "sync"]
+        )
+        self.assertNotIn("warning", out)
+
+    def test_stale_and_differs_prints_diff(self):
+        self.recipe(toml='upstream = "https://example.com/Dockerfile"\n')
+        code, out, _, _ = self.run_cli(
+            containerctl.cli_image_check, versions=([0], 0, True), label="old", fetch=lambda url: "FROM debian:11\n"
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("stale", out)
+        self.assertIn("differs", out)
+        self.assertIn("--- https://example.com/Dockerfile", out)
+        self.assertIn("-FROM debian:11", out)
+        self.assertIn("+FROM debian:12", out)
+
+    def test_built_elsewhere_and_unreachable(self):
+        self.recipe(toml='upstream = "https://example.com/Dockerfile"\n')
+        code, out, _, _ = self.run_cli(containerctl.cli_image_check, versions=([], None, True))
+        self.assertEqual(code, 1)
+        self.assertIn("built elsewhere", out)
+        self.assertIn("unreachable", out)
+
+    def test_ls_never_fetches_and_nags_past_three_versions(self):
+        self.recipe(toml='upstream = "https://example.com/Dockerfile"\n')
+        recipe = containerctl.load_images()["hermes"].recipe_hash()
+        code, out, _, fetched = self.run_cli(containerctl.cli_image_ls, versions=([0, 1, 2, 3], 3, True), label=recipe)
+        self.assertEqual(code, 0)
+        fetched.assert_not_called()
+        self.assertNotIn("UPSTREAM", out)
+        self.assertIn("warning: hermes has 4 local versions", out)
+        self.assertIn("docker rmi hermes:cctl-local-000000 hermes:cctl-local-000001 hermes:cctl-local-000002", out)
+        self.assertNotIn("cctl-local-000003 ", out.split("docker rmi")[1])  # the current one is never suggested
+
+    def test_single_image_and_unknown(self):
+        self.recipe("a")
+        self.recipe("b")
+        code, out, _, _ = self.run_cli(containerctl.cli_image_check, image="a")
+        self.assertEqual(out.count("latest"), 1)
+        with redirect_stderr(io.StringIO()):
+            code, out, _, _ = self.run_cli(containerctl.cli_image_check, image="nope")
+        self.assertEqual((code, out), (1, ""))
+
+    def test_build_command(self):
+        self.recipe()
+        rec = RunRecorder()
+        with mock.patch.object(containerctl.Docker, "_run", rec), redirect_stdout(io.StringIO()):
+            containerctl.cli_image_build(argparse.Namespace(image="hermes"))
+        self.assertEqual(rec.last[:5], ["build", "-t", "hermes:cctl-local-000000", "-t", "hermes:latest"])
+
+    def test_argparse_wiring(self):
+        cases = (
+            (["image", "ls"], "cli_image_ls", None),
+            (["image", "build", "x"], "cli_image_build", "x"),
+            (["image", "check"], "cli_image_check", None),
+        )
+        for argv, func, attr in cases:
+            with (
+                mock.patch.object(containerctl.sys, "argv", ["containerctl", *argv]),
+                mock.patch.object(containerctl, func) as handler,
+            ):
+                containerctl.main()
+            self.assertEqual(getattr(handler.call_args.args[0], "image", None), attr)

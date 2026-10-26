@@ -7,7 +7,7 @@ containerctl - KISS containers CLI/TUI manager
 ──────────────────────────────────────────────
 - containerctl                          ==> launch TUI
 - containerctl help                     ==> show this help
-- containerctl help config              ==> example project, service and secrets TOML
+- containerctl help config              ==> example project, service, image and secrets TOML
 ──────────────────────────────────────────────
 - containerctl ps                       ==> list containers
 - containerctl ps -q                    ==> list container IDs only
@@ -52,7 +52,12 @@ containerctl - KISS containers CLI/TUI manager
 - containerctl services                        ==> list configured services
 - containerctl services -w                     ==> wide: never clip columns
 ──────────────────────────────────────────────
+- containerctl image ls                        ==> list recipes: current build, versions (nags past 3)
+- containerctl image build <name>              ==> build <repo>:cctl-local-NNNNNN, re-point the recipe tag
+- containerctl image check [name]              ==> built image vs recipe, local Dockerfile vs upstream
+──────────────────────────────────────────────
 Project configs: ~/.config/containerctl/projects/<name>.toml
 Service configs: ~/.config/containerctl/services/<name>.toml
+Image recipes:   ~/.config/containerctl/images/<name>.toml + <name>.Dockerfile [+ <name>/ build context]
 Secrets:         ~/.config/containerctl/secrets.toml (chmod 600; a project's [secrets] picks keys from it)
 ```

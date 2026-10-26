@@ -7,17 +7,23 @@ WARNING: I don't recommand using this as-is. This a PoC, and usable by me becaus
 """
 
 import argparse
+import difflib
+import hashlib
 import json
 import os
+import select
 import shutil
 import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import termios
 import threading
 import time
+import tomllib
 import tty
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -478,6 +484,7 @@ class NetworkInspect:
 CONFIG_DIR = Path.home() / ".config" / "containerctl"
 PROJECTS_DIR = CONFIG_DIR / "projects"
 SERVICES_DIR = CONFIG_DIR / "services"
+IMAGES_DIR = CONFIG_DIR / "images"  # <name>.toml + <name>.Dockerfile [+ <name>/ build context]
 SECRETS_FILE = CONFIG_DIR / "secrets.toml"  # flat `key = "value"`, 0600, never versioned; [secrets] picks keys from it
 
 # Paths *inside* a spawned container (the dev user's home is /home/dev — see spawn_project).
@@ -493,6 +500,10 @@ NETWORK_PREFIX = "cctl-net-prj-"  # one per project; mirrors CONTAINER_PREFIX
 LABEL_PROJECT = "cctl.project"
 LABEL_REPO = "cctl.repo"
 LABEL_SERVICE = "cctl.service"
+LABEL_IMAGE = "cctl.image"  # on images built from a recipe
+LABEL_RECIPE = "cctl.recipe"  # sha256 of the recipe (Dockerfile + context) the image was built from
+LOCAL_VERSION_PREFIX = "cctl-local-"  # each build is <repo>:cctl-local-NNNNNN; the recipe tag is re-pointed at it
+IMAGE_VERSIONS_WARN = 3  # `image ls` nags past this many local versions of one image
 
 
 @dataclass
@@ -601,8 +612,6 @@ class ProjectConfig:
     @classmethod
     def from_toml(cls, path: Path) -> "ProjectConfig | None":
         """Load project config from a TOML file"""
-        import tomllib  # lazy: keeps the module importable on Python 3.10 (check-local path)
-
         try:
             with open(path, "rb") as f:
                 data = tomllib.load(f)
@@ -763,8 +772,6 @@ def resolve_enter_target(name: str, projects: dict[str, ProjectConfig]) -> tuple
 def load_secrets() -> dict[str, str]:
     """secrets.toml: flat `key = "value"`. Values are never logged; a malformed entry is skipped, a malformed
     file yields nothing. A file readable by others is reported: a token is only as private as the file's mode."""
-    import tomllib  # lazy: keeps the module importable on Python 3.10 (check-local path)
-
     if not SECRETS_FILE.is_file():
         return {}
     try:
@@ -831,6 +838,7 @@ class ServiceConfig:
     volumes: list[str] = field(default_factory=list)
     scripts: dict[str, list[str]] = field(default_factory=dict)
     env: list[str] = field(default_factory=list)
+    command: list[str] = field(default_factory=list)  # argv after the image; empty = the image's own CMD
     networks: list[str] = field(default_factory=list)  # created if missing; `up` connects an existing container
     # Hardening (all optional, off by default): --read-only, --tmpfs, --cap-drop/--cap-add, --pids-limit
     read_only: bool = False
@@ -846,8 +854,6 @@ class ServiceConfig:
     @classmethod
     def from_toml(cls, path: Path) -> "ServiceConfig | None":
         """Load service config from a TOML file"""
-        import tomllib  # lazy: keeps the module importable on Python 3.10 (check-local path)
-
         try:
             with open(path, "rb") as f:
                 data = tomllib.load(f)
@@ -940,6 +946,11 @@ class ServiceConfig:
             log_error("service.config", f"Invalid 'pids_limit' (must be a positive integer) in {path}")
             return None
 
+        command = data.get("command", [])
+        if not isinstance(command, list) or not all(isinstance(a, str) and a for a in command):
+            log_error("service.config", f"Invalid 'command' (must be a list of non-empty strings) in {path}")
+            return None
+
         scripts: dict[str, list[str]] = {}
         scripts_data = data.get("scripts", {})
         if not isinstance(scripts_data, dict):
@@ -965,6 +976,7 @@ class ServiceConfig:
             volumes=volumes,
             scripts=scripts,
             env=env_list,
+            command=list(command),
             networks=networks,
             read_only=read_only,
             tmpfs=tmpfs,
@@ -984,6 +996,135 @@ def load_services() -> dict[str, ServiceConfig]:
         if service:
             services[service.name] = service
     return services
+
+
+# =============================================================================
+# Image recipes: ~/.config/containerctl/images/<name>.toml + <name>.Dockerfile [+ <name>/ context]
+# =============================================================================
+
+VALID_URL_CHARS = VALID_ID_CHARS + "/:.@~+%"
+
+
+def is_valid_https_url(url: str) -> bool:
+    """https only, conservative charset: an upstream Dockerfile URL, nothing fancier"""
+    return url.startswith("https://") and len(url) > 8 and all(c in VALID_URL_CHARS for c in url)
+
+
+def normalize_image_ref(ref: str) -> str:
+    """`hermes` -> `hermes:latest`, so a project's `image` matches a recipe's `tag` however either was written"""
+    if "@" in ref or ":" in ref.rsplit("/", 1)[-1]:
+        return ref
+    return f"{ref}:latest"
+
+
+@dataclass
+class ImageConfig:
+    """An image recipe: `<name>.toml` + `<name>.Dockerfile`, with `<name>/` as the build context when it exists"""
+
+    name: str
+    dockerfile: Path
+    context: Path  # only used when it is a directory; otherwise the Dockerfile is built with no context at all
+    tag: str = ""  # defaults to <name>:latest
+    upstream: str = ""  # https URL of the canonical Dockerfile; `image check` diffs the local one against it
+
+    def __post_init__(self):
+        self.tag = normalize_image_ref(self.tag or self.name)
+
+    @property
+    def repository(self) -> str:
+        """`tag` without its tag part: where the cctl-local-NNNNNN builds live"""
+        return self.tag.rsplit(":", 1)[0]
+
+    def version_tag(self, n: int) -> str:
+        return f"{self.repository}:{LOCAL_VERSION_PREFIX}{n:06d}"
+
+    @property
+    def has_context(self) -> bool:
+        return self.context.is_dir()
+
+    def recipe_hash(self) -> str | None:
+        """sha256 over the Dockerfile and every context file, by sorted relative path. Stored as a label on the
+        built image so `check` can tell a stale build from a current one. None (after logging) when unreadable."""
+        files = [(self.dockerfile.name, self.dockerfile)]
+        if self.has_context:
+            files += [
+                (str(p.relative_to(self.context)), p)
+                for p in sorted(self.context.rglob("*"))
+                if p.is_file() and ".git" not in p.relative_to(self.context).parts  # a clone's history is not recipe
+            ]
+        digest = hashlib.sha256()
+        for rel, path in files:
+            try:
+                data = path.read_bytes()
+            except OSError as e:
+                log_error("image.recipe", f"Cannot read {path}: {e}")
+                return None
+            digest.update(f"{rel}\0{len(data)}\0".encode())
+            digest.update(data)
+        return digest.hexdigest()
+
+    @classmethod
+    def from_toml(cls, path: Path) -> "ImageConfig | None":
+        """Load an image recipe from a TOML file; the Dockerfile must exist beside it"""
+        try:
+            with open(path, "rb") as f:
+                data = tomllib.load(f)
+        except (OSError, tomllib.TOMLDecodeError) as e:
+            log_error("image.config", f"Failed to load {path}: {e}")
+            return None
+        name = path.stem
+        if not is_valid_id(name):
+            log_error("image.config", f"Invalid image name '{name}': must be a-zA-Z0-9-_")
+            return None
+        tag = data.get("tag", "")
+        if not isinstance(tag, str) or (tag and (not is_valid_image_ref(tag) or "@" in tag)):
+            log_error("image.config", f"Invalid tag '{tag}' in {path}: name[:tag], no digest")
+            return None
+        upstream = data.get("upstream", "")
+        if not isinstance(upstream, str) or (upstream and not is_valid_https_url(upstream)):
+            log_error("image.config", f"Invalid upstream '{upstream}' in {path}: must be an https URL")
+            return None
+        dockerfile = path.with_suffix(".Dockerfile")
+        if not dockerfile.is_file():
+            log_error("image.config", f"Missing {dockerfile.name} beside {path}")
+            return None
+        return cls(name=name, dockerfile=dockerfile, context=path.with_suffix(""), tag=tag, upstream=upstream)
+
+
+def load_images() -> dict[str, ImageConfig]:
+    """Load all image recipes from ~/.config/containerctl/images/"""
+    images: dict[str, ImageConfig] = {}
+    if not IMAGES_DIR.is_dir():
+        return images
+    for path in sorted(IMAGES_DIR.glob("*.toml")):
+        image = ImageConfig.from_toml(path)
+        if image:
+            images[image.name] = image
+    return images
+
+
+def find_image_recipe(ref: str, images: dict[str, ImageConfig]) -> ImageConfig | None:
+    """The recipe whose tag is a project's or service's `image`, if any"""
+    want = normalize_image_ref(ref)
+    return next((image for image in images.values() if image.tag == want), None)
+
+
+def fetch_upstream(url: str, limit: int = 1 << 20) -> str | None:
+    """GET an https URL (CA-verified; nothing is sent but the request) and return its text, None after logging
+    on failure. The result is only ever diffed and shown: never written to the config dir, never built."""
+    if not is_valid_https_url(url):
+        log_error("image.upstream", f"Invalid upstream URL: {url}")
+        return None
+    try:
+        with urllib.request.urlopen(url, timeout=15) as resp:
+            data = resp.read(limit + 1)
+    except (OSError, ValueError) as e:  # URLError and HTTPError are OSErrors
+        log_error("image.upstream", f"Failed to fetch {url}: {e}")
+        return None
+    if len(data) > limit:
+        log_error("image.upstream", f"{url}: larger than {limit} bytes, not a Dockerfile")
+        return None
+    return data.decode("utf-8", errors="replace")
 
 
 # =============================================================================
@@ -1208,8 +1349,6 @@ def install_self(container: str, expected: list[str]) -> bool:
     Docker.exec_noninteractive(container, ["chmod", "+x", CONTAINER_SELF])
 
     # Write the manifest atomically to a temp file, then copy it in.
-    import tempfile
-
     tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
     try:
         json.dump(expected, tmp)
@@ -1343,8 +1482,6 @@ class Term:
             # Handle escape sequences
             if ch == "\x1b":
                 # Try to read more characters for escape sequences
-                import select
-
                 if select.select([sys.stdin], [], [], 0.1)[0]:
                     ch += sys.stdin.read(1)
                     if ch[-1] == "[":
@@ -1403,13 +1540,14 @@ class Docker:
     """Docker CLI wrapper using subprocess"""
 
     @staticmethod
-    def _run(args: list[str], capture: bool = True) -> subprocess.CompletedProcess:
+    def _run(args: list[str], capture: bool = True, stdin=None) -> subprocess.CompletedProcess:
         """Run docker command"""
         cmd = ["docker"] + args
         return subprocess.run(
             cmd,
             capture_output=capture,
             text=True,
+            stdin=stdin,
         )
 
     @staticmethod
@@ -1522,6 +1660,71 @@ class Docker:
             args.insert(1, "-f")
         result = Docker._run(args)
         return result.returncode == 0
+
+    @staticmethod
+    def image_exists(ref: str) -> bool:
+        """Is the image present locally?"""
+        if not is_valid_image_ref(ref):
+            log_error("docker.invalid_id", f"Invalid image ref: {ref}")
+            return False
+        return Docker._run(["image", "inspect", ref]).returncode == 0
+
+    @staticmethod
+    def image_versions(image: "ImageConfig") -> tuple[list[int], int | None, bool]:
+        """(versions, current, tagged): the cctl-local-N builds of the recipe's repository, sorted; the one the
+        recipe tag points at (None when it points elsewhere or nowhere); whether the recipe tag exists at all."""
+        result = Docker._run(["images", "--format", "{{.Tag}} {{.ID}}", image.repository])
+        if result.returncode != 0:
+            log_error("docker.command", f"docker images {image.repository}: {result.stderr.strip()}")
+            return [], None, False
+        ids: dict[str, str] = {}
+        for line in result.stdout.split("\n"):
+            parts = line.split()
+            if len(parts) == 2:
+                ids[parts[0]] = parts[1]
+        versions: dict[int, str] = {}
+        for tag, id_ in ids.items():
+            n = tag.removeprefix(LOCAL_VERSION_PREFIX)
+            if n != tag and n.isdigit():
+                versions[int(n)] = id_
+        current_id = ids.get(image.tag.rsplit(":", 1)[1])
+        current = max((n for n, id_ in versions.items() if id_ == current_id), default=None)
+        return sorted(versions), current, current_id is not None
+
+    @staticmethod
+    def build_image(image: "ImageConfig") -> bool:
+        """`docker build` a recipe as the next <repo>:cctl-local-NNNNNN and re-point the recipe tag at it, streaming
+        the output. The context dir is sent when it exists; otherwise the Dockerfile goes in on stdin, so a recipe
+        that copies nothing sends nothing."""
+        recipe = image.recipe_hash()
+        if recipe is None:
+            return False
+        versions, _, _ = Docker.image_versions(image)
+        version = image.version_tag(max(versions, default=-1) + 1)
+        labels = ["--label", f"{LABEL_IMAGE}={image.name}", "--label", f"{LABEL_RECIPE}={recipe}"]
+        args = ["build", "-t", version, "-t", image.tag, *labels]
+        if image.has_context:
+            result = Docker._run(args + ["-f", str(image.dockerfile), str(image.context)], capture=False)
+        else:
+            with open(image.dockerfile, "rb") as f:
+                result = Docker._run(args + ["-"], capture=False, stdin=f)
+        if result.returncode != 0:
+            log_error("image.build", f"docker build failed for {version} (exit {result.returncode})")
+            return False
+        print(f"Built {version}, {image.tag} now points at it")
+        return True
+
+    @staticmethod
+    def ensure_image(ref: str) -> bool:
+        """Before `docker run`: build the image from its recipe when it is absent and a recipe claims the tag.
+        Without a recipe docker pulls as usual. Never rebuilds an existing image: `image build` is the explicit way."""
+        if Docker.image_exists(ref):
+            return True
+        image = find_image_recipe(ref, load_images())
+        if image is None:
+            return True
+        print(f"Building {image.tag} from {image.dockerfile}...")
+        return Docker.build_image(image)
 
     @staticmethod
     def remove_volume(volume_name: str) -> bool:
@@ -1799,6 +2002,9 @@ class Docker:
         if not Docker.ensure_network(network_name):
             log_error("project.create", f"Failed to ensure network {network_name}")
             return False
+        if not Docker.ensure_image(project.image):
+            log_error("project.create", f"Failed to build image {project.image}")
+            return False
         args = [
             "run",
             "-d",
@@ -1999,6 +2205,9 @@ class Docker:
             if not Docker.ensure_network(network):
                 log_error("service.create", f"Failed to ensure network {network}")
                 return False
+        if not Docker.ensure_image(service.image):
+            log_error("service.create", f"Failed to build image {service.image}")
+            return False
         args = [
             "run",
             "-d",
@@ -2028,6 +2237,7 @@ class Docker:
         for e in service.env:
             args.extend(["-e", e])
         args.append(service.image)
+        args.extend(service.command)
         result = Docker._run(args)
         if result.returncode != 0:
             log_error(
@@ -3311,6 +3521,114 @@ def cli_services(args: argparse.Namespace) -> None:
     print("\n".join(format_table(headers, rows, _table_width(args.wide), shrink=[4, 3, 2, 0, 1])))
 
 
+def _image_or_exit(name: str, images: dict[str, "ImageConfig"]) -> "ImageConfig":
+    if name not in images:
+        print(f"Unknown image: {name}", file=sys.stderr)
+        print(f"Available images: {', '.join(images) or 'none'}", file=sys.stderr)
+        print(f"Add image recipes to {IMAGES_DIR}/ (see: containerctl help config)", file=sys.stderr)
+        sys.exit(1)
+    return images[name]
+
+
+def cli_image_build(args: argparse.Namespace) -> None:
+    """Build an image from its recipe (always; `up`/`spawn` only build when the image is missing)"""
+    image = _image_or_exit(args.image, load_images())
+    print(f"Building {image.tag} from {image.dockerfile}...")
+    if not Docker.build_image(image):
+        sys.exit(1)
+
+
+@dataclass
+class ImageState:
+    """What `image ls` / `image check` know about one recipe from docker alone (no network)"""
+
+    versions: list[int]  # every cctl-local-N of the repository
+    current: int | None  # the one the recipe tag points at
+    built: str  # up to date | stale | not built | built elsewhere | unreadable
+
+    @property
+    def current_display(self) -> str:
+        return "-" if self.current is None else f"{LOCAL_VERSION_PREFIX}{self.current:06d}"
+
+
+def image_state(image: "ImageConfig") -> ImageState:
+    recipe = image.recipe_hash()
+    versions, current, tagged = Docker.image_versions(image)
+    if recipe is None:
+        built = "unreadable"
+    elif not tagged:
+        built = "not built"
+    else:
+        info = Docker.inspect_image(image.tag)
+        label = (info.Config.get("Labels") or {}).get(LABEL_RECIPE) if info else None
+        built = "built elsewhere" if label is None else ("up to date" if label == recipe else "stale")
+    return ImageState(versions, current, built)
+
+
+def upstream_status(image: "ImageConfig") -> tuple[str, str | None]:
+    """(status, diff): - | in sync | differs | unreachable, plus the unified diff upstream -> local when they differ"""
+    if not image.upstream:
+        return "-", None
+    remote = fetch_upstream(image.upstream)
+    if remote is None:
+        return "unreachable", None
+    try:
+        local = image.dockerfile.read_text(errors="replace")
+    except OSError:
+        return "unreachable", None
+    if local == remote:
+        return "in sync", None
+    diff = difflib.unified_diff(
+        remote.splitlines(True), local.splitlines(True), fromfile=image.upstream, tofile=str(image.dockerfile)
+    )
+    return "differs", "".join(diff)
+
+
+def print_images(images: dict[str, "ImageConfig"], upstream: bool) -> bool:
+    """The recipes table, with upstream diffs after it when asked. True when nothing is off."""
+    if not images:
+        print(f"No image recipes. Add <name>.toml + <name>.Dockerfile to {IMAGES_DIR}/ (see: containerctl help config)")
+        return True
+    headers = ["IMAGE", "TAG", "CURRENT", "VERSIONS", "BUILT"] + (["UPSTREAM"] if upstream else [])
+    rows, notes, ok = [], [], True
+    for name, image in images.items():
+        state = image_state(image)
+        row = [name, image.tag, state.current_display, str(len(state.versions)), state.built]
+        ok = ok and state.built == "up to date"
+        if upstream:
+            status, diff = upstream_status(image)
+            row.append(status)
+            ok = ok and status in ("-", "in sync")
+            if diff:
+                notes.append(diff)
+        rows.append(row)
+        if len(state.versions) > IMAGE_VERSIONS_WARN:
+            old = " ".join(image.version_tag(n) for n in state.versions if n != state.current)
+            notes.append(
+                f"warning: {name} has {len(state.versions)} local versions; docker refuses to remove an image a\n"
+                f"container still uses, so this is safe to try:  docker rmi {old}\n"
+            )
+    print("\n".join(format_table(headers, rows, None, [])))
+    for note in notes:
+        print()
+        print(note, end="")
+    return ok
+
+
+def cli_image_ls(args: argparse.Namespace) -> None:
+    """List recipes: current build, version count, built state. Docker only, never the network."""
+    print_images(load_images(), upstream=False)
+
+
+def cli_image_check(args: argparse.Namespace) -> None:
+    """`image ls` plus local Dockerfile vs upstream, diffs included. Exit 1 when anything is off."""
+    images = load_images()
+    if args.image:
+        images = {args.image: _image_or_exit(args.image, images)}
+    if not print_images(images, upstream=True):
+        sys.exit(1)
+
+
 def usage() -> int:
     """Display usage information"""
     output_lines = [
@@ -3318,7 +3636,7 @@ def usage() -> int:
         "──────────────────────────────────────────────",
         "- containerctl                          ==> launch TUI",
         "- containerctl help                     ==> show this help",
-        "- containerctl help config              ==> example project, service and secrets TOML",
+        "- containerctl help config              ==> example project, service, image and secrets TOML",
         "──────────────────────────────────────────────",
         "- containerctl ps                       ==> list containers",
         "- containerctl ps -q                    ==> list container IDs only",
@@ -3363,8 +3681,13 @@ def usage() -> int:
         "- containerctl services                        ==> list configured services",
         "- containerctl services -w                     ==> wide: never clip columns",
         "──────────────────────────────────────────────",
+        "- containerctl image ls                        ==> list recipes: current build, versions (nags past 3)",
+        "- containerctl image build <name>              ==> build <repo>:cctl-local-NNNNNN, re-point the recipe tag",
+        "- containerctl image check [name]              ==> built image vs recipe, local Dockerfile vs upstream",
+        "──────────────────────────────────────────────",
         f"Project configs: {PROJECTS_DIR}/<name>.toml",
         f"Service configs: {SERVICES_DIR}/<name>.toml",
+        f"Image recipes:   {IMAGES_DIR}/<name>.toml + <name>.Dockerfile [+ <name>/ build context]",
         f"Secrets:         {SECRETS_FILE} (chmod 600; a project's [secrets] picks keys from it)",
     ]
     print("\n" + "\n".join(output_lines) + "\n")
@@ -3398,6 +3721,7 @@ def config_usage() -> int:
         'ports = ["127.0.0.1:8080:80"]             # [host_ip:]host:container[/udp]; no ip = all interfaces',
         'volumes = ["~/srv/www:/usr/share/nginx/html:ro"]',
         'env = ["TZ=UTC"]',
+        'command = ["nginx", "-g", "daemon off;"]    # argv after the image (optional; default: the image CMD)',
         'networks = ["proxy"]                      # created if missing; `up` also connects an existing container',
         "read_only = true                          # read-only root fs: writable paths must be tmpfs or volumes",
         'tmpfs = ["/tmp", "/run:size=16m"]         # path[:options]',
@@ -3406,6 +3730,10 @@ def config_usage() -> int:
         "pids_limit = 256",
         "[scripts]                                 # `containerctl service script <name> reload`",
         'reload = ["nginx", "-s", "reload"]',
+        "",
+        f"# {IMAGES_DIR}/<name>.toml  -  recipe: <name>.Dockerfile beside it; <name>/ is the build context if present",
+        'tag = "hermes:latest"                     # newest build\'s alias, for `image =` (default <name>:latest)',
+        'upstream = "https://raw.githubusercontent.com/you/images/main/hermes/Dockerfile"  # `image check` diffs it',
         "",
         f"# {SECRETS_FILE}  -  chmod 600, never versioned; only the keys a project names are read",
         "# Claude Code subscription token: `claude setup-token` on a trusted machine, valid ~1 year.",
@@ -3543,6 +3871,21 @@ def main() -> None:
     svc_scripts.add_argument("service", help="Service name")
     svc_scripts.set_defaults(func=cli_service_scripts)
 
+    # image (with sub-subcommands)
+    image_parser = subparsers.add_parser("image", help="Manage image recipes")
+    image_sub = image_parser.add_subparsers(dest="image_command")
+
+    img_ls = image_sub.add_parser("ls", help="List recipes: current build, versions, built state")
+    img_ls.set_defaults(func=cli_image_ls)
+
+    img_build = image_sub.add_parser("build", help="Build the next <repo>:cctl-local-NNNNNN, re-point the recipe tag")
+    img_build.add_argument("image", help="Image name")
+    img_build.set_defaults(func=cli_image_build)
+
+    img_check = image_sub.add_parser("check", help="Built image vs recipe, local Dockerfile vs upstream")
+    img_check.add_argument("image", nargs="?", help="Image name (default: all)")
+    img_check.set_defaults(func=cli_image_check)
+
     # services (list)
     services_parser = subparsers.add_parser("services", help="List configured services")
     services_parser.add_argument("-w", "--wide", action="store_true", help="Never clip columns")
@@ -3556,6 +3899,8 @@ def main() -> None:
         app.run()
     elif args.command == "service" and not hasattr(args, "func"):
         service_parser.print_help()
+    elif args.command == "image" and not hasattr(args, "func"):
+        image_parser.print_help()
     else:
         # Run CLI command
         args.func(args)

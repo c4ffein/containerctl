@@ -7,10 +7,14 @@ from unittest import mock
 
 import containerctl
 from containerctl import (
+    ImageConfig,
     ProjectConfig,
     RepoSpec,
     ServiceConfig,
+    find_image_recipe,
     get_errors,
+    load_images,
+    normalize_image_ref,
     parse_env_table,
     parse_secrets_table,
     resolve_enter_target,
@@ -187,6 +191,7 @@ class ServiceConfigTests(unittest.TestCase):
         self.assertEqual(cfg.ports, ["8080:80", "4000-5000:4000-5000/tcp"])
         self.assertEqual(cfg.volumes, ["/home/dev/data:/data:ro"])
         self.assertEqual(cfg.scripts["migrate"], ["python", "manage.py", "migrate"])
+        self.assertEqual(cfg.command, [])
         # hardening + networks default off
         self.assertEqual(cfg.networks, [])
         self.assertFalse(cfg.read_only)
@@ -420,3 +425,139 @@ class ResolveEnvTests(unittest.TestCase):
         self.write("garbage = [\n")  # would log if parsed
         self.assertEqual(resolve_env(self.project({"TZ": "UTC"})), {"TZ": "UTC"})
         self.assertEqual(self.cats(), [])
+
+
+class ImageConfigTests(unittest.TestCase):
+    """`<name>.toml` + `<name>.Dockerfile` [+ `<name>/`] -> ImageConfig; the recipe hash covers all of it."""
+
+    def setUp(self):
+        reset_errors()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def recipe(self, name="hermes", toml="", dockerfile="FROM debian:12\n"):
+        path = write_toml(self.dir, name, toml)
+        (self.dir / f"{name}.Dockerfile").write_text(dockerfile)
+        return path
+
+    def test_defaults(self):
+        cfg = ImageConfig.from_toml(self.recipe())
+        self.assertEqual((cfg.name, cfg.tag, cfg.upstream, cfg.has_context), ("hermes", "hermes:latest", "", False))
+        self.assertEqual(cfg.dockerfile, self.dir / "hermes.Dockerfile")
+        self.assertEqual(get_errors(), [])
+
+    def test_tag_and_upstream(self):
+        toml = 'tag = "registry.local/hermes:1.2"\nupstream = "https://raw.githubusercontent.com/u/r/main/Dockerfile"\n'
+        cfg = ImageConfig.from_toml(self.recipe(toml=toml))
+        self.assertEqual(cfg.tag, "registry.local/hermes:1.2")
+        self.assertEqual(cfg.upstream, "https://raw.githubusercontent.com/u/r/main/Dockerfile")
+        self.assertEqual(ImageConfig.from_toml(self.recipe(toml='tag = "hermes"\n')).tag, "hermes:latest")
+
+    def test_invalid_rejected(self):
+        for toml in (
+            "tag = 3\n",
+            'tag = "a b"\n',
+            'tag = "x@sha256:abc"\n',
+            'upstream = "http://x/Dockerfile"\n',
+            'upstream = "https://x/Dockerfile?x=1"\n',
+            "tag = [\n",
+        ):
+            reset_errors()
+            self.assertIsNone(ImageConfig.from_toml(self.recipe(toml=toml)), toml)
+            self.assertEqual(get_errors()[0]["cat"], "image.config", toml)
+
+    def test_missing_dockerfile_rejected(self):
+        path = write_toml(self.dir, "hermes", "")
+        self.assertIsNone(ImageConfig.from_toml(path))
+        self.assertIn("Missing hermes.Dockerfile", get_errors()[0]["msg"])
+
+    def test_invalid_name_rejected(self):
+        self.assertIsNone(ImageConfig.from_toml(self.recipe(name="a.b")))
+
+    def test_load_images_and_find_recipe(self):
+        self.recipe("a")
+        self.recipe("b", toml='tag = "other:2"\n')
+        with mock.patch.object(containerctl, "IMAGES_DIR", self.dir):
+            images = load_images()
+        self.assertEqual(sorted(images), ["a", "b"])
+        self.assertIs(find_image_recipe("a", images), images["a"])
+        self.assertIs(find_image_recipe("a:latest", images), images["a"])
+        self.assertIs(find_image_recipe("other:2", images), images["b"])
+        self.assertIsNone(find_image_recipe("other", images))
+        self.assertIsNone(find_image_recipe("a@sha256:abc", images))
+        with mock.patch.object(containerctl, "IMAGES_DIR", self.dir / "nope"):
+            self.assertEqual(load_images(), {})
+
+    def test_recipe_hash_covers_dockerfile_and_context(self):
+        cfg = ImageConfig.from_toml(self.recipe())
+        h0 = cfg.recipe_hash()
+        self.assertEqual(len(h0), 64)
+        self.assertEqual(cfg.recipe_hash(), h0)  # deterministic
+        (self.dir / "hermes.Dockerfile").write_text("FROM debian:13\n")
+        h1 = cfg.recipe_hash()
+        self.assertNotEqual(h1, h0)
+        ctx = self.dir / "hermes"
+        ctx.mkdir()
+        self.assertTrue(cfg.has_context)
+        h2 = cfg.recipe_hash()
+        self.assertEqual(h2, h1)  # an empty context adds nothing
+        (ctx / "sub").mkdir()
+        (ctx / "sub" / "conf").write_text("x")
+        h3 = cfg.recipe_hash()
+        self.assertNotEqual(h3, h2)
+        (ctx / "sub" / "conf").write_text("y")
+        self.assertNotEqual(cfg.recipe_hash(), h3)
+
+    def test_recipe_hash_ignores_git_history(self):
+        cfg = ImageConfig.from_toml(self.recipe())
+        ctx = self.dir / "hermes"
+        (ctx / ".git" / "objects").mkdir(parents=True)
+        (ctx / "src").mkdir()
+        (ctx / "src" / "a").write_text("a")
+        h = cfg.recipe_hash()
+        (ctx / ".git" / "objects" / "pack").write_text("blob")
+        (ctx / ".git" / "HEAD").write_text("ref")
+        self.assertEqual(cfg.recipe_hash(), h)
+        (ctx / "src" / "a").write_text("b")
+        self.assertNotEqual(cfg.recipe_hash(), h)
+
+    def test_recipe_hash_unreadable(self):
+        cfg = ImageConfig.from_toml(self.recipe())
+        (self.dir / "hermes.Dockerfile").unlink()
+        self.assertIsNone(cfg.recipe_hash())
+        self.assertEqual(get_errors()[0]["cat"], "image.recipe")
+
+
+class NormalizeImageRefTests(unittest.TestCase):
+    def test_cases(self):
+        for ref, want in (
+            ("hermes", "hermes:latest"),
+            ("hermes:1", "hermes:1"),
+            ("registry.local:5000/hermes", "registry.local:5000/hermes:latest"),
+            ("registry.local:5000/hermes:1", "registry.local:5000/hermes:1"),
+            ("x@sha256:abc", "x@sha256:abc"),
+        ):
+            self.assertEqual(normalize_image_ref(ref), want, ref)
+
+
+class ServiceCommandTests(unittest.TestCase):
+    def setUp(self):
+        reset_errors()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_command_parsed(self):
+        cfg = ServiceConfig.from_toml(write_toml(self.dir, "h", 'image = "x"\ncommand = ["gateway", "run"]\n'))
+        self.assertEqual(cfg.command, ["gateway", "run"])
+
+    def test_command_rejected(self):
+        for bad in ('command = "gateway run"', 'command = ["a", ""]', "command = [1]"):
+            reset_errors()
+            self.assertIsNone(ServiceConfig.from_toml(write_toml(self.dir, "h", f'image = "x"\n{bad}\n')), bad)
+            self.assertIn("command", get_errors()[0]["msg"])
