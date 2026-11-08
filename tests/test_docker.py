@@ -4,7 +4,9 @@ No real daemon: ``Docker._run`` and ``subprocess.run`` are replaced with
 recorders so we assert on the argv that *would* be executed.
 """
 
+import base64
 import io
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -12,7 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 import containerctl
-from containerctl import Docker, ProjectConfig, RepoSpec, ServiceConfig, get_errors
+from containerctl import KNOWN_HOSTS, Docker, ProjectConfig, RepoSpec, ServiceConfig, get_errors
 from tests.helper import RunRecorder, SubprocessRecorder, reset_errors
 
 
@@ -388,6 +390,32 @@ class SpawnAndEnterShellFreeTests(unittest.TestCase):
         tail = ["git", "clone", "-b", "main", "--", "https://github.com/u/repo.git", "d"]
         self.assertIn(["exec", "-w", "/home/dev/workspace", "cctl-prj-demo"] + tail, self.rec.calls)
 
+    def test_spawn_pins_forge_host_keys_instead_of_scanning(self):
+        with tempfile.NamedTemporaryFile(delete=False) as key:
+            key.write(b"not a real key")
+        self.addCleanup(os.unlink, key.name)
+        self.project.ssh_key = key.name
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(Docker.spawn_project(self.project))
+        tee = ["exec", "-i", "-u", "dev", "cctl-prj-demo", "tee", "-a", "/home/dev/.ssh/known_hosts"]
+        self.assertIn(tee, self.rec.calls)
+        self.assertEqual(self.rec.inputs[self.rec.calls.index(tee)], KNOWN_HOSTS)
+        flat = " ".join(" ".join(c) for c in self.rec.calls)
+        self.assertNotIn("ssh-keyscan", flat)
+        self.assertNotIn("bash", flat)
+
+    def test_known_hosts_constant_is_well_formed(self):
+        # One `host ssh-ed25519 <b64>` line per forge; the blob is an ed25519 wire key (type string + 32 bytes)
+        lines = KNOWN_HOSTS.splitlines()
+        self.assertEqual([ln.split()[0] for ln in lines], ["github.com", "gitlab.com"])
+        for line in lines:
+            host, kind, blob = line.split(" ")
+            self.assertEqual(kind, "ssh-ed25519")
+            raw = base64.b64decode(blob, validate=True)
+            self.assertEqual(raw[:4], (11).to_bytes(4, "big"))
+            self.assertEqual(raw[4:15], b"ssh-ed25519")
+            self.assertEqual(len(raw), 4 + 11 + 4 + 32)
+
     # enter attaches with a constant bash -c; the landing dir rides in as $1 (data, never
     # interpolated), and `cd -- "$1" || cd /home/dev` does the fallback atomically in-container.
     ENTER_SCRIPT = 'cd -- "$1" 2>/dev/null || cd /home/dev; exec bash'
@@ -496,6 +524,63 @@ class ExecEnvTests(unittest.TestCase):
         _, stderr = self._enter({}, logged=problems)
         self.assertNotIn("-e", self.sub.last)
         self.assertEqual(stderr, "env: TOK: no 'tok' in secrets.toml\n")
+
+
+class InstallSelfTests(unittest.TestCase):
+    """install_self runs on every `enter`: it creates as dev and chowns the two files `docker cp` wrote as root,
+    by name. The old `chown -R dev:dev ~/.local ~/.config` walked the whole home each time and flipped the owner
+    of everything under it."""
+
+    def setUp(self):
+        reset_errors()
+        self.rec = RunRecorder()
+        self._patch = mock.patch.object(Docker, "_run", self.rec)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+
+    def _execs(self):
+        return [c for c in self.rec.calls if c[0] == "exec"]
+
+    def test_creates_as_dev_and_chowns_only_the_copied_files(self):
+        self.assertTrue(containerctl.install_self("cctl-prj-demo", ["app"]))
+        execs = self._execs()
+        dirs = ["/home/dev/.local/bin", "/home/dev/.config/containerctl"]
+        self.assertEqual(execs[0], ["exec", "-u", "dev", "cctl-prj-demo", "mkdir", "-p", *dirs])
+        chowns = [c for c in execs if "chown" in c]
+        self.assertEqual(
+            chowns,
+            [
+                [
+                    "exec",
+                    "cctl-prj-demo",
+                    "chown",
+                    "dev:dev",
+                    "/home/dev/.local/bin/containerctl",
+                    "/home/dev/.config/containerctl/expected.json",
+                ]
+            ],
+        )
+        self.assertTrue(all("-R" not in c for c in self.rec.calls))
+
+    def test_copies_self_and_manifest(self):
+        containerctl.install_self("cctl-prj-demo", ["app", "lib"])
+        cps = [c for c in self.rec.calls if c[0] == "cp"]
+        self.assertEqual(cps[0][2], "cctl-prj-demo:/home/dev/.local/bin/containerctl")
+        self.assertEqual(cps[1][2], "cctl-prj-demo:/home/dev/.config/containerctl/expected.json")
+
+    def test_bashrc_append_runs_as_dev_with_a_constant_script(self):
+        containerctl.install_self("cctl-prj-demo", [])
+        shells = [c for c in self._execs() if "sh" in c]
+        self.assertEqual(len(shells), 1)
+        self.assertEqual(shells[0][:4], ["exec", "-u", "dev", "cctl-prj-demo"])
+        self.assertIn(".local/bin", shells[0][-1])
+
+    def test_failed_copy_of_self_aborts(self):
+        self.rec.returncode = 1
+        self.assertFalse(containerctl.install_self("cctl-prj-demo", []))
+        self.assertTrue(all("chown" not in c for c in self.rec.calls))
 
 
 class ImageBuildTests(unittest.TestCase):

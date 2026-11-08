@@ -1,6 +1,10 @@
 [project]
 name = "containerctl"
 version = "0.1.0"
+description = "KISS containers CLI/TUI manager, in Python"
+authors = [
+  { name = "c4ffein", email = "c4ffein.work@gmail.com" },
+]
 requires-python = ">=3.11"
 
 [dependency-groups]

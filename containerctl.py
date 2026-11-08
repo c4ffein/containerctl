@@ -24,33 +24,82 @@ import time
 import tomllib
 import tty
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 # =============================================================================
-# Error Registry
+# Issues: events (the error log) + conditions (evaluated from current state)
 # =============================================================================
+#
+# Two shapes, one surface (the Issues tab, `containerctl issues`):
+#   - an *event* is something that happened: a docker call failed, a build failed. Logged once per occurrence
+#     through log_error, counted, cleared by the user once read.
+#   - a *condition* is something that is true right now: a config file that doesn't parse, a world-readable
+#     secrets file, too many local image versions. Evaluated from current state on each fetch, never stored,
+#     gone by itself once fixed. Nothing to clear: the action that ends it is its `hint`.
+# Both carry a level. Severity and shape are independent: a broken TOML is an error-level condition.
+
+WARNING, ERROR = "warning", "error"
+
+
+@dataclass(frozen=True)
+class Issue:
+    level: str  # WARNING or ERROR
+    cat: str
+    msg: str
+    hint: str = ""  # what makes it go away
+
+
+_collecting = threading.local()  # .issues: where log_error appends inside a collecting() block, else None
+
+
+@contextmanager
+def collecting() -> Iterator[list[Issue]]:
+    """Inside the block, log_error records error-level conditions here instead of events. The config loaders
+    report through log_error; run them in here and a broken file is a condition that shows while it is broken,
+    instead of one more event per fetch. Per thread: the fetcher collects, the main thread's events stay events."""
+    issues: list[Issue] = []
+    previous = getattr(_collecting, "issues", None)
+    _collecting.issues = issues
+    try:
+        yield issues
+    finally:
+        _collecting.issues = previous
+
 
 _errors: list[dict] = []  # every occurrence, oldest first: {"ts", "cat", "msg", "ctx"}
+# The TUI's fetcher thread logs (config loads, docker failures) while the main thread reads, clears and renders.
+# The GIL makes a lone append safe; append + trim, or the rebind in clear_errors, are not, so every writer and
+# every reader that walks the list takes this lock. Callers never do: log_error and friends handle it.
+_errors_lock = threading.Lock()
 ERROR_MAX_ENTRIES = 10_000  # a broken config logs once per TUI tick; keep memory bounded, newest kept
 
 
 def log_error(category: str, message: str, context: dict | None = None) -> None:
-    """Log a non-fatal error to the global registry (every occurrence; the TUI dedups on display)"""
-    _errors.append({"ts": time.time(), "cat": category, "msg": message, "ctx": context or {}})
-    del _errors[:-ERROR_MAX_ENTRIES]
+    """Record a non-fatal error: an event in the registry (every occurrence; the TUI dedups on display), or an
+    error-level condition when called inside collecting()"""
+    issues = getattr(_collecting, "issues", None)
+    if issues is not None:
+        issues.append(Issue(ERROR, category, message))
+        return
+    with _errors_lock:
+        _errors.append({"ts": time.time(), "cat": category, "msg": message, "ctx": context or {}})
+        del _errors[:-ERROR_MAX_ENTRIES]
 
 
 def get_errors() -> list[dict]:
-    """Get all logged errors"""
+    """The live registry list (slice or copy it before walking it from another thread)"""
     return _errors
 
 
 def get_errors_by_category() -> dict[str, list[dict]]:
-    """Get errors grouped by category"""
+    """Get errors grouped by category (a snapshot taken under the lock)"""
+    with _errors_lock:
+        snapshot = list(_errors)
     grouped: dict[str, list[dict]] = {}
-    for err in _errors:
+    for err in snapshot:
         cat = err["cat"]
         if cat not in grouped:
             grouped[cat] = []
@@ -61,30 +110,33 @@ def get_errors_by_category() -> dict[str, list[dict]]:
 def clear_errors(category: str) -> int:
     """Clear all errors in a category, returns count cleared"""
     global _errors
-    before = len(_errors)
-    _errors = [e for e in _errors if e["cat"] != category]
-    return before - len(_errors)
+    with _errors_lock:
+        before = len(_errors)
+        _errors = [e for e in _errors if e["cat"] != category]
+        return before - len(_errors)
 
 
-def fetch_errors() -> list[dict]:
-    """Fetch errors formatted for the TUI tab: one row per category, latest message with its repeat count"""
-    grouped = get_errors_by_category()
-    if not grouped:
-        return [{"Category": "No errors", "Count": "", "Latest": "", "_category": ""}]
-    result = []
-    for cat, errs in sorted(grouped.items()):
+def by_severity(conditions: list[Issue]) -> list[Issue]:
+    """Errors first, then warnings, each by category"""
+    return sorted(conditions, key=lambda i: (i.level != ERROR, i.cat))
+
+
+def fetch_issues(conditions: list[Issue]) -> list[dict]:
+    """Rows for the Issues tab: conditions first (no count, nothing to clear), then one row per event category
+    with its latest message and repeat count. `_category` is set on event rows only: it is what [c]lear acts on."""
+    rows = []
+    for issue in by_severity(conditions):
+        message = f"{issue.msg}  [{issue.hint}]" if issue.hint else issue.msg
+        rows.append({"Level": issue.level, "Category": issue.cat, "Count": "", "Message": message, "_category": ""})
+    for cat, errs in sorted(get_errors_by_category().items()):
         latest = errs[-1]
         repeats = sum(1 for e in errs if e["msg"] == latest["msg"])
         suffix = f" (x{repeats})" if repeats > 1 else ""
-        result.append(
-            {
-                "Category": cat,
-                "Count": str(len(errs)),
-                "Latest": latest["msg"][:50] + suffix,
-                "_category": cat,  # Hidden field for clearing
-            }
-        )
-    return result
+        message = latest["msg"] + suffix
+        rows.append({"Level": ERROR, "Category": cat, "Count": str(len(errs)), "Message": message, "_category": cat})
+    if not rows:
+        return [{"Level": "", "Category": "No issues", "Count": "", "Message": "", "_category": ""}]
+    return rows
 
 
 # =============================================================================
@@ -505,6 +557,17 @@ LABEL_RECIPE = "cctl.recipe"  # sha256 of the recipe (Dockerfile + context) the 
 LOCAL_VERSION_PREFIX = "cctl-local-"  # each build is <repo>:cctl-local-NNNNNN; the recipe tag is re-pointed at it
 IMAGE_VERSIONS_WARN = 3  # `image ls` nags past this many local versions of one image
 
+# Host keys of the forges a spawn's SSH key talks to, as each publishes them out of band (checked 2026-11-08):
+#   github.com  https://api.github.com/meta  ("ssh_keys")
+#   gitlab.com  https://gitlab.com/help/instance_configuration
+# Appended to the dev user's known_hosts at spawn in place of `ssh-keyscan`, which trusts whatever answers the first
+# connection. ssh then enforces them on every connection: a rotated or spoofed key is a loud MITM warning, never a
+# silent accept. A real rotation means updating these lines and re-spawning.
+KNOWN_HOSTS = (
+    "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n"
+    "gitlab.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAfuCHKVTjquxvt6CM6tdG4SLp1Btn/nOeHHE5UOzRdf\n"
+)
+
 
 @dataclass
 class EnvFile:
@@ -739,17 +802,7 @@ def load_projects() -> dict[str, ProjectConfig]:
         project = ProjectConfig.from_toml(path)
         if project:
             projects[project.name] = project
-    # Shortcuts resolve globally, so flag the two collisions that make `enter <name>` surprising
-    owners: dict[str, list[str]] = {}
-    for project in projects.values():
-        for alias in project.shortcuts:
-            owners.setdefault(alias, []).append(project.name)
-    for alias, names in owners.items():
-        if alias in projects:
-            log_error("project.shortcut", f"Shortcut '{alias}' ({', '.join(names)}) is shadowed by project '{alias}'")
-        elif len(names) > 1:
-            log_error("project.shortcut", f"Shortcut '{alias}' is defined by several projects: {', '.join(names)}")
-    return projects
+    return projects  # shortcut collisions are a condition of the loaded set: see shortcut_issues
 
 
 def resolve_enter_target(name: str, projects: dict[str, ProjectConfig]) -> tuple[ProjectConfig, str | None] | None:
@@ -780,12 +833,8 @@ def load_secrets() -> dict[str, str]:
     except (OSError, tomllib.TOMLDecodeError) as e:
         log_error("env.secret", f"Failed to load {SECRETS_FILE}: {e}")
         return {}
-    try:
-        mode = stat.S_IMODE(SECRETS_FILE.stat().st_mode)
-    except OSError:
-        mode = 0
-    if mode & 0o077:
-        log_error("env.secret", f"{SECRETS_FILE} is mode {mode:04o}, readable by others: chmod 600")
+    if issue := secrets_mode_issue():  # a standing condition too; echoed here so `enter` shows it when it matters
+        log_error(issue.cat, f"{issue.msg}: {issue.hint}")
     secrets: dict[str, str] = {}
     for key, value in data.items():
         if not is_valid_env_name(key):
@@ -1128,6 +1177,79 @@ def fetch_upstream(url: str, limit: int = 1 << 20) -> str | None:
 
 
 # =============================================================================
+# Conditions: what is wrong right now, from state already in hand (no docker calls)
+# =============================================================================
+
+
+def shortcut_issues(projects: dict[str, ProjectConfig]) -> list[Issue]:
+    """Shortcuts resolve globally: the two collisions that make `enter <name>` surprising"""
+    owners: dict[str, list[str]] = {}
+    for project in projects.values():
+        for alias in project.shortcuts:
+            owners.setdefault(alias, []).append(project.name)
+    issues = []
+    for alias, names in sorted(owners.items()):
+        who = ", ".join(names)
+        if alias in projects:
+            msg = f"Shortcut '{alias}' ({who}) is shadowed by project '{alias}'"
+            issues.append(
+                Issue(WARNING, "project.shortcut", msg, f"rename it in {', '.join(f'{n}.toml' for n in names)}")
+            )
+        elif len(names) > 1:
+            msg = f"Shortcut '{alias}' is defined by several projects: {who}"
+            issues.append(Issue(WARNING, "project.shortcut", msg, "`enter` needs it in exactly one"))
+    return issues
+
+
+def secrets_mode_issue() -> Issue | None:
+    """A token is only as private as its file: secrets.toml readable by others"""
+    try:
+        mode = stat.S_IMODE(SECRETS_FILE.stat().st_mode)
+    except OSError:  # absent: nothing to protect
+        return None
+    if mode & 0o077:
+        msg = f"{SECRETS_FILE} is mode {mode:04o}, readable by others"
+        return Issue(WARNING, "env.secret", msg, f"chmod 600 {SECRETS_FILE}")
+    return None
+
+
+def local_versions(image: ImageConfig, rows: list[dict]) -> tuple[list[int], int | None]:
+    """From `docker images` rows: the repository's cctl-local-N versions, sorted, and the one the tag points at"""
+    ids = {r.get("Tag", ""): r.get("ID", "") for r in rows if r.get("Repository") == image.repository}
+    versions: dict[int, str] = {}
+    for tag, id_ in ids.items():
+        n = tag.removeprefix(LOCAL_VERSION_PREFIX)
+        if n != tag and n.isdigit():
+            versions[int(n)] = id_
+    current_id = ids.get(image.tag.rsplit(":", 1)[1])
+    current = max((n for n, id_ in versions.items() if id_ == current_id), default=None)
+    return sorted(versions), current
+
+
+def image_version_issues(images: dict[str, ImageConfig], rows: list[dict]) -> list[Issue]:
+    """Builds pile up: past IMAGE_VERSIONS_WARN local versions, name the ones that are safe to try removing"""
+    issues = []
+    for name, image in images.items():
+        versions, current = local_versions(image, rows)
+        if len(versions) > IMAGE_VERSIONS_WARN:
+            old = " ".join(image.version_tag(n) for n in versions if n != current)
+            issues.append(
+                Issue(WARNING, "image.versions", f"{name} has {len(versions)} local versions", f"docker rmi {old}")
+            )
+    return issues
+
+
+def check_conditions(
+    projects: dict[str, ProjectConfig], images: dict[str, ImageConfig], rows: list[dict]
+) -> list[Issue]:
+    """Every condition computable from loaded config and the `docker images` rows the fetcher already holds"""
+    issues = shortcut_issues(projects)
+    if secrets := secrets_mode_issue():
+        issues.append(secrets)
+    return issues + image_version_issues(images, rows)
+
+
+# =============================================================================
 # Workspace cleanliness check
 # =============================================================================
 #
@@ -1200,6 +1322,11 @@ class WorkspaceReport:
     @property
     def clean(self) -> bool:
         return all(s.clean for s in self.statuses) and not self.extra and not self.missing
+
+    @property
+    def dirty(self) -> list[str]:
+        """The dir names behind a DIRTY verdict: unclean or unconfigured dirs, then configured-but-absent ones"""
+        return [s.name for s in self.statuses if not s.clean or s.name in self.extra] + list(self.missing)
 
 
 def inspect_repo(name: str, run_git: Callable[[str, list[str]], tuple[int, str]]) -> RepoStatus:
@@ -1298,6 +1425,13 @@ def _host_git(container: str) -> Callable[[str, list[str]], tuple[int, str]]:
     return run_git
 
 
+def project_report(project: "ProjectConfig") -> WorkspaceReport:
+    """Check a project's workspace from the host, over `docker exec`; the container must exist.
+    `check` prints it, `destroy` warns from it (non-blocking: the user still decides)."""
+    name = project.container_name
+    return check_workspace([r.name for r in project.repos], lambda: _host_list_dirs(name), _host_git(name))
+
+
 # --- local adapters (run inside the container, plain git) -----------------------
 
 
@@ -1339,11 +1473,17 @@ def install_self(container: str, expected: list[str]) -> bool:
 
     Makes ``containerctl check-local`` available on the dev user's PATH. Best
     effort: failures are logged, never fatal to the spawn/enter flow.
+
+    Runs on every `enter`, so it must only touch what it owns: directories are
+    created as dev, and the two files `docker cp` writes (as root, always) are
+    chowned by name. Nothing recursive, nothing else in the home is affected.
     """
     self_path = Path(__file__).resolve()
     ok = True
 
-    Docker.exec_noninteractive(container, ["mkdir", "-p", CONTAINER_BIN, f"{CONTAINER_HOME}/.config/containerctl"])
+    Docker.exec_noninteractive(
+        container, ["mkdir", "-p", CONTAINER_BIN, f"{CONTAINER_HOME}/.config/containerctl"], user="dev"
+    )
     if not Docker.cp(str(self_path), container, CONTAINER_SELF):
         return False
     Docker.exec_noninteractive(container, ["chmod", "+x", CONTAINER_SELF])
@@ -1359,11 +1499,9 @@ def install_self(container: str, expected: list[str]) -> bool:
     finally:
         os.unlink(tmp.name)
 
-    Docker.exec_noninteractive(
-        container,
-        ["chown", "-R", "dev:dev", f"{CONTAINER_HOME}/.local", f"{CONTAINER_HOME}/.config"],
-    )
-    # Ensure ~/.local/bin is on PATH for future interactive shells (idempotent).
+    Docker.exec_noninteractive(container, ["chown", "dev:dev", CONTAINER_SELF, CONTAINER_MANIFEST])
+    # Ensure ~/.local/bin is on PATH for future interactive shells (idempotent, as dev so a
+    # missing .bashrc is created with the right owner).
     # Shell required here: the conditional append (`grep -qs ... || echo ... >>`) has
     # no argv equivalent. Both interpolated values are module-level constants, but
     # charset-check them at the call site anyway (defense in depth) since they land
@@ -1374,6 +1512,7 @@ def install_self(container: str, expected: list[str]) -> bool:
         Docker.exec_noninteractive(
             container,
             ["sh", "-c", f"grep -qs '.local/bin' '{bashrc}' || echo '{path_line}' >> '{bashrc}'"],
+            user="dev",
         )
     else:
         log_error("install_self.unsafe_shell_value", f"Refusing shell interpolation for {bashrc!r}")
@@ -1540,15 +1679,14 @@ class Docker:
     """Docker CLI wrapper using subprocess"""
 
     @staticmethod
-    def _run(args: list[str], capture: bool = True, stdin=None) -> subprocess.CompletedProcess:
-        """Run docker command"""
+    def _run(
+        args: list[str], capture: bool = True, stdin=None, input: str | None = None
+    ) -> subprocess.CompletedProcess:
+        """Run docker command; `input` feeds stdin from a string, `stdin` from a file (never both)"""
         cmd = ["docker"] + args
-        return subprocess.run(
-            cmd,
-            capture_output=capture,
-            text=True,
-            stdin=stdin,
-        )
+        if input is not None:
+            return subprocess.run(cmd, capture_output=capture, text=True, input=input)
+        return subprocess.run(cmd, capture_output=capture, text=True, stdin=stdin)
 
     @staticmethod
     def _run_json(args: list[str]) -> list[dict]:
@@ -2036,14 +2174,22 @@ class Docker:
 
     @staticmethod
     def exec_noninteractive(
-        container_id: str, command: list[str], workdir: str | None = None
+        container_id: str,
+        command: list[str],
+        workdir: str | None = None,
+        user: str | None = None,
+        input: str | None = None,
     ) -> subprocess.CompletedProcess:
-        """Execute command in container non-interactively (capture output)"""
+        """Execute command in container non-interactively (capture output); `input` is fed to its stdin"""
         args = ["exec"]
+        if input is not None:
+            args.append("-i")
+        if user is not None:
+            args.extend(["-u", user])
         if workdir is not None:
             args.extend(["-w", workdir])
         args.append(container_id)
-        return Docker._run(args + command)
+        return Docker._run(args + command, input=input)
 
     @staticmethod
     def spawn_project(project: "ProjectConfig") -> bool:
@@ -2072,15 +2218,12 @@ class Docker:
                 print("Error: SSH key not readable inside container", file=sys.stderr)
                 Docker.remove_container(project.container_name, force=True)
                 return False
-            # Add common hosts to known_hosts to avoid prompts
-            Docker.exec_noninteractive(
-                project.container_name,
-                [
-                    "bash",
-                    "-c",
-                    "ssh-keyscan -t ed25519 github.com gitlab.com >> /home/dev/.ssh/known_hosts 2>/dev/null",
-                ],
+            # Pinned forge host keys (see KNOWN_HOSTS), appended as dev so ssh can keep adding to the file
+            result = Docker.exec_noninteractive(
+                project.container_name, ["tee", "-a", "/home/dev/.ssh/known_hosts"], user="dev", input=KNOWN_HOSTS
             )
+            if result.returncode != 0:
+                log_error("project.spawn", f"Could not write known_hosts in {project.container_name}: {result.stderr}")
 
         # Clone repos if configured (each into its own dir under the workspace)
         if project.repos:
@@ -2318,13 +2461,14 @@ class DataFetcher:
     def __init__(self, interval: float = 2.0):
         self.interval = interval
         self.lock = threading.Lock()
-        self.data: dict[str, list[dict]] = {
+        self.data: dict[str, list] = {
             "containers": [],
             "images": [],
             "volumes": [],
             "networks": [],
             "projects": [],
             "services": [],
+            "issues": [],  # list[Issue]: the conditions as of the last fetch
         }
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -2363,8 +2507,14 @@ class DataFetcher:
             else:
                 c["Project"] = ""
 
+        # Config loads report through log_error: collected, they are conditions, not one event per fetch
+        with collecting() as conditions:
+            projects_config = load_projects()
+            services_config = load_services()
+            images_config = load_images()
+        conditions += check_conditions(projects_config, images_config, images)
+
         # Build projects list
-        projects_config = load_projects()
         projects_data = []
         for name, project in projects_config.items():
             container = None
@@ -2383,7 +2533,6 @@ class DataFetcher:
             )
 
         # Build services list
-        services_config = load_services()
         services_data = []
         for name, service in services_config.items():
             container = None
@@ -2411,6 +2560,7 @@ class DataFetcher:
             self.data["networks"] = networks
             self.data["projects"] = projects_data
             self.data["services"] = services_data
+            self.data["issues"] = conditions
 
     def _run(self) -> None:
         """Background thread loop"""
@@ -2441,19 +2591,19 @@ class UI:
     """UI rendering components - all methods write to a Screen buffer"""
 
     @staticmethod
-    def tab_bar(scr: Screen, tabs: list[Tab], selected: int, width: int, row: int) -> None:
-        """Render tab bar"""
+    def tab_bar(scr: Screen, tabs: list[Tab], selected: int, width: int, row: int, alert: str | None = None) -> None:
+        """Render tab bar; `alert` (WARNING or ERROR) colors the Issues tab yellow or red"""
         scr.move(row, 1)
         scr.clear_line()
 
         x = 1
         for i, tab in enumerate(tabs):
-            # Errors tab in red if there are errors
-            if tab.key == "errors" and _errors:
+            if tab.key == "issues" and alert:
+                color = Term.RED if alert == ERROR else Term.YELLOW
                 if i == selected:
-                    text = Term.style(f" {tab.name} ", Term.BOLD, Term.INVERT, Term.RED)
+                    text = Term.style(f" {tab.name} ", Term.BOLD, Term.INVERT, color)
                 else:
-                    text = Term.style(f" {tab.name} ", Term.RED)
+                    text = Term.style(f" {tab.name} ", color)
             elif i == selected:
                 text = Term.style(f" {tab.name} ", Term.BOLD, Term.INVERT)
             else:
@@ -2721,13 +2871,14 @@ class App:
                 actions={},
             ),
             Tab(
-                name="Errors",
-                key="errors",
-                fetch=fetch_errors,
+                name="Issues",
+                key="issues",
+                fetch=lambda: [],  # conditions come from the fetcher, events from the registry: see items()
                 columns=[
-                    ("Category", "CATEGORY", 30),
-                    ("Count", "COUNT", 8),
-                    ("Latest", "LATEST", 0),
+                    ("Level", "LEVEL", 8),
+                    ("Category", "CATEGORY", 20),
+                    ("Count", "COUNT", 6),
+                    ("Message", "MESSAGE", 0),
                 ],
                 id_key="_category",
                 actions={},
@@ -2740,8 +2891,8 @@ class App:
 
     def items(self) -> list[dict]:
         """Get items for current tab from cache"""
-        if self.current().key == "errors":
-            return fetch_errors()
+        if self.current().key == "issues":
+            return fetch_issues(self.fetcher.get("issues"))
         data = self.fetcher.get(self.current().key)
         if self.current().key == "projects" and not data:
             return [
@@ -2777,6 +2928,13 @@ class App:
             return item.get(self.current().id_key)
         return None
 
+    def alert_level(self) -> str | None:
+        """What the Issues tab signals: ERROR on any event or error-level condition, WARNING on warnings only"""
+        conditions = self.fetcher.get("issues")
+        if _errors or any(i.level == ERROR for i in conditions):
+            return ERROR
+        return WARNING if conditions else None
+
     def set_message(self, text: str, style: str = "") -> None:
         """Set status message"""
         self.message_text = text
@@ -2804,7 +2962,7 @@ class App:
         scr.move(1, 1)
 
         # Tab bar
-        UI.tab_bar(scr, self.tabs, self.current_tab, cols, tab_row)
+        UI.tab_bar(scr, self.tabs, self.current_tab, cols, tab_row, alert=self.alert_level())
 
         # Divider
         UI.divider(scr, 2, cols)
@@ -2868,7 +3026,7 @@ class App:
             keys = "[u]p [d]own [r]ecreate [q]uit"
         elif self.current().key == "networks":
             keys = "[e]dit [d]elete [q]uit"
-        elif self.current().key == "errors":
+        elif self.current().key == "issues":
             keys = "[c]lear [q]uit"
         else:
             keys = "[d]elete [q]uit"
@@ -3041,9 +3199,12 @@ class App:
                 Docker.enter_project(project)
                 self.enter_tui()
 
-            elif project and key == "d":  # Destroy
+            elif project and key == "d":  # Destroy, the prompt carrying `check`'s verdict when it is DIRTY
                 if Docker.find_project_container(project_name):
-                    if UI.confirm(f"Destroy project '{project_name}'?", rows - 1):
+                    prompt = f"Destroy project '{project_name}'?"
+                    if dirty := project_report(project).dirty:
+                        prompt = f"{prompt} Workspace is DIRTY: {', '.join(dirty)}."
+                    if UI.confirm(prompt, rows - 1):
                         if Docker.destroy_project(project):
                             self.set_message(f"Destroyed {project_name}", Term.GREEN)
                         else:
@@ -3083,10 +3244,10 @@ class App:
                     input("\nPress Enter to return...")
                     self.enter_tui()
 
-        # Error clearing
-        elif self.current().key == "errors" and key == "c" and self.selected_id():
+        # Event clearing (condition rows and the placeholder carry no _category: nothing to clear)
+        elif self.current().key == "issues" and key == "c" and self.selected_id():
             category = self.selected_id()
-            if category:  # Not the "No errors" placeholder
+            if category:
                 if UI.confirm(f"Clear all '{category}' errors?", rows - 1):
                     count = clear_errors(category)
                     self.set_message(f"Cleared {count} errors from {category}", Term.GREEN)
@@ -3333,12 +3494,18 @@ def cli_spawn(args: argparse.Namespace) -> None:
 
 
 def cli_destroy(args: argparse.Namespace) -> None:
-    """Destroy a project container"""
+    """Destroy a project container, after a `check` of its workspace: a DIRTY verdict is printed, not enforced"""
     projects = load_projects()
     if args.project not in projects:
         print(f"Unknown project: {args.project}", file=sys.stderr)
         sys.exit(1)
-    if not Docker.destroy_project(projects[args.project]):
+    project = projects[args.project]
+    if Docker.find_project_container(project.name):
+        report = project_report(project)
+        if not report.clean:
+            print_report(f"{project.name} ({project.container_name})", report)
+            print(f"warning: {project.name} is DIRTY, destroying anyway ({', '.join(report.dirty)})", file=sys.stderr)
+    if not Docker.destroy_project(project):
         sys.exit(1)
     print(f"Destroyed {args.project}")
 
@@ -3383,10 +3550,7 @@ def _check_one(project: "ProjectConfig") -> bool | None:
     if container is None:
         print(f"{project.name}: no container (nothing to check)")
         return None
-    expected = [r.name for r in project.repos]
-    name = project.container_name
-    report = check_workspace(expected, lambda: _host_list_dirs(name), _host_git(name))
-    return print_report(f"{project.name} ({name})", report)
+    return print_report(f"{project.name} ({project.container_name})", project_report(project))
 
 
 def cli_check(args: argparse.Namespace) -> None:
@@ -3414,6 +3578,32 @@ def cli_check(args: argparse.Namespace) -> None:
         if result is False:
             dirty = True
     if dirty:
+        sys.exit(1)
+
+
+def current_issues() -> list[Issue]:
+    """The conditions as the TUI computes them, for one CLI run"""
+    with collecting() as conditions:
+        projects, images = load_projects(), load_images()
+        load_services()
+    return conditions + check_conditions(projects, images, Docker.images())
+
+
+def print_issues(conditions: list[Issue]) -> bool:
+    """Conditions, then the events recorded so far in this run, as one table. True when nothing is error-level."""
+    rows = [[i.level, i.cat, i.msg, i.hint] for i in by_severity(conditions)]
+    for cat, errs in sorted(get_errors_by_category().items()):
+        rows.append([ERROR, cat, errs[-1]["msg"], f"x{len(errs)}" if len(errs) > 1 else ""])
+    if not rows:
+        print("No issues")
+        return True
+    print("\n".join(format_table(["LEVEL", "CATEGORY", "MESSAGE", "HINT"], rows, None, [])))
+    return all(row[0] != ERROR for row in rows)
+
+
+def cli_issues(args: argparse.Namespace) -> None:
+    """What needs attention: the Issues tab for one run; exit 1 when anything is error-level"""
+    if not print_issues(current_issues()):
         sys.exit(1)
 
 
@@ -3665,13 +3855,14 @@ def usage() -> int:
         "- containerctl enter <proj> user=root   ==> enter project as another user",
         "- containerctl enter <shortcut>         ==> enter project, landing in a [shortcuts] dir",
         "- containerctl spawn <project>          ==> force-create project container",
-        "- containerctl destroy <project>        ==> stop and remove project container",
+        "- containerctl destroy <project>        ==> stop and remove project container (warns when DIRTY)",
         "- containerctl projects                 ==> list configured projects",
         "- containerctl projects -w              ==> wide: full shortcut lists, never clip",
         "──────────────────────────────────────────────",
         "- containerctl check <project>          ==> is the workspace safe to destroy? (uncommitted/unpushed/extra)",
         "- containerctl check --all              ==> check every configured project",
         "- containerctl check-local              ==> run the same check from inside a container",
+        "- containerctl issues                   ==> what needs attention: warnings (config, secrets, images) + errors",
         "──────────────────────────────────────────────",
         "- containerctl service up <name>               ==> create/start a service",
         "- containerctl service down <name>             ==> stop and remove a service",
@@ -3840,6 +4031,10 @@ def main() -> None:
     # check-local (runs inside a container; installed to ~/.local/bin on spawn)
     check_local_parser = subparsers.add_parser("check-local", help="Check current workspace (inside a container)")
     check_local_parser.set_defaults(func=cli_check_local)
+
+    # issues
+    issues_parser = subparsers.add_parser("issues", help="What needs attention: conditions, then recorded errors")
+    issues_parser.set_defaults(func=cli_issues)
 
     # projects
     projects_parser = subparsers.add_parser("projects", help="List configured projects")

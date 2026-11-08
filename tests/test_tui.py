@@ -9,10 +9,27 @@ import io
 import re
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest import mock
 
 import containerctl
-from containerctl import UI, App, DataFetcher, Docker, ProjectConfig, Screen, ServiceConfig, Tab, Term, log_error
+from containerctl import (
+    ERROR,
+    UI,
+    WARNING,
+    App,
+    DataFetcher,
+    Docker,
+    Issue,
+    ProjectConfig,
+    RepoStatus,
+    Screen,
+    ServiceConfig,
+    Tab,
+    Term,
+    WorkspaceReport,
+    log_error,
+)
 from tests.helper import RunRecorder, reset_errors
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -89,14 +106,17 @@ class UIWidgetTests(unittest.TestCase):
         self.assertIn(Term.DIM + " One " + Term.RESET, raw)
         self.assertIn(Term.BOLD + Term.INVERT + " Two " + Term.RESET, raw)
 
-    def test_tab_bar_paints_errors_tab_red_only_when_errors_exist(self):
-        errors_tab = tab([], key="errors")
-        errors_tab.name = "Errors"
-        UI.tab_bar(self.scr, [errors_tab], 0, 80, 1)
+    def test_tab_bar_colors_issues_tab_by_alert_level(self):
+        issues_tab = tab([], key="issues")
+        issues_tab.name = "Issues"
+        UI.tab_bar(self.scr, [issues_tab], 0, 80, 1)
         self.assertNotIn(Term.RED, "".join(self.scr.buf))
-        log_error("x", "boom")
+        self.assertNotIn(Term.YELLOW, "".join(self.scr.buf))
         self.scr.clear()
-        UI.tab_bar(self.scr, [errors_tab], 0, 80, 1)
+        UI.tab_bar(self.scr, [issues_tab], 0, 80, 1, alert=WARNING)
+        self.assertIn(Term.YELLOW, "".join(self.scr.buf))
+        self.scr.clear()
+        UI.tab_bar(self.scr, [issues_tab], 0, 80, 1, alert=ERROR)
         self.assertIn(Term.RED, "".join(self.scr.buf))
 
     def test_list_header_flex_column_takes_remaining_width(self):
@@ -230,7 +250,7 @@ class AppItemsTests(AppBase):
     def test_tabs_are_in_documented_order(self):
         self.assertEqual(
             [t.key for t in self.app.tabs],
-            ["containers", "images", "volumes", "networks", "projects", "services", "errors"],
+            ["containers", "images", "volumes", "networks", "projects", "services", "issues"],
         )
 
     def test_items_come_from_fetcher_cache(self):
@@ -250,12 +270,27 @@ class AppItemsTests(AppBase):
         self.goto("services")
         self.assertEqual(self.app.items()[0]["Name"], "No services configured")
 
-    def test_errors_tab_reads_registry_live(self):
-        self.goto("errors")
-        self.assertEqual(self.app.items()[0]["Category"], "No errors")
+    def test_issues_tab_shows_fetcher_conditions_then_registry_events_live(self):
+        self.goto("issues")
+        self.assertEqual(self.app.items()[0]["Category"], "No issues")
         self.assertEqual(self.app.selected_id(), "")  # placeholder carries an empty _category
+        self.app.fetcher.data["issues"] = [Issue(WARNING, "image.versions", "hermes has 4 local versions")]
+        self.assertEqual(self.app.items()[0]["Level"], WARNING)
+        self.assertEqual(self.app.selected_id(), "")  # a condition cannot be cleared
         log_error("docker.command", "docker ps")
+        self.assertEqual([r["Category"] for r in self.app.items()], ["image.versions", "docker.command"])
+        self.app.selected_index = 1
         self.assertEqual(self.app.selected_id(), "docker.command")
+
+    def test_alert_level_follows_conditions_and_events(self):
+        self.assertIsNone(self.app.alert_level())
+        self.app.fetcher.data["issues"] = [Issue(WARNING, "a", "b")]
+        self.assertEqual(self.app.alert_level(), WARNING)
+        self.app.fetcher.data["issues"] = [Issue(ERROR, "a", "b")]
+        self.assertEqual(self.app.alert_level(), ERROR)
+        self.app.fetcher.data["issues"] = []
+        log_error("x", "boom")
+        self.assertEqual(self.app.alert_level(), ERROR)
 
     def test_selected_id_uses_each_tabs_id_key(self):
         self.containers(1)
@@ -275,7 +310,7 @@ class AppRenderTests(AppBase):
     def test_render_shows_tabs_header_rows_and_status_bar(self):
         self.containers(2)
         text = self.rendered()
-        for name in ("Containers", "Images", "Errors"):
+        for name in ("Containers", "Images", "Issues"):
             self.assertIn(name, text)
         self.assertIn("NAME", text)
         self.assertIn("c0", text)
@@ -313,7 +348,7 @@ class AppRenderTests(AppBase):
             "projects": "[e]nter [d]estroy",
             "services": "[u]p [d]own [r]ecreate",
             "networks": "[e]dit [d]elete",
-            "errors": "[c]lear",
+            "issues": "[c]lear",
             "images": "[d]elete [q]uit",
         }
         for key, hint in expectations.items():
@@ -380,7 +415,7 @@ class AppNavigationTests(AppBase):
 
     def test_number_keys_select_tabs(self):
         self.feed("7")
-        self.assertEqual(self.app.current().key, "errors")
+        self.assertEqual(self.app.current().key, "issues")
         self.feed("1")
         self.assertEqual(self.app.current().key, "containers")
 
@@ -529,19 +564,37 @@ class AppOtherTabActionTests(AppBase):
         confirm.assert_not_called()
         self.assertEqual(self.app.message_style, Term.YELLOW)
 
-    def test_project_destroy_confirmed(self):
+    def _destroy(self, report, answer):
         self.goto("projects")
         self.app.fetcher.data["projects"] = [{"Name": "demo", "Status": "running", "Image": "i", "Repo": "-"}]
         project = ProjectConfig(name="demo", image="i")
         with (
             mock.patch.object(containerctl, "load_projects", return_value={"demo": project}),
             mock.patch.object(Docker, "find_project_container", return_value={"State": "running"}),
-            mock.patch.object(UI, "confirm", return_value=True),
+            mock.patch.object(containerctl, "project_report", return_value=report) as check,
+            mock.patch.object(UI, "confirm", return_value=answer) as confirm,
             mock.patch.object(Docker, "destroy_project", return_value=True) as destroy,
         ):
             self.feed("d")
+        check.assert_called_once_with(project)
+        return project, confirm, destroy
+
+    def test_project_destroy_confirmed(self):
+        project, confirm, destroy = self._destroy(WorkspaceReport(statuses=[RepoStatus(name="app")]), True)
+        confirm.assert_called_once_with("Destroy project 'demo'?", self.ROWS - 1)
         destroy.assert_called_once_with(project)
         self.assertEqual(self.app.message_text, "Destroyed demo")
+
+    def test_project_destroy_prompt_names_dirty_dirs_and_still_destroys_on_yes(self):
+        report = WorkspaceReport(statuses=[RepoStatus(name="app", ahead=2)], extra=[], missing=["lib"])
+        project, confirm, destroy = self._destroy(report, True)
+        confirm.assert_called_once_with("Destroy project 'demo'? Workspace is DIRTY: app, lib.", self.ROWS - 1)
+        destroy.assert_called_once_with(project)
+
+    def test_project_destroy_declined_on_dirty_prompt_does_nothing(self):
+        _, _, destroy = self._destroy(WorkspaceReport(statuses=[RepoStatus(name="app", untracked=True)]), False)
+        destroy.assert_not_called()
+        self.assertEqual(self.app.message_text, "")
 
     def test_service_down_confirmed(self):
         self.goto("services")
@@ -574,7 +627,7 @@ class AppOtherTabActionTests(AppBase):
         log_error("a.cat", "1")
         log_error("a.cat", "2")
         log_error("b.cat", "3")
-        self.goto("errors")
+        self.goto("issues")
         with mock.patch.object(UI, "confirm", return_value=True) as confirm:
             self.feed("c")
         confirm.assert_called_once_with("Clear all 'a.cat' errors?", self.ROWS - 1)
@@ -582,7 +635,7 @@ class AppOtherTabActionTests(AppBase):
         self.assertEqual(self.app.message_text, "Cleared 2 errors from a.cat")
 
     def test_errors_clear_ignores_placeholder(self):
-        self.goto("errors")
+        self.goto("issues")
         with mock.patch.object(UI, "confirm") as confirm:
             self.feed("c")
         confirm.assert_not_called()
@@ -628,16 +681,41 @@ class DataFetcherTests(unittest.TestCase):
             {"ID": "ghi", "Names": "other", "Image": "x", "Status": "Up", "State": "running"},
         ]
 
-    def _fetch(self, projects=None, services=None):
+    def _fetch(self, projects=None, services=None, load_projects=None):
         with (
             mock.patch.object(Docker, "containers", return_value=[dict(c) for c in self.containers]),
             mock.patch.object(Docker, "images", return_value=[]),
             mock.patch.object(Docker, "volumes", return_value=[]),
             mock.patch.object(Docker, "networks", return_value=[]),
-            mock.patch.object(containerctl, "load_projects", return_value=projects or {}),
+            mock.patch.object(containerctl, "load_projects", load_projects or mock.Mock(return_value=projects or {})),
             mock.patch.object(containerctl, "load_services", return_value=services or {}),
+            mock.patch.object(containerctl, "load_images", return_value={}),
+            mock.patch.object(containerctl, "SECRETS_FILE", Path("/nonexistent/secrets.toml")),  # never the real one
         ):
             self.fetcher._fetch_all()
+
+    def test_config_problems_are_conditions_not_events(self):
+        reset_errors()
+
+        def broken_loader():
+            log_error("project.config", "Failed to load p.toml: bad toml")
+            return {}
+
+        self._fetch(load_projects=broken_loader)
+        self.assertEqual(
+            self.fetcher.get("issues"), [Issue(ERROR, "project.config", "Failed to load p.toml: bad toml")]
+        )
+        self.assertEqual(containerctl.get_errors(), [])  # not one event per tick
+
+    def test_conditions_are_recomputed_each_fetch(self):
+        projects = {
+            "lib": ProjectConfig(name="lib", image="i"),
+            "a": ProjectConfig(name="a", image="i", shortcuts={"lib": "lib"}),
+        }
+        self._fetch(projects=projects)
+        self.assertEqual([(i.level, i.cat) for i in self.fetcher.get("issues")], [(WARNING, "project.shortcut")])
+        self._fetch()  # fixed: the condition is simply gone, nothing to clear
+        self.assertEqual(self.fetcher.get("issues"), [])
 
     def test_containers_get_project_column_from_name_prefix(self):
         self._fetch()

@@ -149,6 +149,25 @@ class CheckWorkspaceTests(unittest.TestCase):
         self.assertFalse(report.clean)
 
 
+class DirtyNamesTests(unittest.TestCase):
+    """`report.dirty` is what `destroy` shows: unclean and extra dirs first, then configured-but-absent ones."""
+
+    def test_clean_report_has_no_names(self):
+        report = check_workspace(["a"], lambda: ["a"], FakeGit({"a": {}}))
+        self.assertTrue(report.clean)
+        self.assertEqual(report.dirty, [])
+
+    def test_names_unclean_extra_then_missing(self):
+        git = FakeGit({"a": {}, "b": {"porcelain": " M x\n"}, "c": {}, "x": {"is_git": False}})
+        report = check_workspace(["a", "b", "c", "gone"], lambda: ["x", "c", "b", "a"], git)
+        self.assertFalse(report.clean)
+        self.assertEqual(report.dirty, ["b", "x", "gone"])
+
+    def test_clean_but_unconfigured_dir_counts(self):
+        report = check_workspace([], lambda: ["stray"], FakeGit({"stray": {}}))
+        self.assertEqual(report.dirty, ["stray"])
+
+
 class PrintReportTests(unittest.TestCase):
     def _render(self, report):
         buf = io.StringIO()

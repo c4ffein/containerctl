@@ -28,13 +28,15 @@ class RunRecorder:
     def __init__(self, returncode=0, stdout="", stderr=""):
         self.calls = []
         self.stdins = []  # one entry per call: the stdin= of a no-context `build -` lands here
+        self.inputs = []  # one entry per call: the input= string of an `exec -i` lands here
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
 
-    def __call__(self, args, capture=True, stdin=None):
+    def __call__(self, args, capture=True, stdin=None, input=None):
         self.calls.append(list(args))
         self.stdins.append(stdin)
+        self.inputs.append(input)
         return subprocess.CompletedProcess(
             args=["docker", *args],
             returncode=self.returncode,

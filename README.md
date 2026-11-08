@@ -36,13 +36,14 @@ containerctl - KISS containers CLI/TUI manager
 - containerctl enter <proj> user=root   ==> enter project as another user
 - containerctl enter <shortcut>         ==> enter project, landing in a [shortcuts] dir
 - containerctl spawn <project>          ==> force-create project container
-- containerctl destroy <project>        ==> stop and remove project container
+- containerctl destroy <project>        ==> stop and remove project container (warns when DIRTY)
 - containerctl projects                 ==> list configured projects
 - containerctl projects -w              ==> wide: full shortcut lists, never clip
 ──────────────────────────────────────────────
 - containerctl check <project>          ==> is the workspace safe to destroy? (uncommitted/unpushed/extra)
 - containerctl check --all              ==> check every configured project
 - containerctl check-local              ==> run the same check from inside a container
+- containerctl issues                   ==> what needs attention: warnings (config, secrets, images) + errors
 ──────────────────────────────────────────────
 - containerctl service up <name>               ==> create/start a service
 - containerctl service down <name>             ==> stop and remove a service

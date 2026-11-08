@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 import containerctl
-from containerctl import ProjectConfig, config_usage, format_table, usage
+from containerctl import ProjectConfig, RepoStatus, WorkspaceReport, config_usage, format_table, usage
 from tests.helper import RunRecorder, reset_errors
 
 
@@ -199,6 +199,110 @@ class CliEnterOptionTests(unittest.TestCase):
                 with self.assertRaises(SystemExit) as ctx:
                     containerctl.cli_enter(argparse.Namespace(project="proj", options=options))
             self.assertEqual(ctx.exception.code, 1)
+
+
+class CliDestroyTests(unittest.TestCase):
+    """`destroy` runs `check` first and prints a DIRTY verdict as a warning; it never refuses."""
+
+    def setUp(self):
+        reset_errors()
+        self.project = ProjectConfig(name="demo", image="i")
+        self._load = mock.patch.object(containerctl, "load_projects", return_value={"demo": self.project})
+        self._load.start()
+
+    def tearDown(self):
+        self._load.stop()
+
+    def _destroy(self, container, report):
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(containerctl.Docker, "find_project_container", return_value=container),
+            mock.patch.object(containerctl, "project_report", return_value=report) as check,
+            mock.patch.object(containerctl.Docker, "destroy_project", return_value=True) as destroy,
+            redirect_stdout(out),
+            redirect_stderr(err),
+        ):
+            containerctl.cli_destroy(argparse.Namespace(project="demo"))
+        destroy.assert_called_once_with(self.project)
+        return check, out.getvalue(), err.getvalue()
+
+    def test_dirty_workspace_is_reported_then_destroyed_anyway(self):
+        report = WorkspaceReport(statuses=[RepoStatus(name="app", uncommitted=True)], missing=["lib"])
+        check, out, err = self._destroy({"State": "running"}, report)
+        check.assert_called_once_with(self.project)
+        self.assertIn("✗ app — uncommitted changes", out)
+        self.assertIn("Destroyed demo", out)
+        self.assertEqual(err, "warning: demo is DIRTY, destroying anyway (app, lib)\n")
+
+    def test_clean_workspace_destroys_quietly(self):
+        _, out, err = self._destroy({"State": "running"}, WorkspaceReport(statuses=[RepoStatus(name="app")]))
+        self.assertEqual(out, "Destroyed demo\n")
+        self.assertEqual(err, "")
+
+    def test_no_container_skips_the_check(self):
+        check, _, err = self._destroy(None, WorkspaceReport())
+        check.assert_not_called()
+        self.assertEqual(err, "")
+
+
+class CliIssuesTests(unittest.TestCase):
+    """`issues` is the Issues tab for one run: collected config loads + state checks, then this run's events."""
+
+    def setUp(self):
+        reset_errors()
+
+    def _run(self, load_projects=lambda: {}, docker_images=lambda: []):
+        out = io.StringIO()
+        with (
+            mock.patch.object(containerctl, "load_projects", side_effect=load_projects),
+            mock.patch.object(containerctl, "load_services", return_value={}),
+            mock.patch.object(containerctl, "load_images", return_value={}),
+            mock.patch.object(containerctl, "SECRETS_FILE", Path("/nonexistent/secrets.toml")),
+            mock.patch.object(containerctl.Docker, "images", side_effect=docker_images),
+            redirect_stdout(out),
+        ):
+            code = 0
+            try:
+                containerctl.cli_issues(argparse.Namespace())
+            except SystemExit as e:
+                code = e.code
+        return code, out.getvalue()
+
+    def test_nothing_to_report(self):
+        self.assertEqual(self._run(), (0, "No issues\n"))
+
+    def test_warning_condition_is_listed_with_its_hint_and_exits_zero(self):
+        projects = {
+            "lib": ProjectConfig(name="lib", image="i"),
+            "a": ProjectConfig(name="a", image="i", shortcuts={"lib": "lib"}),
+        }
+        code, out = self._run(load_projects=lambda: projects)
+        self.assertEqual(code, 0)
+        self.assertIn("LEVEL", out)
+        self.assertIn("warning", out)
+        self.assertIn("project.shortcut", out)
+        self.assertIn("rename it in a.toml", out)
+
+    def test_broken_config_is_an_error_condition_and_exits_one(self):
+        def loader():
+            containerctl.log_error("project.config", "Failed to load p.toml")
+            return {}
+
+        code, out = self._run(load_projects=loader)
+        self.assertEqual(code, 1)
+        self.assertIn("error", out)
+        self.assertIn("Failed to load p.toml", out)
+        self.assertEqual(containerctl.get_errors(), [])  # collected, not logged
+
+    def test_events_of_this_run_are_listed_after_conditions(self):
+        def docker_down():
+            containerctl.log_error("docker.command", "docker images: cannot connect")
+            return []
+
+        code, out = self._run(docker_images=docker_down)
+        self.assertEqual(code, 1)
+        self.assertIn("docker.command", out)
+        self.assertIn("cannot connect", out)
 
 
 class ListingsQueryDockerOnceTests(unittest.TestCase):
@@ -411,6 +515,7 @@ class CliImageTests(unittest.TestCase):
             (["image", "ls"], "cli_image_ls", None),
             (["image", "build", "x"], "cli_image_build", "x"),
             (["image", "check"], "cli_image_check", None),
+            (["issues"], "cli_issues", None),
         )
         for argv, func, attr in cases:
             with (

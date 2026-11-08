@@ -561,3 +561,55 @@ class ServiceCommandTests(unittest.TestCase):
             reset_errors()
             self.assertIsNone(ServiceConfig.from_toml(write_toml(self.dir, "h", f'image = "x"\n{bad}\n')), bad)
             self.assertIn("command", get_errors()[0]["msg"])
+
+
+class ConditionTests(unittest.TestCase):
+    """Conditions: evaluated from loaded config and `docker images` rows, never logged, gone once fixed."""
+
+    def setUp(self):
+        reset_errors()
+
+    def test_shortcut_defined_twice_and_shadowed_by_a_project(self):
+        projects = {
+            "lib": ProjectConfig(name="lib", image="i"),
+            "a": ProjectConfig(name="a", image="i", shortcuts={"lib": "lib", "docs": "d"}),
+            "b": ProjectConfig(name="b", image="i", shortcuts={"docs": "d", "only": "o"}),
+        }
+        issues = containerctl.shortcut_issues(projects)
+        self.assertEqual([(i.level, i.cat) for i in issues], [(containerctl.WARNING, "project.shortcut")] * 2)
+        self.assertEqual(issues[0].msg, "Shortcut 'docs' is defined by several projects: a, b")
+        self.assertEqual(issues[1].msg, "Shortcut 'lib' (a) is shadowed by project 'lib'")
+        self.assertEqual(issues[1].hint, "rename it in a.toml")
+        self.assertEqual(get_errors(), [])  # a condition, not an event
+        self.assertEqual(containerctl.shortcut_issues({"a": ProjectConfig(name="a", image="i")}), [])
+
+    def test_secrets_file_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sec = Path(tmp) / "secrets.toml"
+            with mock.patch.object(containerctl, "SECRETS_FILE", sec):
+                self.assertIsNone(containerctl.secrets_mode_issue())  # absent: nothing to protect
+                sec.write_text('tok = "s"\n')
+                sec.chmod(0o600)
+                self.assertIsNone(containerctl.secrets_mode_issue())
+                sec.chmod(0o644)
+                issue = containerctl.secrets_mode_issue()
+        self.assertEqual((issue.level, issue.cat), (containerctl.WARNING, "env.secret"))
+        self.assertEqual(issue.msg, f"{sec} is mode 0644, readable by others")
+        self.assertEqual(issue.hint, f"chmod 600 {sec}")
+        self.assertEqual(get_errors(), [])
+
+    def test_image_versions_from_docker_images_rows(self):
+        image = containerctl.ImageConfig(name="hermes", dockerfile=Path("h.Dockerfile"), context=Path("h"))
+        rows = [{"Repository": "hermes", "Tag": f"cctl-local-{n:06d}", "ID": f"id{n}"} for n in range(4)]
+        rows.append({"Repository": "hermes", "Tag": "latest", "ID": "id3"})  # the recipe tag points at version 3
+        rows.append({"Repository": "other", "Tag": "cctl-local-000009", "ID": "x"})  # another repository
+        self.assertEqual(containerctl.local_versions(image, rows), ([0, 1, 2, 3], 3))
+        issues = containerctl.image_version_issues({"hermes": image}, rows)
+        self.assertEqual(
+            [(i.level, i.cat, i.msg) for i in issues],
+            [(containerctl.WARNING, "image.versions", "hermes has 4 local versions")],
+        )
+        self.assertEqual(
+            issues[0].hint, "docker rmi hermes:cctl-local-000000 hermes:cctl-local-000001 hermes:cctl-local-000002"
+        )
+        self.assertEqual(containerctl.image_version_issues({"hermes": image}, rows[:3]), [])  # three is fine
