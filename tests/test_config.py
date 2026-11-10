@@ -603,7 +603,7 @@ class ConditionTests(unittest.TestCase):
         rows = [{"Repository": "hermes", "Tag": f"cctl-local-{n:06d}", "ID": f"id{n}"} for n in range(4)]
         rows.append({"Repository": "hermes", "Tag": "latest", "ID": "id3"})  # the recipe tag points at version 3
         rows.append({"Repository": "other", "Tag": "cctl-local-000009", "ID": "x"})  # another repository
-        self.assertEqual(containerctl.local_versions(image, rows), ([0, 1, 2, 3], 3))
+        self.assertEqual(containerctl.local_versions(image, rows), ([0, 1, 2, 3], 3, True))
         issues = containerctl.image_version_issues({"hermes": image}, rows)
         self.assertEqual(
             [(i.level, i.cat, i.msg) for i in issues],

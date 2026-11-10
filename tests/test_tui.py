@@ -681,9 +681,11 @@ class DataFetcherTests(unittest.TestCase):
             {"ID": "ghi", "Names": "other", "Image": "x", "Status": "Up", "State": "running"},
         ]
 
-    def _fetch(self, projects=None, services=None, load_projects=None):
+    def _fetch(self, projects=None, services=None, load_projects=None, containers=None):
         with (
-            mock.patch.object(Docker, "containers", return_value=[dict(c) for c in self.containers]),
+            mock.patch.object(
+                Docker, "containers", containers or mock.Mock(return_value=[dict(c) for c in self.containers])
+            ),
             mock.patch.object(Docker, "images", return_value=[]),
             mock.patch.object(Docker, "volumes", return_value=[]),
             mock.patch.object(Docker, "networks", return_value=[]),
@@ -706,6 +708,19 @@ class DataFetcherTests(unittest.TestCase):
             self.fetcher.get("issues"), [Issue(ERROR, "project.config", "Failed to load p.toml: bad toml")]
         )
         self.assertEqual(containerctl.get_errors(), [])  # not one event per tick
+
+    def test_docker_failures_during_a_fetch_are_conditions_not_events(self):
+        reset_errors()
+
+        def docker_down():
+            log_error("docker.command", "docker ps: cannot connect to the daemon")
+            return []
+
+        self._fetch(containers=docker_down)
+        self.assertEqual(
+            self.fetcher.get("issues"), [Issue(ERROR, "docker.command", "docker ps: cannot connect to the daemon")]
+        )
+        self.assertEqual(containerctl.get_errors(), [])  # a daemon that is down is a state, not 1800 events an hour
 
     def test_conditions_are_recomputed_each_fetch(self):
         projects = {

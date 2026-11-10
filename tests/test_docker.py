@@ -6,6 +6,7 @@ recorders so we assert on the argv that *would* be executed.
 
 import base64
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -583,6 +584,19 @@ class InstallSelfTests(unittest.TestCase):
         self.assertTrue(all("chown" not in c for c in self.rec.calls))
 
 
+class MissingDockerTests(unittest.TestCase):
+    """No docker on PATH reads as a failed call, reported like any other, never a traceback"""
+
+    def test_missing_binary_is_a_failed_call(self):
+        reset_errors()
+        missing = FileNotFoundError(2, "No such file or directory", "docker")
+        with mock.patch.object(containerctl.subprocess, "run", side_effect=missing):
+            self.assertEqual(Docker.containers(), [])
+            self.assertFalse(Docker.start("abc"))
+        self.assertEqual({e["cat"] for e in get_errors()}, {"docker.command"})
+        self.assertIn("command not found", json.dumps(get_errors()))
+
+
 class ImageBuildTests(unittest.TestCase):
     """`docker build` argv, the no-context stdin path, and the auto-build before `docker run`."""
 
@@ -625,17 +639,24 @@ class ImageBuildTests(unittest.TestCase):
         self.assertEqual(argv[-3:], ["-f", str(self.dir / "hermes.Dockerfile"), str(self.dir / "hermes")])
         self.assertIsNone(self.rec.stdins[-1])
 
+    def rows(self, *pairs):
+        """`docker images --format {{json .}}` lines for the hermes repository"""
+        return "\n".join(json.dumps({"Repository": "hermes", "Tag": t, "ID": i, "Size": "1MB"}) for t, i in pairs)
+
     def test_build_numbers_after_the_highest_existing_version(self):
-        self.rec.stdout = "cctl-local-000007 aaa\nlatest aaa\ncctl-local-000002 bbb\n<none> ccc\n"
+        self.rec.stdout = self.rows(("cctl-local-000007", "aaa"), ("latest", "aaa"), ("cctl-local-000002", "bbb"))
         with redirect_stdout(io.StringIO()):
             self.assertTrue(Docker.build_image(self.image))
-        self.assertEqual(self.rec.calls[0], ["images", "--format", "{{.Tag}} {{.ID}}", "hermes"])
+        self.assertEqual(self.rec.calls[0], ["images", "--format", "{{json .}}"])
         self.assertEqual(self.rec.last[1:5], ["-t", "hermes:cctl-local-000008", "-t", "hermes:latest"])
 
     def test_image_versions(self):
-        self.rec.stdout = "cctl-local-000007 aaa\nlatest aaa\ncctl-local-000002 bbb\ncctl-local-x ddd\n<none> ccc\n"
+        rows = self.rows
+        self.rec.stdout = rows(("cctl-local-000007", "aaa"), ("latest", "aaa"), ("cctl-local-000002", "bbb"))
+        self.rec.stdout += "\n" + rows(("cctl-local-x", "ddd"), ("<none>", "ccc"))
         self.assertEqual(Docker.image_versions(self.image), ([2, 7], 7, True))
-        self.rec.stdout = "cctl-local-000002 bbb\nlatest zzz\n"  # tag points at something that is not a local build
+        self.assertEqual(self.rec.last, ["images", "--format", "{{json .}}"])  # the listing everyone else uses
+        self.rec.stdout = rows(("cctl-local-000002", "bbb"), ("latest", "zzz"))  # tag points at a non-local build
         self.assertEqual(Docker.image_versions(self.image), ([2], None, True))
         self.rec.stdout = ""
         self.assertEqual(Docker.image_versions(self.image), ([], None, False))

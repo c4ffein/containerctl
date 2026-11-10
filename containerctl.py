@@ -70,23 +70,22 @@ def collecting() -> Iterator[list[Issue]]:
 
 
 _errors: list[dict] = []  # every occurrence, oldest first: {"ts", "cat", "msg", "ctx"}
-# The TUI's fetcher thread logs (config loads, docker failures) while the main thread reads, clears and renders.
-# The GIL makes a lone append safe; append + trim, or the rebind in clear_errors, are not, so every writer and
-# every reader that walks the list takes this lock. Callers never do: log_error and friends handle it.
+# Events are what user actions log; the fetcher thread collects its own failures as conditions, but the TUI
+# reads, groups and clears this list from the main thread while actions append to it. The GIL makes a lone
+# append safe; the rebind in clear_errors racing a reader is not, and free-threaded builds have no GIL, so
+# every writer and every reader that walks the list takes this lock. Callers never do: log_error handles it.
 _errors_lock = threading.Lock()
-ERROR_MAX_ENTRIES = 10_000  # a broken config logs once per TUI tick; keep memory bounded, newest kept
 
 
 def log_error(category: str, message: str, context: dict | None = None) -> None:
-    """Record a non-fatal error: an event in the registry (every occurrence; the TUI dedups on display), or an
-    error-level condition when called inside collecting()"""
+    """Record a non-fatal error: an event in the registry (every occurrence; the TUI shows one row per category),
+    or an error-level condition when called inside collecting()"""
     issues = getattr(_collecting, "issues", None)
     if issues is not None:
         issues.append(Issue(ERROR, category, message))
         return
     with _errors_lock:
         _errors.append({"ts": time.time(), "cat": category, "msg": message, "ctx": context or {}})
-        del _errors[:-ERROR_MAX_ENTRIES]
 
 
 def get_errors() -> list[dict]:
@@ -123,16 +122,13 @@ def by_severity(conditions: list[Issue]) -> list[Issue]:
 
 def fetch_issues(conditions: list[Issue]) -> list[dict]:
     """Rows for the Issues tab: conditions first (no count, nothing to clear), then one row per event category
-    with its latest message and repeat count. `_category` is set on event rows only: it is what [c]lear acts on."""
+    with its latest message and count. `_category` is set on event rows only: it is what [c]lear acts on."""
     rows = []
     for issue in by_severity(conditions):
         message = f"{issue.msg}  [{issue.hint}]" if issue.hint else issue.msg
         rows.append({"Level": issue.level, "Category": issue.cat, "Count": "", "Message": message, "_category": ""})
     for cat, errs in sorted(get_errors_by_category().items()):
-        latest = errs[-1]
-        repeats = sum(1 for e in errs if e["msg"] == latest["msg"])
-        suffix = f" (x{repeats})" if repeats > 1 else ""
-        message = latest["msg"] + suffix
+        message = errs[-1]["msg"]
         rows.append({"Level": ERROR, "Category": cat, "Count": str(len(errs)), "Message": message, "_category": cat})
     if not rows:
         return [{"Level": "", "Category": "No issues", "Count": "", "Message": "", "_category": ""}]
@@ -1213,8 +1209,9 @@ def secrets_mode_issue() -> Issue | None:
     return None
 
 
-def local_versions(image: ImageConfig, rows: list[dict]) -> tuple[list[int], int | None]:
-    """From `docker images` rows: the repository's cctl-local-N versions, sorted, and the one the tag points at"""
+def local_versions(image: ImageConfig, rows: list[dict]) -> tuple[list[int], int | None, bool]:
+    """(versions, current, tagged) from `docker images` rows: the repository's cctl-local-N builds, sorted; the one
+    the recipe tag points at (None when it points elsewhere or nowhere); whether the recipe tag exists at all"""
     ids = {r.get("Tag", ""): r.get("ID", "") for r in rows if r.get("Repository") == image.repository}
     versions: dict[int, str] = {}
     for tag, id_ in ids.items():
@@ -1223,19 +1220,24 @@ def local_versions(image: ImageConfig, rows: list[dict]) -> tuple[list[int], int
             versions[int(n)] = id_
     current_id = ids.get(image.tag.rsplit(":", 1)[1])
     current = max((n for n, id_ in versions.items() if id_ == current_id), default=None)
-    return sorted(versions), current
+    return sorted(versions), current, current_id is not None
+
+
+def version_issue(name: str, image: ImageConfig, versions: list[int], current: int | None) -> Issue | None:
+    """Builds pile up: past IMAGE_VERSIONS_WARN local versions, name the ones that are safe to try removing"""
+    if len(versions) <= IMAGE_VERSIONS_WARN:
+        return None
+    old = " ".join(image.version_tag(n) for n in versions if n != current)
+    return Issue(WARNING, "image.versions", f"{name} has {len(versions)} local versions", f"docker rmi {old}")
 
 
 def image_version_issues(images: dict[str, ImageConfig], rows: list[dict]) -> list[Issue]:
-    """Builds pile up: past IMAGE_VERSIONS_WARN local versions, name the ones that are safe to try removing"""
+    """version_issue over every recipe, from one set of `docker images` rows"""
     issues = []
     for name, image in images.items():
-        versions, current = local_versions(image, rows)
-        if len(versions) > IMAGE_VERSIONS_WARN:
-            old = " ".join(image.version_tag(n) for n in versions if n != current)
-            issues.append(
-                Issue(WARNING, "image.versions", f"{name} has {len(versions)} local versions", f"docker rmi {old}")
-            )
+        versions, current, _ = local_versions(image, rows)
+        if issue := version_issue(name, image, versions, current):
+            issues.append(issue)
     return issues
 
 
@@ -1684,23 +1686,21 @@ class Docker:
     ) -> subprocess.CompletedProcess:
         """Run docker command; `input` feeds stdin from a string, `stdin` from a file (never both)"""
         cmd = ["docker"] + args
-        if input is not None:
-            return subprocess.run(cmd, capture_output=capture, text=True, input=input)
-        return subprocess.run(cmd, capture_output=capture, text=True, stdin=stdin)
+        try:
+            if input is not None:
+                return subprocess.run(cmd, capture_output=capture, text=True, input=input)
+            return subprocess.run(cmd, capture_output=capture, text=True, stdin=stdin)
+        except FileNotFoundError:  # no docker on PATH: reads as a failed call, which every caller already reports
+            return subprocess.CompletedProcess(cmd, 127, "", "docker: command not found on PATH")
 
     @staticmethod
     def _run_json(args: list[str]) -> list[dict]:
         """Run docker command and parse JSON output"""
         result = Docker._run(args)
         if result.returncode != 0:
-            log_error(
-                "docker.command",
-                f"docker {' '.join(args)}",
-                {
-                    "returncode": result.returncode,
-                    "stderr": result.stderr.strip() if result.stderr else "",
-                },
-            )
+            stderr = result.stderr.strip() if result.stderr else ""
+            message = f"docker {' '.join(args)}" + (f": {stderr}" if stderr else "")
+            log_error("docker.command", message, {"returncode": result.returncode})
             return []
 
         items = []
@@ -1809,25 +1809,8 @@ class Docker:
 
     @staticmethod
     def image_versions(image: "ImageConfig") -> tuple[list[int], int | None, bool]:
-        """(versions, current, tagged): the cctl-local-N builds of the recipe's repository, sorted; the one the
-        recipe tag points at (None when it points elsewhere or nowhere); whether the recipe tag exists at all."""
-        result = Docker._run(["images", "--format", "{{.Tag}} {{.ID}}", image.repository])
-        if result.returncode != 0:
-            log_error("docker.command", f"docker images {image.repository}: {result.stderr.strip()}")
-            return [], None, False
-        ids: dict[str, str] = {}
-        for line in result.stdout.split("\n"):
-            parts = line.split()
-            if len(parts) == 2:
-                ids[parts[0]] = parts[1]
-        versions: dict[int, str] = {}
-        for tag, id_ in ids.items():
-            n = tag.removeprefix(LOCAL_VERSION_PREFIX)
-            if n != tag and n.isdigit():
-                versions[int(n)] = id_
-        current_id = ids.get(image.tag.rsplit(":", 1)[1])
-        current = max((n for n, id_ in versions.items() if id_ == current_id), default=None)
-        return sorted(versions), current, current_id is not None
+        """local_versions over a fresh `docker images`; a failed call is logged there and reads as nothing built"""
+        return local_versions(image, Docker.images())
 
     @staticmethod
     def build_image(image: "ImageConfig") -> bool:
@@ -2298,13 +2281,15 @@ class Docker:
             elif len(project.repos) > 1:
                 workdir = "/home/dev/workspace"
         # [env] values and [secrets] looked up in secrets.toml ride into this shell's process environment
-        # only. Problems are in the registry; echo them so they're seen right before the prompt instead
-        # of only in the TUI's Errors tab.
-        seen = len(get_errors())
-        env = resolve_env(project)
-        for err in get_errors()[seen:]:
-            if err["cat"].startswith("env."):
-                print(f"env: {err['msg']}", file=sys.stderr)
+        # only. Their problems are echoed right before the prompt, where they matter; anything else that was
+        # logged meanwhile goes back to the run's report.
+        with collecting() as problems:
+            env = resolve_env(project)
+        for problem in problems:
+            if problem.cat.startswith("env."):
+                print(f"env: {problem.msg}", file=sys.stderr)
+            else:
+                log_error(problem.cat, problem.msg)
         # cd into the landing dir if it exists, else fall back home - done atomically inside the
         # container (no TOCTOU, unlike a separate `test -d` probe then `-w`). workdir rides in as
         # $1 (data, never interpolated as code); `--` stops cd option-parsing a leading dash.
@@ -2493,11 +2478,17 @@ class DataFetcher:
             return self.data.get(key, []).copy()
 
     def _fetch_all(self) -> None:
-        """Fetch all data from Docker"""
-        containers = Docker.containers()
-        images = Docker.images()
-        volumes = Docker.volumes()
-        networks = Docker.networks()
+        """Fetch all data from Docker. Everything logged meanwhile (a docker call failing, a config file that doesn't
+        parse) is a condition of this fetch, not an event: shown while true, gone on the next fetch that is fine."""
+        with collecting() as conditions:
+            containers = Docker.containers()
+            images = Docker.images()
+            volumes = Docker.volumes()
+            networks = Docker.networks()
+            projects_config = load_projects()
+            services_config = load_services()
+            images_config = load_images()
+        conditions += check_conditions(projects_config, images_config, images)
 
         # Enrich containers with project labels
         for c in containers:
@@ -2506,13 +2497,6 @@ class DataFetcher:
                 c["Project"] = name[len(CONTAINER_PREFIX) :]
             else:
                 c["Project"] = ""
-
-        # Config loads report through log_error: collected, they are conditions, not one event per fetch
-        with collecting() as conditions:
-            projects_config = load_projects()
-            services_config = load_services()
-            images_config = load_images()
-        conditions += check_conditions(projects_config, images_config, images)
 
         # Build projects list
         projects_data = []
@@ -3582,23 +3566,23 @@ def cli_check(args: argparse.Namespace) -> None:
 
 
 def current_issues() -> list[Issue]:
-    """The conditions as the TUI computes them, for one CLI run"""
+    """The conditions as the TUI computes them, for one CLI run: its loads and docker calls collected too"""
     with collecting() as conditions:
         projects, images = load_projects(), load_images()
         load_services()
-    return conditions + check_conditions(projects, images, Docker.images())
+        rows = Docker.images()
+    return conditions + check_conditions(projects, images, rows)
 
 
-def print_issues(conditions: list[Issue]) -> bool:
-    """Conditions, then the events recorded so far in this run, as one table. True when nothing is error-level."""
-    rows = [[i.level, i.cat, i.msg, i.hint] for i in by_severity(conditions)]
-    for cat, errs in sorted(get_errors_by_category().items()):
-        rows.append([ERROR, cat, errs[-1]["msg"], f"x{len(errs)}" if len(errs) > 1 else ""])
-    if not rows:
-        print("No issues")
+def print_issues(issues: list[Issue], file=None) -> bool:
+    """One table, errors first. True when nothing is error-level."""
+    file = file or sys.stdout
+    if not issues:
+        print("No issues", file=file)
         return True
-    print("\n".join(format_table(["LEVEL", "CATEGORY", "MESSAGE", "HINT"], rows, None, [])))
-    return all(row[0] != ERROR for row in rows)
+    rows = [[i.level, i.cat, i.msg, i.hint] for i in by_severity(issues)]
+    print("\n".join(format_table(["LEVEL", "CATEGORY", "MESSAGE", "HINT"], rows, None, [])), file=file)
+    return all(i.level != ERROR for i in issues)
 
 
 def cli_issues(args: argparse.Namespace) -> None:
@@ -3792,11 +3776,10 @@ def print_images(images: dict[str, "ImageConfig"], upstream: bool) -> bool:
             if diff:
                 notes.append(diff)
         rows.append(row)
-        if len(state.versions) > IMAGE_VERSIONS_WARN:
-            old = " ".join(image.version_tag(n) for n in state.versions if n != state.current)
+        if issue := version_issue(name, image, state.versions, state.current):
             notes.append(
-                f"warning: {name} has {len(state.versions)} local versions; docker refuses to remove an image a\n"
-                f"container still uses, so this is safe to try:  docker rmi {old}\n"
+                f"warning: {issue.msg}; docker refuses to remove an image a container still uses,\n"
+                f"so this is safe to try:  {issue.hint}\n"
             )
     print("\n".join(format_table(headers, rows, None, [])))
     for note in notes:
@@ -4097,11 +4080,14 @@ def main() -> None:
     elif args.command == "image" and not hasattr(args, "func"):
         image_parser.print_help()
     else:
-        # Run CLI command
-        args.func(args)
-        # Output errors to stderr as JSON if any
-        if _errors:
-            sys.stderr.write(json.dumps({"errors": _errors}, indent=2) + "\n")
+        # One run, one report: whatever the command's loaders and docker calls complained about, as the Issues
+        # table on stderr once it is done (a sys.exit inside the command still gets the report).
+        with collecting() as issues:
+            try:
+                args.func(args)
+            finally:
+                if issues:
+                    print_issues(issues, file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -82,21 +82,12 @@ class ErrorRegistryTests(unittest.TestCase):
         self.assertEqual([e["ctx"] for e in errors if e["msg"] == "boom"], [{"first": 1}, {"second": 2}])
         self.assertLessEqual(errors[0]["ts"], errors[-1]["ts"])
 
-    def test_registry_is_capped_keeping_the_newest(self):
-        with unittest.mock.patch.object(containerctl, "ERROR_MAX_ENTRIES", 3):
-            for i in range(5):
-                log_error("cat.a", "boom", {"i": i})
-        self.assertEqual([e["ctx"]["i"] for e in get_errors()], [2, 3, 4])
-
-    def test_fetch_issues_counts_repeats_and_marks_latest(self):
-        log_error("cat.a", "boom")
-        log_error("cat.a", "boom")
-        log_error("cat.a", "boom")
-        log_error("cat.a", "other")
-        log_error("cat.a", "other")
+    def test_fetch_issues_one_row_per_event_category_with_count_and_latest(self):
+        for msg in ("boom", "boom", "boom", "other", "other"):
+            log_error("cat.a", msg)
         rows = fetch_issues([])
         self.assertEqual(rows[0]["Count"], "5")  # every occurrence in the category
-        self.assertEqual(rows[0]["Message"], "other (x2)")  # repeats of the latest message only
+        self.assertEqual(rows[0]["Message"], "other")
 
     def test_every_mutation_takes_the_registry_lock(self):
         # The TUI fetcher thread logs while the main thread clears/groups: all of them go through the lock.

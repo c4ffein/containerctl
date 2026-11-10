@@ -245,6 +245,53 @@ class CliDestroyTests(unittest.TestCase):
         self.assertEqual(err, "")
 
 
+class MainReportsIssuesTests(unittest.TestCase):
+    """A CLI run ends with whatever its loaders and docker calls complained about, as one table on stderr (in place
+    of the old JSON dump), even when the command exits non-zero."""
+
+    def setUp(self):
+        reset_errors()
+
+    def _main(self, side_effect):
+        err = io.StringIO()
+        with (
+            mock.patch.object(containerctl.sys, "argv", ["containerctl", "projects"]),
+            mock.patch.object(containerctl, "cli_projects", side_effect=side_effect),
+            redirect_stderr(err),
+        ):
+            code = 0
+            try:
+                containerctl.main()
+            except SystemExit as e:
+                code = e.code
+        return code, err.getvalue()
+
+    def test_quiet_run_prints_nothing(self):
+        self.assertEqual(self._main(lambda args: None), (0, ""))
+
+    def test_problems_are_one_table_on_stderr_not_events(self):
+        def complain(args):
+            containerctl.log_error("project.config", "Failed to load p.toml")
+
+        code, err = self._main(complain)
+        self.assertEqual(code, 0)
+        self.assertIn("LEVEL", err)
+        self.assertIn("error", err)
+        self.assertIn("project.config", err)
+        self.assertIn("Failed to load p.toml", err)
+        self.assertNotIn("{", err)  # not the JSON dump
+        self.assertEqual(containerctl.get_errors(), [])
+
+    def test_report_survives_sys_exit(self):
+        def complain_and_fail(args):
+            containerctl.log_error("docker.command", "docker ps: boom")
+            raise SystemExit(1)
+
+        code, err = self._main(complain_and_fail)
+        self.assertEqual(code, 1)
+        self.assertIn("docker ps: boom", err)
+
+
 class CliIssuesTests(unittest.TestCase):
     """`issues` is the Issues tab for one run: collected config loads + state checks, then this run's events."""
 
@@ -294,7 +341,7 @@ class CliIssuesTests(unittest.TestCase):
         self.assertIn("Failed to load p.toml", out)
         self.assertEqual(containerctl.get_errors(), [])  # collected, not logged
 
-    def test_events_of_this_run_are_listed_after_conditions(self):
+    def test_docker_failures_of_this_run_are_listed_too(self):
         def docker_down():
             containerctl.log_error("docker.command", "docker images: cannot connect")
             return []

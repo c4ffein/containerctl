@@ -43,7 +43,7 @@ containerctl - KISS containers CLI/TUI manager
 - containerctl check <project>          ==> is the workspace safe to destroy? (uncommitted/unpushed/extra)
 - containerctl check --all              ==> check every configured project
 - containerctl check-local              ==> run the same check from inside a container
-- containerctl issues                   ==> what needs attention: warnings (config, secrets, images) + errors
+- containerctl issues                   ==> what wants an action: shortcuts, secrets mode, image versions
 ──────────────────────────────────────────────
 - containerctl service up <name>               ==> create/start a service
 - containerctl service down <name>             ==> stop and remove a service
