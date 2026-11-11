@@ -49,6 +49,30 @@ class ProjectConfigTests(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
+    def test_user_and_home_default_to_dev_and_follow_each_other(self):
+        for extra, expected in (
+            ("", ("dev", "/home/dev", "/home/dev/workspace")),
+            ('user = "ubuntu"\n', ("ubuntu", "/home/ubuntu", "/home/ubuntu/workspace")),
+            ('user = "root"\n', ("root", "/root", "/root/workspace")),
+            ('user = "app"\nhome = "/srv/app/"\n', ("app", "/srv/app", "/srv/app/workspace")),
+        ):
+            cfg = ProjectConfig.from_toml(write_toml(self.dir, "p", 'image = "ubuntu"\n' + extra))
+            self.assertEqual((cfg.user, cfg.home, cfg.workspace), expected)
+
+    def test_an_unsafe_user_or_home_is_refused(self):
+        for extra in (
+            'user = "-u"\n',
+            'user = "a b"\n',
+            "user = 1000\n",
+            'home = "relative/dir"\n',
+            'home = "/"\n',
+            'home = "/home/../etc"\n',
+            'home = "/home/$(id)"\n',
+            'home = "/home/it\'s"\n',
+        ):
+            error = rejected(ProjectConfig.from_toml, write_toml(self.dir, "p", 'image = "ubuntu"\n' + extra))
+            self.assertRegex(str(error), "Invalid (user|home)", extra)
+
     def test_minimal_valid(self):
         path = write_toml(self.dir, "myproj", 'image = "ubuntu:22.04"\n')
         cfg = ProjectConfig.from_toml(path)
@@ -158,6 +182,8 @@ class ResolveEnterTargetTests(unittest.TestCase):
 
     def test_unique_shortcut_lands_in_its_dir(self):
         self.assertEqual(resolve_enter_target("y", self.projects), (self.b, "/home/dev/workspace/y/sub"))
+        self.b.home = "/home/ubuntu"
+        self.assertEqual(resolve_enter_target("y", self.projects), (self.b, "/home/ubuntu/workspace/y/sub"))
 
     def test_ambiguous_or_unknown_is_none(self):
         self.assertIsNone(resolve_enter_target("both", self.projects))
@@ -470,7 +496,7 @@ class ImageConfigTests(unittest.TestCase):
         self.assertIn("Missing hermes.Dockerfile", str(rejected(ImageConfig.from_toml, path)))
 
     def test_invalid_name_rejected(self):
-        rejected(ImageConfig.from_toml, self.recipe(name="a.b"))
+        rejected(ImageConfig.from_toml, self.recipe(name="a b"))
 
     def test_load_images_and_find_recipe(self):
         self.recipe("a")

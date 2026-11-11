@@ -2,6 +2,7 @@
 
 import unittest
 
+import containerctl
 from containerctl import (
     Container,
     ContainerInspect,
@@ -145,6 +146,21 @@ class InspectModelTests(unittest.TestCase):
         self.assertIsNone(VolumeInspect.from_dict({"Name": "v", "Driver": "local"}))
         ok = VolumeInspect.from_dict({"Name": "v", "Driver": "local", "Mountpoint": "/m", "Scope": "local"})
         self.assertIsNotNone(ok)
+
+    def test_inspect_checks_types_and_logs_what_is_wrong(self):
+        data = {"Id": "n1", "Name": "bridge", "Created": "t", "Scope": "local", "Driver": 7}
+        self.assertIsNone(NetworkInspect.from_dict(data))
+        (event,) = containerctl.get_errors()
+        self.assertEqual((event.cat, event.msg), ("docker.network_inspect_parse", "Wrong types: Driver (int)"))
+
+    def test_inspect_takes_null_where_docker_sends_it(self):
+        data = {"Id": "n1", "Name": "b", "Created": "t", "Scope": "local", "Driver": "d", "Options": None}
+        self.assertIsNotNone(NetworkInspect.from_dict(data))
+
+    def test_inspect_rejects_an_unsafe_key(self):
+        data = {"Id": "a;b", "Name": "/x", "Created": "t", "State": {}, "Image": "i", "Config": {}}
+        self.assertIsNone(ContainerInspect.from_dict(data))
+        self.assertEqual(containerctl.get_errors()[0].msg, "Invalid Id: a;b")
 
     def test_network_inspect_minimal(self):
         ni = NetworkInspect.from_dict(

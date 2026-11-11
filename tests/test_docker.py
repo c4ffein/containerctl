@@ -17,7 +17,17 @@ from unittest import mock
 
 import containerctl
 from containerctl import KNOWN_HOSTS, Docker, ProjectConfig, RepoSpec, ServiceConfig, get_errors
-from tests.helper import RunRecorder, SubprocessRecorder, container, reset_errors
+from tests.helper import FakeProcess, PopenRecorder, RunRecorder, SubprocessRecorder, container, reset_errors
+
+_tty = mock.patch.object(containerctl, "stdin_is_tty", return_value=True)  # tests run with or without a terminal
+
+
+def setUpModule():
+    _tty.start()
+
+
+def tearDownModule():
+    _tty.stop()
 
 
 class CommandConstructionTests(unittest.TestCase):
@@ -94,6 +104,17 @@ class IdGuardTests(unittest.TestCase):
     def test_remove_volume_rejects_bad_name(self):
         self.assertFalse(Docker.remove_volume("bad name"))
         self.assertEqual(self.rec.calls, [])
+
+    def test_exec_noninteractive_refuses_what_would_be_read_as_an_option_or_another_name(self):
+        ok = ("cctl-prj-demo", "dev", "/home/dev/workspace")
+        bad = (("a;b", ok[1], ok[2]), (ok[0], "-u0", ok[2]), (ok[0], "", ok[2]), (ok[0], ok[1], "../etc"))
+        for container_id, user, workdir in bad:
+            result = Docker.exec_noninteractive(container_id, ["true"], workdir=workdir, user=user)
+            self.assertEqual(result.returncode, containerctl.REFUSED)
+        self.assertEqual(self.rec.calls, [])
+        cats = ["docker.invalid_id", "docker.invalid_user", "docker.invalid_user", "docker.invalid_workdir"]
+        self.assertEqual([e.cat for e in get_errors()], cats)
+        self.assertEqual(Docker.exec_noninteractive(*ok[:1], ["true"], workdir=ok[2], user=ok[1]).returncode, 0)
 
     def test_connect_network_validates_both_args(self):
         self.assertFalse(Docker.connect_network("net", "bad;id"))
@@ -205,9 +226,13 @@ class JsonParsingTests(unittest.TestCase):
         self.assertEqual(containerctl.docker_failure(["ps"], call).detail, "docker ps: exit code 3")
 
     def test_no_docker_on_path_is_classified_end_to_end(self):
-        with mock.patch.object(containerctl.subprocess, "run", side_effect=FileNotFoundError):
+        with mock.patch.object(containerctl.subprocess, "Popen", side_effect=FileNotFoundError):
             listing = Docker.list_volumes()
         self.assertEqual(listing.failure.msg, "docker is not installed")
+        with mock.patch.object(containerctl.subprocess, "run", side_effect=FileNotFoundError):
+            with self.assertRaises(containerctl.DockerError) as raised:  # not "no such image": nobody could say
+                Docker.image_exists("a:b")
+        self.assertEqual(str(raised.exception), "docker is not installed")
 
     def test_containers_filters_invalid_rows(self):
         # One good row, one missing required field -> only the good one survives.
@@ -235,6 +260,13 @@ class StreamingCommandTests(unittest.TestCase):
     def test_logs_flags(self):
         Docker.logs("abc", follow=True, tail=100)
         self.assertEqual(self.rec.last, ["docker", "logs", "-f", "--tail", "100", "abc"])
+
+    def test_they_hand_back_docker_exit_code(self):
+        self.rec.returncode = 7
+        self.assertEqual(Docker.logs("abc"), 7)
+        self.assertEqual(Docker.exec("abc", ["false"]), 7)
+        self.assertEqual(Docker.shell("abc"), 7)
+        self.assertEqual(Docker.exec("a b", ["ls"]), containerctl.REFUSED)
 
     def test_logs_minimal(self):
         Docker.logs("abc")
@@ -369,7 +401,10 @@ class ProjectAndServiceRunTests(unittest.TestCase):
         )
 
     def test_create_service_container_fails_when_network_cannot_be_ensured(self):
-        self.rec.returncode = 1  # inspect fails and so does create
+        self.rec.returncode, self.rec.stderr = (
+            1,
+            "Error response from daemon: network x not found",
+        )  # inspect says absent, and the create fails
         service = ServiceConfig(name="web", image="nginx", networks=["proxy"])
         self.assertFalse(Docker.create_service_container(service))
         self.assertTrue(all(c[0] != "run" for c in self.rec.calls))
@@ -398,7 +433,7 @@ class ServiceUpNetworkTests(unittest.TestCase):
             Config={},
             NetworkSettings={"Networks": {n: {} for n in networks}},
         )
-        return mock.patch.object(Docker, "inspect_container", return_value=info)
+        return mock.patch.object(Docker, "inspect", return_value=info)
 
     def test_running_container_gets_missing_networks_only(self):
         with mock.patch.object(Docker, "find_service_container", return_value=container("c")):
@@ -431,7 +466,7 @@ class ServiceUpNetworkTests(unittest.TestCase):
     def test_connect_failure_is_reported(self):
         with mock.patch.object(Docker, "find_service_container", return_value=container("c")):
             with self._inspect("proxy"), redirect_stdout(io.StringIO()):
-                self.rec.returncode = 1
+                self.rec.returncode, self.rec.stderr = 1, "Error response from daemon: network x not found"
                 self.assertFalse(Docker.service_up(self.service))
         self.assertEqual(get_errors()[-1].cat, "service.network")
 
@@ -467,16 +502,18 @@ class SpawnAndEnterShellFreeTests(unittest.TestCase):
     def test_spawn_clones_via_workdir_argv_with_option_terminator(self):
         with redirect_stdout(io.StringIO()):
             self.assertTrue(Docker.spawn_project(self.project))
-        tail = ["git", "clone", "--", "https://github.com/u/repo.git"]
-        self.assertIn(["exec", "-w", "/home/dev/workspace", "cctl-prj-demo"] + tail, self.rec.calls)
+        mirror = ["-c", "remote.origin.fetch=+refs/tags/*:refs/upstream-tags/*"]  # see UPSTREAM_TAGS
+        tail = ["git", "clone", "--progress", *mirror, "--", "https://github.com/u/repo.git"]
+        self.assertIn(["exec", "-u", "dev", "-w", "/home/dev/workspace", "cctl-spawning-demo"] + tail, self.rec.calls)
         self.assertTrue(all("bash" not in call for call in self.rec.calls))
 
     def test_spawn_clone_branch_and_dir_stay_before_and_after_terminator(self):
         self.project.repos = [RepoSpec("https://github.com/u/repo.git", dir="d", branch="main")]
         with redirect_stdout(io.StringIO()):
             self.assertTrue(Docker.spawn_project(self.project))
-        tail = ["git", "clone", "-b", "main", "--", "https://github.com/u/repo.git", "d"]
-        self.assertIn(["exec", "-w", "/home/dev/workspace", "cctl-prj-demo"] + tail, self.rec.calls)
+        mirror = ["-c", "remote.origin.fetch=+refs/tags/*:refs/upstream-tags/*"]
+        tail = ["git", "clone", "--progress", *mirror, "-b", "main", "--", "https://github.com/u/repo.git", "d"]
+        self.assertIn(["exec", "-u", "dev", "-w", "/home/dev/workspace", "cctl-spawning-demo"] + tail, self.rec.calls)
 
     def test_spawn_pins_forge_host_keys_instead_of_scanning(self):
         with tempfile.NamedTemporaryFile(delete=False) as key:
@@ -485,12 +522,41 @@ class SpawnAndEnterShellFreeTests(unittest.TestCase):
         self.project.ssh_key = key.name
         with redirect_stdout(io.StringIO()):
             self.assertTrue(Docker.spawn_project(self.project))
-        tee = ["exec", "-i", "-u", "dev", "cctl-prj-demo", "tee", "-a", "/home/dev/.ssh/known_hosts"]
+        tee = ["exec", "-i", "-u", "dev", "cctl-spawning-demo", "tee", "-a", "/home/dev/.ssh/known_hosts"]
         self.assertIn(tee, self.rec.calls)
         self.assertEqual(self.rec.inputs[self.rec.calls.index(tee)], KNOWN_HOSTS)
         flat = " ".join(" ".join(c) for c in self.rec.calls)
         self.assertNotIn("ssh-keyscan", flat)
         self.assertNotIn("bash", flat)
+
+    def test_spawn_goes_by_the_projects_user_and_home(self):
+        with tempfile.NamedTemporaryFile(delete=False) as key:
+            key.write(b"not a real key")
+        self.addCleanup(os.unlink, key.name)
+        self.project.ssh_key, self.project.user, self.project.home = key.name, "ubuntu", "/home/ubuntu"
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(Docker.spawn_project(self.project))
+        name, key_dest = "cctl-spawning-demo", "/home/ubuntu/.ssh/id_ed25519"
+        # As the user, whatever the image's USER: the dir, the check that the key can be read, the clones. As
+        # root, by name: only the handing over of the one file `docker cp` wrote.
+        self.assertIn(["exec", "-u", "ubuntu", name, "mkdir", "-p", "/home/ubuntu/.ssh"], self.rec.calls)
+        self.assertIn(["exec", "-u", "root", name, "chown", "ubuntu:", key_dest], self.rec.calls)
+        self.assertIn(["exec", "-u", "ubuntu", name, "test", "-r", key_dest], self.rec.calls)
+        self.assertEqual({c[2] for c in self.rec.calls if c[:2] == ["exec", "-u"]}, {"ubuntu", "root"})
+        self.assertEqual([c for c in self.rec.calls if c[0] == "exec" and "-u" not in c], [])  # none by default
+        self.assertIn(
+            ["exec", "-i", "-u", "ubuntu", name, "tee", "-a", "/home/ubuntu/.ssh/known_hosts"], self.rec.calls
+        )
+        self.assertIn(["exec", "-u", "ubuntu", name, "mkdir", "-p", "/home/ubuntu/workspace"], self.rec.calls)
+        clones = [c[:5] for c in self.rec.calls if "clone" in c]
+        self.assertEqual(clones, [["exec", "-u", "ubuntu", "-w", "/home/ubuntu/workspace"]])
+        containerctl.install_self.assert_called_once_with(mock.ANY, ["repo"], "ubuntu", "/home/ubuntu", {})
+        self.assertNotIn("/home/dev", " ".join(" ".join(c) for c in self.rec.calls))
+        self._enter()
+        self.assertEqual(self.sub.last[-2:], ["/home/ubuntu/workspace/repo", "/home/ubuntu"])
+        self.assertEqual(self.sub.last[:5], ["docker", "exec", "-it", "-u", "ubuntu"])  # the shell is theirs too
+        self._enter(user="root")
+        self.assertEqual(self.sub.last[:5], ["docker", "exec", "-it", "-u", "root"])  # unless asked otherwise
 
     def test_known_hosts_constant_is_well_formed(self):
         # One `host ssh-ed25519 <b64>` line per forge; the blob is an ed25519 wire key (type string + 32 bytes)
@@ -504,9 +570,9 @@ class SpawnAndEnterShellFreeTests(unittest.TestCase):
             self.assertEqual(raw[4:15], b"ssh-ed25519")
             self.assertEqual(len(raw), 4 + 11 + 4 + 32)
 
-    # enter attaches with a constant bash -c; the landing dir rides in as $1 (data, never
-    # interpolated), and `cd -- "$1" || cd /home/dev` does the fallback atomically in-container.
-    ENTER_SCRIPT = 'cd -- "$1" 2>/dev/null || cd /home/dev; exec bash'
+    # enter attaches with a constant bash -c; the landing dir and the home ride in as $1 and $2 (data,
+    # never interpolated), and `cd -- "$1" || cd -- "$2"` does the fallback atomically in-container.
+    ENTER_SCRIPT = 'cd -- "$1" 2>/dev/null || cd -- "$2"; exec bash'
 
     def _enter(self, **kwargs):
         with mock.patch.object(Docker, "find_project_container", return_value=container("c")):
@@ -514,7 +580,8 @@ class SpawnAndEnterShellFreeTests(unittest.TestCase):
                 Docker.enter_project(self.project, **kwargs)
 
     def _expected(self, workdir):
-        return ["docker", "exec", "-it", "cctl-prj-demo", "bash", "-c", self.ENTER_SCRIPT, "bash", workdir]
+        script = ["bash", "-c", self.ENTER_SCRIPT, "bash", workdir, "/home/dev"]
+        return ["docker", "exec", "-it", "-u", "dev", "cctl-prj-demo", *script]
 
     def test_enter_single_repo_attaches_atomically_without_probe(self):
         self._enter()
@@ -537,15 +604,15 @@ class SpawnAndEnterShellFreeTests(unittest.TestCase):
         self.assertEqual(self.sub.last, self._expected("/home/dev/workspace/repo/sub"))
 
     def test_enter_dir_is_passed_as_data_not_interpolated(self):
-        # The script is a constant; the dir is the LAST argv element ($1), and it is quoted +
-        # option-terminated so it can never be parsed as shell code or a cd option.
+        # The script is a constant; the dir and the home are the last argv elements ($1, $2), quoted +
+        # option-terminated so they can never be parsed as shell code or a cd option.
         self._enter()
         script = self.sub.last[self.sub.last.index("-c") + 1]
         self.assertEqual(script, self.ENTER_SCRIPT)
         self.assertIn('"$1"', script)
         self.assertIn("cd --", script)
-        self.assertIn("|| cd /home/dev", script)
-        self.assertEqual(self.sub.last[-1], "/home/dev/workspace/repo")
+        self.assertIn('|| cd -- "$2"', script)
+        self.assertEqual(self.sub.last[-2:], ["/home/dev/workspace/repo", "/home/dev"])
 
 
 if __name__ == "__main__":
@@ -603,7 +670,7 @@ class ExecEnvTests(unittest.TestCase):
     def test_enter_injects_resolved_env(self):
         resolve, stderr = self._enter({"TOK": "s3cret", "TZ": "UTC"})
         self.assertEqual(resolve.call_args.args[0].name, "demo")
-        self.assertEqual(self.sub.last[:7], ["docker", "exec", "-it", "-e", "TOK", "-e", "TZ"])
+        self.assertEqual(self.sub.last[:9], ["docker", "exec", "-it", "-u", "dev", "-e", "TOK", "-e", "TZ"])
         self.assertEqual(self.sub.kwargs[-1]["env"]["TOK"], "s3cret")
         self.assertEqual(stderr, "")
 
@@ -615,7 +682,7 @@ class ExecEnvTests(unittest.TestCase):
 
 
 class InstallSelfTests(unittest.TestCase):
-    """install_self runs on every `enter`: it creates as dev and chowns the two files `docker cp` wrote as root,
+    """install_self runs on every `enter`: it creates as dev and chowns the three files `docker cp` wrote as root,
     by name. The old `chown -R dev:dev ~/.local ~/.config` walked the whole home each time and flipped the owner
     of everything under it."""
 
@@ -642,11 +709,14 @@ class InstallSelfTests(unittest.TestCase):
             [
                 [
                     "exec",
+                    "-u",
+                    "root",  # `docker cp` wrote them as root: only root hands them over, whatever the image's USER
                     "cctl-prj-demo",
                     "chown",
-                    "dev:dev",
+                    "dev:",  # the user and its own group, whatever that is called
                     "/home/dev/.local/bin/containerctl",
                     "/home/dev/.config/containerctl/expected.json",
+                    "/home/dev/.config/containerctl/injected.json",
                 ]
             ],
         )
@@ -657,6 +727,26 @@ class InstallSelfTests(unittest.TestCase):
         cps = [c for c in self.rec.calls if c[0] == "cp"]
         self.assertEqual(cps[0][2], "cctl-prj-demo:/home/dev/.local/bin/containerctl")
         self.assertEqual(cps[1][2], "cctl-prj-demo:/home/dev/.config/containerctl/expected.json")
+        self.assertEqual(cps[2][2], "cctl-prj-demo:/home/dev/.config/containerctl/injected.json")
+
+    def test_what_was_injected_is_written_beside_the_manifest_even_when_nothing_was(self):
+        written = []
+        real = Docker.cp
+
+        def cp(src, container, dest):
+            if dest.endswith(".json"):
+                with open(src) as f:
+                    written.append((dest.rsplit("/", 1)[1], json.load(f)))
+            return real(src, container, dest)
+
+        with mock.patch.object(Docker, "cp", cp):
+            containerctl.install_self("cctl-prj-demo", ["app"], injected={".env": "abc"})
+            containerctl.install_self("cctl-prj-demo", ["app"])
+        self.assertEqual(
+            written,
+            [("expected.json", ["app"]), ("injected.json", {".env": "abc"})]
+            + [("expected.json", ["app"]), ("injected.json", {})],  # none now: the old list must not stay
+        )
 
     def test_bashrc_append_runs_as_dev_with_a_constant_script(self):
         containerctl.install_self("cctl-prj-demo", [])
@@ -665,10 +755,386 @@ class InstallSelfTests(unittest.TestCase):
         self.assertEqual(shells[0][:4], ["exec", "-u", "dev", "cctl-prj-demo"])
         self.assertIn(".local/bin", shells[0][-1])
 
+    def test_another_user_and_home_are_used_throughout(self):
+        self.assertTrue(containerctl.install_self("cctl-prj-demo", [], "ubuntu", "/srv/u"))
+        flat = [" ".join(c) for c in self.rec.calls]
+        self.assertIn("exec -u ubuntu cctl-prj-demo mkdir -p /srv/u/.local/bin /srv/u/.config/containerctl", flat)
+        self.assertTrue(any(c.startswith("exec -u root cctl-prj-demo chown ubuntu: /srv/u/.local/bin/") for c in flat))
+        self.assertTrue(any("'/srv/u/.bashrc'" in c and c.startswith("exec -u ubuntu ") for c in flat))
+        self.assertFalse(any("dev" in c for c in flat if c.startswith("exec ")))  # (the `cp` source is a host path)
+
     def test_failed_copy_of_self_aborts(self):
         self.rec.returncode = 1
         self.assertFalse(containerctl.install_self("cctl-prj-demo", []))
         self.assertTrue(all("chown" not in c for c in self.rec.calls))
+
+
+class HungDockerTests(unittest.TestCase):
+    """A daemon that doesn't answer reads as a failed call, with its own words, instead of blocking forever"""
+
+    def test_a_query_that_times_out_is_a_failure_that_says_so_and_its_client_is_killed(self):
+        hung = PopenRecorder(hang=True)
+        with mock.patch.object(containerctl.subprocess, "Popen", hung):
+            listing = Docker.list_containers()
+        self.assertEqual(listing.rows, [])
+        self.assertEqual(listing.failure.msg, "Docker did not answer in time")
+        self.assertEqual(hung.procs[0].timeouts[0], containerctl.QUERY_TIMEOUT)
+        self.assertTrue(hung.procs[0].killed)
+        self.assertEqual(Docker._own_group, set())  # no longer in flight
+
+    def test_a_ps_with_sizes_gets_the_long_timeout_whoever_asks(self):
+        rec = PopenRecorder()
+        with mock.patch.object(containerctl.subprocess, "Popen", rec):
+            Docker.list_containers(include_size=True, timeout=containerctl.POLL_TIMEOUT)
+            Docker.listings(timeout=containerctl.POLL_TIMEOUT)
+        self.assertEqual(
+            [proc.timeouts[0] for proc in rec.procs], [containerctl.SIZE_TIMEOUT] + [containerctl.POLL_TIMEOUT] * 4
+        )
+
+    def test_an_image_that_did_not_answer_is_not_an_absent_one(self):
+        def hang(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+        with mock.patch.object(containerctl.subprocess, "run", hang):
+            with self.assertRaises(containerctl.DockerError) as ctx:
+                Docker.ensure_image("ubuntu:24.04")  # must not go on to pull or build over it
+        self.assertEqual(str(ctx.exception), "Docker did not answer in time")
+
+    def test_destroy_removes_only_the_names_it_was_given(self):
+        rec = RunRecorder(stdout=SpawnNameIsTheStateTests.LEFTOVER)  # a spawn appeared since the question
+        project = ProjectConfig(name="p", image="i")
+        with mock.patch.object(Docker, "_run", rec), redirect_stdout(io.StringIO()):
+            self.assertTrue(Docker.destroy_project(project, ["cctl-prj-p"]))
+        self.assertEqual([c for c in rec.calls if c[0] == "rm"], [["rm", "-f", "cctl-prj-p"]])
+        self.assertNotIn("ps", [c[0] for c in rec.calls])
+
+    def test_a_network_that_did_not_answer_is_not_an_absent_one(self):
+        def run(args, **kwargs):
+            self.assertNotEqual(args[:2], ["network", "create"])
+            return subprocess.CompletedProcess(args, containerctl.TIMED_OUT, "", f"{containerctl.NO_ANSWER} 6s")
+
+        with mock.patch.object(Docker, "_run", run), self.assertRaises(containerctl.DockerError):
+            Docker.ensure_network("proxy")
+
+    def test_an_inspect_that_did_not_answer_is_not_no_such_object(self):
+        def run(args, **kwargs):
+            return subprocess.CompletedProcess(args, containerctl.TIMED_OUT, "", f"{containerctl.NO_ANSWER} 6s")
+
+        with mock.patch.object(Docker, "_run", run), self.assertRaises(containerctl.DockerError) as ctx:
+            Docker.inspect(containerctl.ContainerInspect, "abc")
+        self.assertEqual(str(ctx.exception), "Docker did not answer in time")
+
+    def test_listings_leave_the_terminals_process_group_and_nothing_else_does(self):
+        # Ctrl-C goes to the whole foreground group: the fetcher's listings must not die of one meant for an action
+        own, rec = PopenRecorder(), SubprocessRecorder()
+        with (
+            mock.patch.object(containerctl.subprocess, "Popen", own),
+            mock.patch.object(containerctl.subprocess, "run", rec),
+        ):
+            Docker.listings()
+            Docker.stop("abc")
+            Docker.exec_noninteractive("abc", ["git", "clone", "x"])
+        self.assertEqual([c[1] for c in own.calls], ["ps", "images", "volume", "network"])
+        self.assertEqual({(kw["process_group"], kw["stdin"]) for kw in own.kwargs}, {(0, subprocess.DEVNULL)})
+        self.assertEqual([c[1] for c in rec.calls], ["stop", "exec"])
+        self.assertEqual([(kw.get("process_group"), kw.get("stdin")) for kw in rec.kwargs], [(None, None)] * 2)
+
+    def test_whoever_stops_waiting_on_an_own_group_call_kills_it(self):
+        own = PopenRecorder()
+        with mock.patch.object(containerctl.subprocess, "Popen", own):
+            waits = iter([KeyboardInterrupt, ("", "")])  # interrupted while waiting; then reaped after the kill
+
+            def communicate(proc, timeout=None):
+                step = next(waits)
+                if step is KeyboardInterrupt:
+                    raise step
+                return step
+
+            with mock.patch.object(FakeProcess, "communicate", communicate), self.assertRaises(KeyboardInterrupt):
+                Docker.list_images()
+        self.assertTrue(own.procs[0].killed)
+        self.assertEqual(Docker._own_group, set())
+
+    def test_leaving_kills_the_own_group_calls_in_flight_and_lets_none_start(self):
+        # They are out of the terminal's group: nothing else ends a `docker ps` the fetcher was waiting on
+        own = PopenRecorder()
+        self.addCleanup(setattr, Docker, "_leaving", False)
+        with mock.patch.object(containerctl.subprocess, "Popen", own):
+            in_flight = own(["docker", "ps"])
+            Docker._own_group.add(in_flight)
+            self.addCleanup(Docker._own_group.discard, in_flight)
+            Docker.kill_own_group()  # the TUI stopping its fetcher: kills, and nothing more
+            self.assertTrue(in_flight.killed)
+            self.assertFalse(Docker._leaving)
+            Docker.kill_own_group(leaving=True)  # at exit
+            listing = Docker.list_containers()  # the fetcher, on its way to the next listing
+        self.assertEqual(len(own.calls), 1)  # only ours: none was started after
+        self.assertTrue(listing.failure)
+
+    def test_only_docker_saying_no_such_thing_is_an_absent_one(self):
+        def said(stderr, returncode=1):
+            return subprocess.CompletedProcess([], returncode, "", stderr)
+
+        self.assertFalse(Docker._absent(["x"], said("", 0)))
+        for words in (
+            "Error response from daemon: No such image: a:b",
+            "Error: No such container: abc",
+            "Error response from daemon: network proxy not found",
+            "Error response from daemon: get data: no such volume",
+        ):
+            self.assertTrue(Docker._absent(["x"], said(words)), words)
+        for words, msg in (
+            ("Cannot connect to the Docker daemon at unix:///var/run/docker.sock.", "Docker daemon is not running"),
+            ("docker: command not found on PATH", "docker is not installed"),  # "not found", but not docker's
+            ("something new", "Unknown docker failure"),
+            ("", "Unknown docker failure"),
+        ):
+            with self.assertRaises(containerctl.DockerError) as raised:
+                Docker._absent(["x"], said(words))
+            self.assertEqual(str(raised.exception), msg)
+
+    def test_an_inspect_docker_failed_is_not_no_such_object(self):
+        rec = RunRecorder(returncode=1, stderr="Cannot connect to the Docker daemon at unix:///var/run/docker.sock.")
+        with mock.patch.object(Docker, "_run", rec), self.assertRaises(containerctl.DockerError):
+            Docker.inspect(containerctl.ContainerInspect, "abc")
+        rec = RunRecorder(returncode=1, stderr="Error response from daemon: No such container: abc")
+        with mock.patch.object(Docker, "_run", rec):
+            self.assertIsNone(Docker.inspect(containerctl.ContainerInspect, "abc"))
+
+    def test_what_an_exec_ran_said_is_not_read_as_docker_saying_it(self):
+        def failure(stderr):
+            call = subprocess.CompletedProcess([], 2, "", stderr)
+            return containerctl.docker_failure(["exec", "c", "ls"], call, inside="ls")
+
+        denied = failure("ls: cannot open directory '/home/dev/workspace': Permission denied\nmore")
+        self.assertEqual(
+            denied.msg,
+            "`ls` failed in the container: ls: cannot open directory '/home/dev/workspace': Permission denied",
+        )
+        self.assertIn("more", denied.detail)
+        self.assertEqual(failure("").msg, "`ls` failed in the container: exit code 2")
+        # docker's own voice, client or daemon, is still docker's
+        socket = "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock"
+        self.assertEqual(failure(socket).msg, "No permission on the docker socket")
+        stopped = "Error response from daemon: container abc is not running"
+        self.assertEqual(failure(stopped).msg, "Container is not running")
+        self.assertEqual(failure(f"{containerctl.NO_ANSWER} 6s").msg, "Docker did not answer in time")
+
+    def test_exec_only_asks_for_a_terminal_when_it_has_one_to_lend(self):
+        rec = SubprocessRecorder()
+        with mock.patch.object(containerctl.subprocess, "run", rec):
+            with mock.patch.object(containerctl, "stdin_is_tty", return_value=False):
+                Docker.exec("abc", ["ls"])
+        self.assertEqual(rec.last, ["docker", "exec", "-i", "abc", "ls"])
+
+    def test_only_questions_get_a_timeout(self):
+        own, rec = PopenRecorder(), SubprocessRecorder()
+        with (
+            mock.patch.object(containerctl.subprocess, "Popen", own),
+            mock.patch.object(containerctl.subprocess, "run", rec),
+        ):
+            Docker.list_images()
+            Docker.image_exists("a:b")
+            Docker.stop("abc")
+            Docker.exec_noninteractive("abc", ["git", "clone", "x"])
+        self.assertEqual(own.procs[0].timeouts, [containerctl.QUERY_TIMEOUT])
+        self.assertEqual([kw["timeout"] for kw in rec.kwargs], [containerctl.QUERY_TIMEOUT] + [None] * 2)
+
+
+class SpawnNameIsTheStateTests(unittest.TestCase):
+    """A project container only gets its name once everything is in it: see SPAWNING_PREFIX"""
+
+    def setUp(self):
+        reset_errors()
+        self.project = ProjectConfig(name="p", image="i", repos=[RepoSpec(url="https://github.com/u/repo.git")])
+
+    LEFTOVER = json.dumps(
+        {"ID": "abc", "Names": "cctl-spawning-p", "Image": "i", "Status": "Up", "RunningFor": "3 minutes ago"}
+    )
+
+    def _spawn(self, rec, answer=True):
+        self.out = io.StringIO()
+        with (
+            mock.patch.object(Docker, "_run", rec),
+            mock.patch.object(containerctl, "confirm_cli", return_value=answer) as self.confirm,
+            mock.patch.object(containerctl, "install_self", return_value=True),
+            redirect_stdout(self.out),
+            redirect_stderr(io.StringIO()),
+        ):
+            return Docker.spawn_project(self.project)
+
+    def test_made_under_the_spawning_name_and_renamed_last(self):
+        rec = RunRecorder()
+        self.assertTrue(self._spawn(rec))
+        run = next(c for c in rec.calls if c[0] == "run")
+        self.assertEqual(run[run.index("--name") + 1], "cctl-spawning-p")
+        self.assertEqual(rec.last, ["rename", "cctl-spawning-p", "cctl-prj-p"])
+        self.assertNotIn("cctl-prj-p", [arg for c in rec.calls[:-1] for arg in c])
+
+    def test_interrupted_halfway_it_just_ends_and_nothing_was_renamed(self):
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append(args)
+            if "clone" in args:
+                raise KeyboardInterrupt
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with self.assertRaises(KeyboardInterrupt):
+            self._spawn(run)
+        self.assertEqual([c[0] for c in calls if c[0] in ("rename", "rm")], [])  # no cleanup, no project container
+
+    def test_no_leftover_no_question(self):
+        self._spawn(RunRecorder())
+        self.confirm.assert_not_called()
+
+    def test_a_leftover_is_shown_with_its_age_and_kept_unless_the_user_says_so(self):
+        rec = RunRecorder(stdout=self.LEFTOVER)
+        self.assertFalse(self._spawn(rec, answer=False))
+        self.assertIn("cctl-spawning-p exists (created 3 minutes ago)", self.out.getvalue())
+        self.confirm.assert_called_once_with("Remove it and start over?")
+        self.assertEqual([c[0] for c in rec.calls], ["ps"])  # nothing removed, nothing created
+
+    def test_what_an_unfinished_spawn_left_is_removed_on_a_yes_before_starting_over(self):
+        rec = RunRecorder(stdout=self.LEFTOVER)
+        self.assertTrue(self._spawn(rec))
+        kinds = [c[0] for c in rec.calls]
+        self.assertEqual(rec.calls[kinds.index("rm")], ["rm", "-f", "abc"])  # by ID: the one that was shown
+        self.assertLess(kinds.index("rm"), kinds.index("run"))
+
+    def test_an_env_file_under_the_home_is_handed_to_the_user_one_elsewhere_stays_roots(self):
+        with tempfile.NamedTemporaryFile() as src:
+            home, etc = "/home/dev/workspace/app/.env", "/etc/app/env"
+            self.project.env_files = [containerctl.EnvFile(src.name, home), containerctl.EnvFile(src.name, etc)]
+            rec = RunRecorder()
+            with mock.patch.object(containerctl, "install_self", return_value=True):
+                self.assertTrue(self._spawn(rec))
+        execs = [c[1:] for c in rec.calls if c[0] == "exec"]
+        self.assertIn(["-u", "dev", "cctl-spawning-p", "mkdir", "-p", "/home/dev/workspace/app"], execs)
+        self.assertIn(["-u", "root", "cctl-spawning-p", "chown", "dev:", home], execs)  # `docker cp` wrote it as root
+        self.assertIn(["-u", "root", "cctl-spawning-p", "mkdir", "-p", "/etc/app"], execs)
+        self.assertEqual([c for c in execs if etc in c], [])  # not chowned: outside the home it is not theirs
+
+    def test_anything_that_could_not_be_put_in_fails_the_spawn_and_nothing_is_renamed(self):
+        with tempfile.NamedTemporaryFile() as src:
+            self.project.env_files = [containerctl.EnvFile(src=src.name, dest="/home/dev/.env")]
+            for broken in ("cp", "install_self"):
+
+                def run(args, **kwargs):
+                    return subprocess.CompletedProcess(args, 1 if args[0] == broken else 0, "", "")
+
+                rec = mock.Mock(side_effect=run)
+                with mock.patch.object(containerctl, "install_self", return_value=broken != "install_self"):
+                    with mock.patch.object(Docker, "_run", rec), redirect_stdout(io.StringIO()):
+                        with redirect_stderr(io.StringIO()):
+                            self.assertFalse(Docker.spawn_project(self.project), broken)
+                kinds = [call.args[0][0] for call in rec.call_args_list]
+                self.assertNotIn("rename", kinds, broken)
+                self.assertEqual(rec.call_args_list[-1].args[0], ["rm", "-f", "cctl-spawning-p"], broken)
+
+    def test_a_file_missing_on_the_host_stops_the_spawn_before_anything_is_created(self):
+        self.project.env_files = [containerctl.EnvFile(src="/nonexistent/app.env", dest="/home/dev/.env")]
+        self.project.ssh_key = "/nonexistent/id_ed25519"
+        rec = RunRecorder()
+        err = io.StringIO()
+        with mock.patch.object(Docker, "_run", rec), redirect_stderr(err):
+            self.assertFalse(Docker.spawn_project(self.project))
+        self.assertEqual(rec.calls, [])  # not even a `ps`: no container, no clone to redo
+        self.assertIn("not found on this host: /nonexistent/id_ed25519, /nonexistent/app.env", err.getvalue())
+
+    def _docker(self, fail=None, stderr=""):
+        """A docker whose `run -d` prints an ID, and whose `fail` subcommand (or `git clone`) exits 1"""
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append(list(args))
+            failed = fail is not None and (fail == args[0] or fail in args)
+            return subprocess.CompletedProcess(args, 1 if failed else 0, "id123\n" if args[0] == "run" else "", stderr)
+
+        return run, calls
+
+    def test_everything_after_the_run_goes_by_the_id_docker_printed(self):
+        run, calls = self._docker()
+        self.assertTrue(self._spawn(run))
+        after = calls[[c[0] for c in calls].index("run") + 1 :]
+        self.assertEqual(after[-1], ["rename", "id123", "cctl-prj-p"])
+        self.assertTrue(all("id123" in c for c in after))
+        self.assertNotIn("cctl-spawning-p", [arg for c in after for arg in c])  # the name may have changed hands
+
+    def test_a_failed_spawn_removes_its_own_container_by_id(self):
+        run, calls = self._docker(fail="clone")
+        self.assertFalse(self._spawn(run))
+        self.assertEqual(calls[-1], ["rm", "-f", "id123"])
+        self.assertEqual(containerctl.get_errors()[-1].msg, "p: git clone failed for https://github.com/u/repo.git")
+
+    def test_a_rename_that_fails_leaves_the_container_under_its_spawning_name_and_says_so(self):
+        run, calls = self._docker(fail="rename", stderr="name already in use")
+        self.assertFalse(self._spawn(run))
+        self.assertNotIn("rm", [c[0] for c in calls])  # complete, and maybe wanted: not ours to remove
+        error = containerctl.get_errors()[-1]
+        self.assertEqual(error.msg, "Could not rename cctl-spawning-p to cctl-prj-p: name already in use")
+        self.assertTrue(error.echoed)
+
+    def test_destroy_with_nothing_to_remove_says_so_and_removes_nothing(self):
+        rec, out = RunRecorder(), io.StringIO()
+        with mock.patch.object(Docker, "_run", rec), redirect_stdout(out):
+            self.assertFalse(Docker.destroy_project(self.project, []))
+        self.assertEqual((rec.calls, out.getvalue()), ([], "No container found for project p\n"))
+
+    def test_enter_stops_at_a_container_that_will_not_start(self):
+        stopped = container("cctl-prj-p", "exited")
+        err = io.StringIO()
+        with (
+            mock.patch.object(Docker, "find_project_container", return_value=stopped),
+            mock.patch.object(Docker, "start", return_value=False),
+            mock.patch.object(Docker, "exec") as shell,
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(err),
+        ):
+            self.assertIsNone(Docker.enter_project(self.project))
+        shell.assert_not_called()
+        self.assertEqual(err.getvalue(), "Error: Could not start cctl-prj-p\n")
+
+    def test_enter_does_not_see_an_unfinished_spawn_as_the_project_container(self):
+        with mock.patch.object(Docker, "_run", RunRecorder(stdout=self.LEFTOVER)):
+            self.assertIsNone(Docker.find_project_container("p"))
+
+    def test_destroy_takes_what_an_unfinished_spawn_left_too(self):
+        rec = RunRecorder(stdout=self.LEFTOVER)
+        with mock.patch.object(Docker, "_run", rec), redirect_stdout(io.StringIO()):
+            self.assertTrue(Docker.destroy_project(self.project))
+        self.assertIn(["rm", "-f", "cctl-spawning-p"], rec.calls)
+
+    def _spawning(self, seconds_old):
+        """A `docker ps` row for a container under its spawning name, created that long ago"""
+        import datetime
+
+        created = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=seconds_old)
+        row = container("cctl-spawning-p")
+        row.CreatedAt = created.strftime("%Y-%m-%d %H:%M:%S +0000 UTC")
+        row.RunningFor = "a while ago"
+        return row
+
+    def test_a_young_spawn_is_a_spawn_doing_its_job_no_warning(self):
+        self.assertEqual(containerctl.spawning_issues([self._spawning(containerctl.SPAWN_WARN_AFTER - 5)]), [])
+
+    def test_past_the_threshold_it_warns_without_claiming_to_know_why(self):
+        rows = [container("cctl-prj-a"), self._spawning(containerctl.SPAWN_WARN_AFTER + 5), container("other")]
+        (issue,) = containerctl.spawning_issues(rows)
+        self.assertEqual((issue.level, issue.cat), (containerctl.WARNING, "project.spawning"))
+        self.assertIn("cctl-spawning-p is still spawning (created a while ago)", issue.msg)
+        self.assertIn("maybe just slow, maybe stuck or dead", issue.msg)
+        self.assertIn("`destroy p` asks, then removes it; or docker rm -f cctl-spawning-p", issue.hint)
+
+    def test_an_age_we_cannot_read_counts_as_old(self):
+        self.assertEqual(len(containerctl.spawning_issues([container("cctl-spawning-p")])), 1)  # no CreatedAt
+
+    def test_container_age_reads_docker_createdat_with_its_timezone(self):
+        row = container("x")
+        row.CreatedAt = "2020-01-01 12:00:00 +0100 CET"
+        self.assertGreater(containerctl.container_age(row), 6 * 365 * 86400)
+        row.CreatedAt = "garbage"
+        self.assertIsNone(containerctl.container_age(row))
 
 
 class MissingDockerTests(unittest.TestCase):
@@ -677,7 +1143,11 @@ class MissingDockerTests(unittest.TestCase):
     def test_missing_binary_is_a_failed_call(self):
         reset_errors()
         missing = FileNotFoundError(2, "No such file or directory", "docker")
-        with mock.patch.object(containerctl.subprocess, "run", side_effect=missing):
+        gone = {"side_effect": missing}  # a listing goes through Popen (see _run_own_group), the rest through run
+        with (
+            mock.patch.object(containerctl.subprocess, "run", **gone),
+            mock.patch.object(containerctl.subprocess, "Popen", **gone),
+        ):
             self.assertEqual(Docker.list_containers().logged(), [])
             self.assertFalse(Docker.start("abc"))
         self.assertEqual({e.cat for e in get_errors()}, {"docker.command"})
@@ -780,7 +1250,7 @@ class ImageBuildTests(unittest.TestCase):
         self.assertEqual(self.rec.calls, [["image", "inspect", "hermes:latest"]])
 
     def test_ensure_image_builds_when_missing_and_recipe_claims_it(self):
-        self.rec.returncode = 1  # inspect fails: absent
+        self.rec.returncode, self.rec.stderr = 1, "Error response from daemon: No such image: x"  # inspect says absent
         calls = []
 
         def build(image):
@@ -789,13 +1259,63 @@ class ImageBuildTests(unittest.TestCase):
 
         with mock.patch.object(Docker, "build_image", side_effect=build), redirect_stdout(io.StringIO()):
             self.assertTrue(Docker.ensure_image("hermes"))
-            self.assertTrue(Docker.ensure_image("ubuntu:24.04"))  # no recipe: docker will pull
+            self.assertFalse(Docker.ensure_image("ubuntu:24.04"))  # no recipe: pulled, and here the pull fails
         self.assertEqual(calls, ["hermes"])
+        self.assertEqual(self.rec.last, ["pull", "ubuntu:24.04"])
+
+    def test_ensure_image_pulls_what_no_recipe_claims_with_its_progress_on_screen(self):
+        captured = []
+
+        def run(args, capture=True, **kwargs):
+            captured.append((args, capture))
+            return subprocess.CompletedProcess(
+                args, 0 if args[0] == "pull" else 1, "", "Error response from daemon: No such image: x"
+            )
+
+        with mock.patch.object(Docker, "_run", run), redirect_stdout(io.StringIO()):
+            self.assertTrue(Docker.ensure_image("ubuntu:24.04"))
+        self.assertEqual(captured[-1], (["pull", "ubuntu:24.04"], False))
+
+    def test_every_listing_gets_its_own_timeout_one_that_hangs_does_not_take_the_others_down(self):
+        def run(args, **kwargs):
+            if args[0] == "images":
+                return subprocess.CompletedProcess(args, 124, "", f"{containerctl.NO_ANSWER} 2s")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch.object(Docker, "_run", run):
+            results = Docker.listings()
+        self.assertEqual(
+            {k: bool(r.failure) for k, r in results.items()}, {**dict.fromkeys(results, False), "images": True}
+        )
+        self.assertEqual(results["images"].failure.msg, "Docker did not answer in time")
+
+    def test_an_ordinary_failure_does_not_stop_the_other_listings(self):
+        self.rec.returncode = 1
+        Docker.listings()
+        self.assertEqual(len(self.rec.calls), 4)
+
+    def test_an_invalid_ref_is_never_pulled(self):
+        for ref in ("--all-tags", "a b", ""):
+            with redirect_stdout(io.StringIO()) as out:
+                self.assertFalse(Docker.ensure_image(ref))  # stops there: image_exists's False would read "absent"
+                self.assertFalse(Docker.pull_image(ref))  # and the pull itself refuses it too
+            self.assertEqual((self.rec.calls, out.getvalue()), ([], ""), ref)
+        self.assertEqual({e.cat for e in get_errors()}, {"docker.invalid_id"})
+
+    def test_inspect_asks_by_type_and_refuses_an_unsafe_ref(self):
+        self.rec.returncode, self.rec.stdout = 0, "[]"
+        self.assertIsNone(Docker.inspect(containerctl.NetworkInspect, "proxy"))
+        self.assertEqual(self.rec.last, ["inspect", "--type", "network", "proxy"])
+        self.assertIsNone(Docker.inspect(containerctl.ContainerInspect, "-x"))
+        self.assertEqual(len(self.rec.calls), 1)
 
     def test_create_containers_ensure_the_image_first(self):
-        self.rec.returncode = 1  # every docker call fails, including `image inspect`
-        with mock.patch.object(Docker, "build_image", return_value=False), redirect_stdout(io.StringIO()):
+        # every docker call fails; `network inspect` and `image inspect` with docker's words for "absent"
+        self.rec.returncode, self.rec.stderr = 1, "Error response from daemon: No such image: x / network x not found"
+        build = mock.patch.object(Docker, "build_image", return_value=False)
+        with build, redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
             self.assertFalse(Docker.create_project_container(ProjectConfig(name="p", image="hermes")))
             self.assertFalse(Docker.create_service_container(ServiceConfig(name="s", image="hermes")))
+        self.assertIn("Error: Failed to ensure network cctl-net-prj-p", err.getvalue())  # a spawn says it at once
         self.assertNotIn("run", [c[0] for c in self.rec.calls])
         self.assertLessEqual({"project.create", "service.create"}, {e.cat for e in get_errors()})

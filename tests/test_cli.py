@@ -2,6 +2,7 @@
 
 import argparse
 import io
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -10,7 +11,7 @@ from unittest import mock
 
 import containerctl
 from containerctl import ProjectConfig, RepoStatus, WorkspaceReport, config_usage, format_table, usage
-from tests.helper import RunRecorder, container, listings, reset_errors
+from tests.helper import PopenRecorder, RunRecorder, container, listings, reset_errors
 
 
 def readme_block(section):
@@ -23,6 +24,18 @@ def readme_block(section):
     block_end = readme.find("```", block_start + 3)
     assert block_end != -1, "README code block should be closed"
     return readme[block_start + 3 : block_end].strip()
+
+
+real_stdin_is_tty = containerctl.stdin_is_tty  # the one the patch below replaces, for the tests about it
+_tty = mock.patch.object(containerctl, "stdin_is_tty", return_value=True)  # tests run with or without a terminal
+
+
+def setUpModule():
+    _tty.start()
+
+
+def tearDownModule():
+    _tty.stop()
 
 
 class UsageTests(unittest.TestCase):
@@ -39,7 +52,7 @@ class UsageTests(unittest.TestCase):
         self.assertIn("service up", out)
 
     def test_readme_help_block_matches_usage(self):
-        """The README '## Help' code block must match usage() output byte-for-byte.
+        """The README '## Help' code block must match `help full` (usage(full=True)) byte-for-byte.
 
         The config-dir lines depend on $HOME, so the dirs are patched to their
         canonical `~` form — the form the README is generated with.
@@ -52,9 +65,20 @@ class UsageTests(unittest.TestCase):
             mock.patch.object(containerctl, "SECRETS_FILE", "~/.config/containerctl/secrets.toml"),
             redirect_stdout(buf),
         ):
-            usage()
+            usage(full=True)
         expected = buf.getvalue().strip()
         self.assertEqual(readme_block("Help"), expected, "README help block drifted from usage() — regenerate it")
+
+    def test_full_help_is_the_short_one_with_the_concepts_ahead_of_the_commands(self):
+        short, full = io.StringIO(), io.StringIO()
+        with redirect_stdout(short):
+            usage()
+        with redirect_stdout(full):
+            usage(full=True)
+        short_lines, full_lines = short.getvalue().splitlines(), full.getvalue().splitlines()
+        self.assertNotIn("Concepts", short_lines)
+        self.assertIn("Concepts", full_lines)
+        self.assertEqual(full_lines, short_lines[:3] + containerctl.CONCEPTS + short_lines[3:])
 
     def test_config_examples_parse_as_valid_configs(self):
         """`help config` is the only place the config shape is documented (the README stays a mirror
@@ -169,9 +193,16 @@ class CliEnterOptionTests(unittest.TestCase):
         self._load.stop()
 
     def _enter(self, options):
-        with mock.patch.object(containerctl.Docker, "enter_project") as enter:
+        with mock.patch.object(containerctl.Docker, "enter_project", return_value=0) as enter:
             containerctl.cli_enter(argparse.Namespace(project="proj", options=options))
         return enter
+
+    def test_exits_with_the_shell_code_and_with_1_when_no_shell_was_entered(self):
+        for returned, code in ((3, 3), (None, 1)):
+            with mock.patch.object(containerctl.Docker, "enter_project", return_value=returned):
+                with self.assertRaises(SystemExit) as ctx:
+                    containerctl.cli_enter(argparse.Namespace(project="proj", options=[]))
+            self.assertEqual(ctx.exception.code, code)
 
     def test_no_options_defaults_user(self):
         self._enter([]).assert_called_once_with(self.project, user=None, workdir=None)
@@ -182,7 +213,7 @@ class CliEnterOptionTests(unittest.TestCase):
     def test_shortcut_resolves_to_project_and_workdir(self):
         project = ProjectConfig(name="proj", image="ubuntu", shortcuts={"lib": "lib/src"})
         with mock.patch.object(containerctl, "load_projects", return_value={"proj": project}):
-            with mock.patch.object(containerctl.Docker, "enter_project") as enter:
+            with mock.patch.object(containerctl.Docker, "enter_project", return_value=0) as enter:
                 containerctl.cli_enter(argparse.Namespace(project="lib", options=["user=root"]))
         enter.assert_called_once_with(project, user="root", workdir="/home/dev/workspace/lib/src")
 
@@ -205,7 +236,7 @@ class CliEnterOptionTests(unittest.TestCase):
 
 
 class CliDestroyTests(unittest.TestCase):
-    """`destroy` runs `check` first and prints a DIRTY verdict as a warning; it never refuses."""
+    """`destroy` runs `check` first, then asks with the verdict in the question; `--force` doesn't ask."""
 
     def setUp(self):
         reset_errors()
@@ -216,36 +247,211 @@ class CliDestroyTests(unittest.TestCase):
     def tearDown(self):
         self._load.stop()
 
-    def _destroy(self, container, report):
-        out, err = io.StringIO(), io.StringIO()
+    def _destroy(self, container, report, force=False, answer=None, leftover=None):
+        """(exit code, check mock, destroy mock, the question asked or None, stdout, stderr); `answer` is what
+        is typed at the question, None when there is no terminal to ask on. `report` may be an exception."""
+        out, err, asked = io.StringIO(), io.StringIO(), []
+
+        def typed(prompt):
+            asked.append(prompt)
+            return answer
+
+        stdin = mock.Mock(isatty=lambda: answer is not None)
+        code = 0
         with (
-            mock.patch.object(containerctl.Docker, "find_project_container", return_value=container),
-            mock.patch.object(containerctl, "project_report", return_value=report) as check,
+            mock.patch.object(containerctl, "stdin_is_tty", real_stdin_is_tty),
+            mock.patch.object(containerctl.Docker, "project_containers", return_value=(container, leftover)),
+            mock.patch.object(containerctl, "project_report", side_effect=[report]) as check,
             mock.patch.object(containerctl.Docker, "destroy_project", return_value=True) as destroy,
+            mock.patch.object(containerctl.sys, "stdin", stdin),
+            mock.patch("builtins.input", typed),
             redirect_stdout(out),
             redirect_stderr(err),
         ):
-            containerctl.cli_destroy(argparse.Namespace(project="demo"))
-        destroy.assert_called_once_with(self.project)
-        return check, out.getvalue(), err.getvalue()
+            try:
+                containerctl.cli_destroy(argparse.Namespace(project="demo", force=force))
+            except SystemExit as e:
+                code = e.code
+        return code, check, destroy, (asked[0] if asked else None), out.getvalue(), err.getvalue()
 
-    def test_dirty_workspace_is_reported_then_destroyed_anyway(self):
-        report = WorkspaceReport(statuses=[RepoStatus(name="app", uncommitted=True)], missing=["lib"])
-        check, out, err = self._destroy(container("cctl-prj-demo"), report)
+    CLEAN = WorkspaceReport(statuses=[RepoStatus(name="app")])
+    DIRTY = WorkspaceReport(statuses=[RepoStatus(name="app", uncommitted=True)], missing=["lib"])
+
+    def test_clean_workspace_is_destroyed_on_a_yes(self):
+        code, check, destroy, asked, out, err = self._destroy(container("cctl-prj-demo"), self.CLEAN, answer="y")
         check.assert_called_once_with(self.project)
+        self.assertEqual(asked, "Destroy cctl-prj-demo? [y/N] ")
+        destroy.assert_called_once_with(self.project, ["cctl-prj-demo"])
+        self.assertEqual((code, out, err), (0, "Destroyed demo\n", ""))
+
+    def test_anything_but_a_yes_destroys_nothing(self):
+        for answer in ("", "n", "maybe"):
+            code, _, destroy, _, _, err = self._destroy(container("cctl-prj-demo"), self.CLEAN, answer=answer)
+            destroy.assert_not_called()
+            self.assertEqual((code, err), (1, "Not destroyed\n"))
+
+    def test_dirty_verdict_is_printed_and_in_the_question(self):
+        code, _, destroy, asked, out, _ = self._destroy(container("cctl-prj-demo"), self.DIRTY, answer="yes")
         self.assertIn("✗ app — uncommitted changes", out)
+        self.assertEqual(asked, "Destroy cctl-prj-demo, though its workspace is DIRTY (app, lib)? [y/N] ")
+        destroy.assert_called_once_with(self.project, ["cctl-prj-demo"])
+        self.assertEqual(code, 0)
+
+    def test_no_terminal_to_ask_on_destroys_nothing_and_points_at_force(self):
+        code, _, destroy, asked, _, err = self._destroy(container("cctl-prj-demo"), self.CLEAN)
+        self.assertIsNone(asked)
+        destroy.assert_not_called()
+        self.assertEqual((code, err), (1, "Not destroyed: no terminal to ask on, use --force\n"))
+
+    def test_a_closed_stdin_is_nobody_to_ask_not_a_crash(self):
+        class Closed:
+            def isatty(self):
+                raise ValueError("I/O operation on closed file")
+
+        for stdin in (None, Closed()):  # `<&-` at startup: no sys.stdin at all; closed later: one that raises
+            with mock.patch.object(containerctl, "stdin_is_tty", real_stdin_is_tty):
+                with mock.patch.object(containerctl.sys, "stdin", stdin):
+                    self.assertFalse(containerctl.stdin_is_tty())
+                    self.assertFalse(containerctl.confirm_cli("Sure?"))
+
+    def test_force_does_not_ask_but_still_says_dirty(self):
+        code, check, destroy, asked, out, err = self._destroy(container("cctl-prj-demo"), self.DIRTY, force=True)
+        check.assert_called_once_with(self.project)
+        self.assertIsNone(asked)
+        destroy.assert_called_once_with(self.project, ["cctl-prj-demo"])
         self.assertIn("Destroyed demo", out)
-        self.assertEqual(err, "warning: demo is DIRTY, destroying anyway (app, lib)\n")
+        self.assertEqual(err, "warning: demo: its workspace is DIRTY (app, lib), destroying anyway (--force)\n")
 
-    def test_clean_workspace_destroys_quietly(self):
-        _, out, err = self._destroy(container("cctl-prj-demo"), WorkspaceReport(statuses=[RepoStatus(name="app")]))
-        self.assertEqual(out, "Destroyed demo\n")
-        self.assertEqual(err, "")
+    def test_force_on_a_clean_workspace_is_quiet(self):
+        code, _, destroy, _, out, err = self._destroy(container("cctl-prj-demo"), self.CLEAN, force=True)
+        destroy.assert_called_once_with(self.project, ["cctl-prj-demo"])
+        self.assertEqual((code, out, err), (0, "Destroyed demo\n", ""))
 
-    def test_no_container_skips_the_check(self):
-        check, _, err = self._destroy(None, WorkspaceReport())
+    def test_a_check_that_could_not_run_is_not_a_clean_verdict(self):
+        call = subprocess.CompletedProcess([], 1, "", "Error response from daemon: container x is not running")
+        failed = containerctl.DockerError(containerctl.docker_failure(["exec"], call))
+        code, _, destroy, asked, _, _ = self._destroy(container("cctl-prj-demo", "exited"), failed, answer="n")
+        self.assertIn("though its workspace could NOT be checked (Container is not running)", asked)
+        destroy.assert_not_called()
+        self.assertEqual(code, 1)
+
+    def test_what_an_unfinished_spawn_left_is_asked_about_too(self):
+        leftover = container("cctl-spawning-demo")
+        leftover.RunningFor = "3 minutes ago"
+        question = "Destroy cctl-spawning-demo (created 3 minutes ago: a spawn still running, or one that died)? [y/N] "
+        code, check, destroy, asked, _, _ = self._destroy(None, self.CLEAN, answer="n", leftover=leftover)
+        check.assert_not_called()  # never entered: no workspace of yours in it
+        self.assertEqual(asked, question)
+        destroy.assert_not_called()
+        self.assertEqual(code, 1)
+        prj = container("cctl-prj-demo")
+        _, _, destroy, asked, _, _ = self._destroy(prj, self.CLEAN, answer="y", leftover=leftover)
+        self.assertEqual(asked, "Destroy cctl-prj-demo and " + question.removeprefix("Destroy "))
+        destroy.assert_called_once_with(self.project, ["cctl-prj-demo", "cctl-spawning-demo"])
+
+    def test_no_container_skips_the_check_and_the_question(self):
+        _, check, destroy, asked, _, _ = self._destroy(None, self.CLEAN)
         check.assert_not_called()
-        self.assertEqual(err, "")
+        self.assertIsNone(asked)
+        destroy.assert_called_once_with(self.project, [])
+
+
+class ExitCodeTests(unittest.TestCase):
+    """What runs in a container hands its exit code to whoever ran containerctl; a failed listing is not an
+    empty one."""
+
+    def setUp(self):
+        reset_errors()
+
+    def _main(self, *argv, returncode=0):
+        """(exit code, the docker argv that ran or None) for one `containerctl <argv>`"""
+        ran = []
+
+        def run(cmd, **kwargs):
+            ran.append(cmd)
+            return subprocess.CompletedProcess(cmd, returncode, "", "")
+
+        with (
+            mock.patch.object(containerctl.sys, "argv", ["containerctl", *argv]),
+            mock.patch.object(containerctl.subprocess, "run", run),
+            mock.patch.object(containerctl.subprocess, "Popen", PopenRecorder(returncode=returncode)),  # listings
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(io.StringIO()),
+        ):
+            try:
+                containerctl.main()
+            except SystemExit as e:
+                return e.code, (ran[0] if ran else None)
+        return 0, (ran[0] if ran else None)
+
+    def test_exec_takes_dashed_arguments_and_returns_the_command_exit_code(self):
+        code, ran = self._main("exec", "abc", "ls", "-la", "--color", returncode=3)
+        self.assertEqual(ran, ["docker", "exec", "-it", "abc", "ls", "-la", "--color"])
+        self.assertEqual(code, 3)
+
+    def test_exec_drops_a_leading_double_dash(self):
+        _, ran = self._main("exec", "abc", "--", "ls", "-la")
+        self.assertEqual(ran, ["docker", "exec", "-it", "abc", "ls", "-la"])
+
+    def test_exec_without_a_command_is_a_usage_error(self):
+        self.assertEqual(self._main("exec", "abc"), (2, None))
+
+    def test_logs_and_shell_return_docker_exit_code(self):
+        self.assertEqual(self._main("logs", "abc", returncode=1)[0], 1)
+        self.assertEqual(self._main("shell", "abc", returncode=130)[0], 130)
+        self.assertEqual(self._main("logs", "abc")[0], 0)
+
+    def test_a_refused_argument_runs_nothing_and_exits_2(self):
+        for argv in (("logs", "bad;name"), ("exec", "-x", "ls"), ("shell", "a b")):
+            self.assertEqual(self._main(*argv), (2, None), argv)
+
+    def test_a_listing_that_failed_exits_1_instead_of_printing_an_empty_table(self):
+        for command in ("ps", "images", "volumes", "networks"):
+            code, _ = self._main(command, returncode=1)
+            self.assertEqual(code, 1, command)
+
+    def test_check_all_gives_a_stopped_container_no_clean_verdict_and_goes_on(self):
+        projects = {name: ProjectConfig(name=name, image="i") for name in ("a", "b")}
+        call = subprocess.CompletedProcess([], 1, "", "Error response from daemon: container x is not running")
+        failed = containerctl.DockerError(containerctl.docker_failure(["exec"], call))
+        out = io.StringIO()
+        with (
+            mock.patch.object(containerctl, "load_projects", return_value=projects),
+            mock.patch.object(containerctl.Docker, "find_project_container", return_value=container("c")),
+            mock.patch.object(containerctl, "project_report", side_effect=[failed, WorkspaceReport()]) as check,
+            redirect_stdout(out),
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                containerctl.cli_check(argparse.Namespace(project=None, all=True))
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertEqual(check.call_count, 2)
+        self.assertIn("could NOT be checked: Container is not running", out.getvalue())
+
+
+class LeaveCleanlyTests(unittest.TestCase):
+    """A closed terminal or a `kill` must leave like any exit does: `finally` blocks run, own-group calls die"""
+
+    def test_hangup_and_term_become_an_exit_and_exit_kills_what_is_in_flight(self):
+        with mock.patch.object(containerctl.signal, "signal") as install:
+            with mock.patch.object(containerctl.atexit, "register") as at_exit:
+                containerctl.leave_cleanly()
+        handlers = {call.args[0]: call.args[1] for call in install.call_args_list}
+        self.assertEqual(set(handlers), {containerctl.signal.SIGHUP, containerctl.signal.SIGTERM})
+        with self.assertRaises(SystemExit) as raised:
+            handlers[containerctl.signal.SIGHUP](containerctl.signal.SIGHUP, None)
+        self.assertEqual(raised.exception.code, 129)
+        at_exit.assert_called_once_with(containerctl.Docker.kill_own_group, leaving=True)
+
+    def test_a_signal_ignored_on_purpose_stays_ignored(self):
+        """`nohup containerctl image build x &`: the terminal closing must not end the build"""
+        sig = containerctl.signal
+        with (
+            mock.patch.object(sig, "getsignal", lambda s: sig.SIG_IGN if s == sig.SIGHUP else sig.SIG_DFL),
+            mock.patch.object(containerctl.signal, "signal") as install,
+            mock.patch.object(containerctl.atexit, "register"),
+        ):
+            containerctl.leave_cleanly()
+        self.assertEqual([call.args[0] for call in install.call_args_list], [containerctl.signal.SIGTERM])
 
 
 class MainReportsErrorsTests(unittest.TestCase):
@@ -271,6 +477,13 @@ class MainReportsErrorsTests(unittest.TestCase):
 
     def test_quiet_run_prints_nothing(self):
         self.assertEqual(self._main(lambda args: None), (0, ""))
+
+    def test_what_was_said_when_it_happened_is_not_said_again_at_the_end(self):
+        def complain(args):
+            containerctl.log_error("project.spawn", "clone failed", echo=True)
+
+        self.assertEqual(self._main(complain), (0, "Error: clone failed\n"))
+        self.assertEqual([e.msg for e in containerctl.get_errors()], ["clone failed"])  # still in the log
 
     def test_what_the_run_logged_is_one_table_on_stderr(self):
         def complain(args):
@@ -524,13 +737,13 @@ class CliImageTests(unittest.TestCase):
                 containerctl.Image("elsewhere" if current is None else f"id{current}", "hermes", "latest", "1MB")
             )
 
-        def inspect(ref):
+        def inspect(cls, ref):
             return mock.Mock(Config={"Labels": {"cctl.recipe": label} if label else {}})
 
         out = io.StringIO()
         with (
             mock.patch.object(containerctl.Docker, "list_images", return_value=containerctl.Listing(rows)),
-            mock.patch.object(containerctl.Docker, "inspect_image", side_effect=inspect) as inspected,
+            mock.patch.object(containerctl.Docker, "inspect", side_effect=inspect) as inspected,
             mock.patch.object(containerctl, "fetch_upstream", side_effect=fetch or (lambda url: None)) as fetched,
             redirect_stdout(out),
         ):

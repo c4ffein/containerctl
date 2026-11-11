@@ -2,13 +2,15 @@
 """
 containerctl - KISS containers CLI/TUI manager
 MIT License - Copyright (c) 2026 c4ffein
-WARNING: I don't recommand using this as-is. This a PoC, and usable by me because I know what I want to do with it.
+WARNING: I don't recommend using this as-is. This is a PoC, and usable by me because I know what I want to do with it.
 - You can use it if you feel that you can edit the code yourself and you can live with my future breaking changes.
 """
 
 import argparse
+import atexit
 import collections
 import dataclasses
+import datetime
 import difflib
 import hashlib
 import json
@@ -30,6 +32,11 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
+
+# Heuristics: guesses, kept here where they are easy to find and change.
+# Seconds a container may stay under its spawning name (see SPAWNING_PREFIX) before the Issues tab warns about it.
+# A spawn is rarely that fast, a dead one is dead at once: past this it is "maybe slow, maybe stuck", never a verdict.
+SPAWN_WARN_AFTER = 10
 
 # =============================================================================
 # Errors (a log) and issues (detected from current state)
@@ -59,6 +66,7 @@ class Event:
     cat: str
     msg: str
     ctx: dict
+    echoed: bool = False  # already said on stderr when it happened: see log_error
 
     @property
     def time(self) -> str:
@@ -96,10 +104,14 @@ _errors: collections.deque[Event] = collections.deque(maxlen=EVENTS_MAX)  # olde
 _errors_lock = threading.Lock()
 
 
-def log_error(category: str, message: str, context: dict | None = None) -> None:
-    """Record a non-fatal error"""
+def log_error(category: str, message: str, context: dict | None = None, echo: bool = False) -> None:
+    """Record a non-fatal error. `echo` also says it on stderr right now, for a flow that has the terminal and a
+    user waiting on it (a spawn): it stays in the log (the TUI's Errors tab), and main's closing summary of a
+    CLI run leaves it out, as already said."""
     with _errors_lock:
-        _errors.append(Event(time.time(), category, message, context or {}))
+        _errors.append(Event(time.time(), category, message, context or {}, echoed=echo))
+    if echo:
+        print(f"Error: {message}", file=sys.stderr)
 
 
 def get_errors() -> list[Event]:
@@ -134,18 +146,25 @@ VALID_PORT_PROTOCOLS = {"tcp", "udp"}
 
 
 def is_valid_id(id_str: str) -> bool:
-    """Check if ID contains only valid characters (a-z, A-Z, 0-9, -, _)"""
-    return all(c in VALID_ID_CHARS for c in id_str)
+    """A name we hand to docker (container, volume, network, user, ...): a-z A-Z 0-9 - _ and, as docker allows
+    them in names, dots. Never empty, and never starting with `-` (docker would read an option) or `.`"""
+    return bool(id_str) and id_str[0] not in "-." and all(c in VALID_ID_CHARS or c == "." for c in id_str)
 
 
 def is_valid_image_ref(ref_str: str) -> bool:
-    """Check if image reference contains only valid characters (allows /, :, . for repo:tag)"""
-    return all(c in VALID_IMAGE_REF_CHARS for c in ref_str)
+    """Check if image reference contains only valid characters (allows /, :, . for repo:tag); like is_valid_id,
+    never empty and never starting with `-` or `.`"""
+    return bool(ref_str) and ref_str[0] not in "-." and all(c in VALID_IMAGE_REF_CHARS for c in ref_str)
 
 
 def has_path_traversal(path_str: str) -> bool:
     """Check if a path contains '..' components"""
     return ".." in path_str.split("/")
+
+
+def is_valid_home(path_str: str) -> bool:
+    """A project's `home`: an absolute path inside the container, safe as an argv word, a `-w` and a path"""
+    return path_str.startswith("/") and path_str.rstrip("/") != "" and is_valid_path(path_str)
 
 
 def is_valid_path(path_str: str) -> bool:
@@ -216,13 +235,14 @@ class Row:
     """A row of a docker listing: a dataclass, deserialized as one, whose KEY field (what we hand back to docker
     to name it) must be a safe identifier"""
 
-    KEY = "ID"  # not annotated: a class attribute, not a field
+    KEY = "ID"  # not annotated: class attributes, not fields
+    VALID = staticmethod(is_valid_id)
 
     @classmethod
     def from_dict(cls, data):
         """A row of the listing; ValueError when it is not one we can use"""
         row = deserialize(cls, data)
-        if not is_valid_id(getattr(row, cls.KEY)):
+        if not cls.VALID(getattr(row, cls.KEY)):
             raise ValueError(f"Invalid {cls.KEY}: {getattr(row, cls.KEY)}")
         return row
 
@@ -303,6 +323,23 @@ class Network(Row):
     Labels: str = ""
 
 
+# A docker call that only asks a question (a listing, an inspect) gets a few seconds to answer: a daemon that hangs
+# then reads as a failed call, which every caller already reports, instead of freezing whoever asked. Three budgets:
+# - QUERY_TIMEOUT: the default, for a question somebody asked (a CLI command, a key in the TUI). These answer in
+#   well under a second on a daemon that is fine; the margin is for a loaded host.
+# - POLL_TIMEOUT: the TUI's background fetch, every 2s. Short: a listing that missed its turn is asked again on the
+#   next one. A listing slower than this shows as a failed one, its tab empty until one makes it. That should not
+#   happen (they answer in milliseconds), and is not a flaw to design around here: if it does, will fix then.
+# - SIZE_TIMEOUT: `docker ps` with sizes walks every container's filesystem: over ten seconds is its normal.
+# Calls that do something (run, pull, build, stop, clone over exec) take the time they take: no timeout there,
+# Ctrl-C is the way out (see main, App.handle_key).
+QUERY_TIMEOUT = 6
+POLL_TIMEOUT = 1
+SIZE_TIMEOUT = 60
+TIMED_OUT = 124  # exit code _run gives a call that timed out (as timeout(1) does)
+NO_ANSWER = "containerctl: no answer after"  # what _run puts on stderr for a call that timed out
+
+
 # What a failed docker call says on stderr (lowercased substring) -> what we say, and what to do about it. First
 # match wins: the socket's "permission denied" also mentions connecting to the daemon. Anything else shows as
 # UNKNOWN_DOCKER_FAILURE with the raw stderr in the issue's details: read it there, then add its line here.
@@ -310,8 +347,18 @@ DOCKER_FAILURES = [
     ("command not found", "docker is not installed", "install docker, or fix PATH"),
     ("permission denied", "No permission on the docker socket", "add yourself to the docker group"),
     ("cannot connect to the docker daemon", "Docker daemon is not running", "start docker"),
+    ("is not running", "Container is not running", "start it, then try again"),
+    (NO_ANSWER, "Docker did not answer in time", "is the daemon hung? look at `systemctl status docker`"),
 ]
 UNKNOWN_DOCKER_FAILURE = ("Unknown docker failure", "its details have what docker said")
+# `docker exec` also hands over the stderr of what it ran, and an `ls: Permission denied` in there is not the
+# socket's. What docker itself says (client or daemon; lowercased substrings), when the call is an exec: anything
+# else is the command's own, and docker_failure says it as that (see `inside`).
+DOCKER_VOICE = ("error response from daemon", "docker daemon", "docker: command not found", NO_ANSWER)
+# How docker says "there is no such thing" (lowercased substrings: "No such image: x", "network x not found"), the
+# one failure of a "does it exist?" call that is an answer: see Docker._absent. A wording missing here is not read
+# as "absent" but as an unknown failure, raw stderr in its details: add it then.
+NO_SUCH = ("no such", "not found")
 
 
 @dataclass(frozen=True)
@@ -323,10 +370,15 @@ class Failure:
     detail: str
 
 
-def docker_failure(args: list[str], result: subprocess.CompletedProcess) -> Failure:
+def docker_failure(args: list[str], result: subprocess.CompletedProcess, inside: str = "") -> Failure:
+    """Our words for a failed docker call. `inside` names the command an exec ran in the container: unless the
+    stderr is docker's own voice, the failure is that command's, and is said as such."""
     stderr = (result.stderr or "").strip()
     detail = f"docker {' '.join(args)}" + (f": {stderr}" if stderr else f": exit code {result.returncode}")
     text = stderr.lower()
+    if inside and not any(voice.lower() in text for voice in DOCKER_VOICE):
+        said = stderr.splitlines()[0] if stderr else f"exit code {result.returncode}"
+        return Failure(f"`{inside}` failed in the container: {said}", "its details have all it said", detail)
     msg, hint = next(((m, h) for needle, m, h in DOCKER_FAILURES if needle in text), UNKNOWN_DOCKER_FAILURE)
     return Failure(msg, hint, detail)
 
@@ -374,9 +426,30 @@ LISTINGS = ("containers", "images", "volumes", "networks")  # the four docker li
 # =============================================================================
 
 
+class Inspected(Row):
+    """What `docker inspect` says of one object: a Row (a dataclass whose KEY field must pass VALID), of which
+    there is one, not a listing. So one we can't use is not skipped but None, after logging under CAT.
+    Docker.inspect fetches one: `Docker.inspect(NetworkInspect, name)`."""
+
+    KEY = "Id"
+    TYPE = ""  # what `docker inspect --type` calls it
+    CAT = ""
+
+    @classmethod
+    def from_dict(cls, data):
+        try:
+            return super().from_dict(data)
+        except ValueError as e:
+            log_error(cls.CAT, str(e), {"data": str(data)[:200]})
+            return None
+
+
 @dataclass
-class ContainerInspect:
+class ContainerInspect(Inspected):
     """Docker container inspect data model (from docker inspect)"""
+
+    TYPE = "container"
+    CAT = "docker.container_inspect_parse"
 
     Id: str
     Name: str
@@ -385,7 +458,7 @@ class ContainerInspect:
     Image: str
     Config: dict
     Path: str = ""
-    Args: list = field(default_factory=list)
+    Args: list | None = field(default_factory=list)
     ResolvConfPath: str = ""
     HostnamePath: str = ""
     HostsPath: str = ""
@@ -397,27 +470,10 @@ class ContainerInspect:
     ProcessLabel: str = ""
     AppArmorProfile: str = ""
     ExecIDs: list | None = None
-    HostConfig: dict = field(default_factory=dict)
-    GraphDriver: dict = field(default_factory=dict)
-    Mounts: list = field(default_factory=list)
-    NetworkSettings: dict = field(default_factory=dict)
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "ContainerInspect | None":
-        """Create ContainerInspect from dict, logging errors for missing required fields"""
-        required = ["Id", "Name", "Created", "State", "Image", "Config"]
-        missing = [f for f in required if f not in data]
-        if missing:
-            log_error("docker.container_inspect_parse", f"Missing fields: {missing}", {"data": str(data)[:200]})
-            return None
-        if not is_valid_id(data["Id"]):
-            log_error("docker.container_inspect_parse", f"Invalid Id: {data['Id']}", {"data": str(data)[:200]})
-            return None
-        try:
-            return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
-        except TypeError as e:
-            log_error("docker.container_inspect_parse", str(e), {"data": str(data)[:200]})
-            return None
+    HostConfig: dict | None = field(default_factory=dict)
+    GraphDriver: dict | None = field(default_factory=dict)
+    Mounts: list | None = field(default_factory=list)
+    NetworkSettings: dict | None = field(default_factory=dict)
 
     @property
     def labels(self) -> dict:
@@ -431,46 +487,37 @@ class ContainerInspect:
 
 
 @dataclass
-class ImageInspect:
+class ImageInspect(Inspected):
     """Docker image inspect data model (from docker image inspect)"""
+
+    TYPE = "image"
+    CAT = "docker.image_inspect_parse"
+    VALID = staticmethod(is_valid_image_ref)  # sha256:<digest>
 
     Id: str
     Created: str
     Architecture: str
     Os: str
     Size: int
-    RepoTags: list = field(default_factory=list)
-    RepoDigests: list = field(default_factory=list)
+    RepoTags: list | None = field(default_factory=list)
+    RepoDigests: list | None = field(default_factory=list)
     Parent: str = ""
     Comment: str = ""
     DockerVersion: str = ""
     Author: str = ""
-    Config: dict = field(default_factory=dict)
-    GraphDriver: dict = field(default_factory=dict)
-    RootFS: dict = field(default_factory=dict)
-    Metadata: dict = field(default_factory=dict)
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "ImageInspect | None":
-        """Create ImageInspect from dict, logging errors for missing required fields"""
-        required = ["Id", "Created", "Architecture", "Os", "Size"]
-        missing = [f for f in required if f not in data]
-        if missing:
-            log_error("docker.image_inspect_parse", f"Missing fields: {missing}", {"data": str(data)[:200]})
-            return None
-        if not is_valid_image_ref(data["Id"]):
-            log_error("docker.image_inspect_parse", f"Invalid Id: {data['Id']}", {"data": str(data)[:200]})
-            return None
-        try:
-            return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
-        except TypeError as e:
-            log_error("docker.image_inspect_parse", str(e), {"data": str(data)[:200]})
-            return None
+    Config: dict | None = field(default_factory=dict)
+    GraphDriver: dict | None = field(default_factory=dict)
+    RootFS: dict | None = field(default_factory=dict)
+    Metadata: dict | None = field(default_factory=dict)
 
 
 @dataclass
-class VolumeInspect:
+class VolumeInspect(Inspected):
     """Docker volume inspect data model (from docker volume inspect)"""
+
+    KEY = "Name"
+    TYPE = "volume"
+    CAT = "docker.volume_inspect_parse"
 
     Name: str
     Driver: str
@@ -480,27 +527,13 @@ class VolumeInspect:
     Labels: dict | None = None
     Options: dict | None = None
 
-    @classmethod
-    def from_dict(cls, data: dict) -> "VolumeInspect | None":
-        """Create VolumeInspect from dict, logging errors for missing required fields"""
-        required = ["Name", "Driver", "Mountpoint", "Scope"]
-        missing = [f for f in required if f not in data]
-        if missing:
-            log_error("docker.volume_inspect_parse", f"Missing fields: {missing}", {"data": str(data)[:200]})
-            return None
-        if not is_valid_id(data["Name"]):
-            log_error("docker.volume_inspect_parse", f"Invalid Name: {data['Name']}", {"data": str(data)[:200]})
-            return None
-        try:
-            return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
-        except TypeError as e:
-            log_error("docker.volume_inspect_parse", str(e), {"data": str(data)[:200]})
-            return None
-
 
 @dataclass
-class NetworkInspect:
+class NetworkInspect(Inspected):
     """Docker network inspect data model (from docker network inspect)"""
+
+    TYPE = "network"
+    CAT = "docker.network_inspect_parse"
 
     Id: str
     Name: str
@@ -509,32 +542,15 @@ class NetworkInspect:
     Driver: str
     EnableIPv4: bool = True
     EnableIPv6: bool = False
-    IPAM: dict = field(default_factory=dict)
+    IPAM: dict | None = field(default_factory=dict)
     Internal: bool = False
     Attachable: bool = False
     Ingress: bool = False
-    ConfigFrom: dict = field(default_factory=dict)
+    ConfigFrom: dict | None = field(default_factory=dict)
     ConfigOnly: bool = False
-    Containers: dict = field(default_factory=dict)
-    Options: dict = field(default_factory=dict)
-    Labels: dict = field(default_factory=dict)
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "NetworkInspect | None":
-        """Create NetworkInspect from dict, logging errors for missing required fields"""
-        required = ["Id", "Name", "Created", "Scope", "Driver"]
-        missing = [f for f in required if f not in data]
-        if missing:
-            log_error("docker.network_inspect_parse", f"Missing fields: {missing}", {"data": str(data)[:200]})
-            return None
-        if not is_valid_id(data["Id"]):
-            log_error("docker.network_inspect_parse", f"Invalid Id: {data['Id']}", {"data": str(data)[:200]})
-            return None
-        try:
-            return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
-        except TypeError as e:
-            log_error("docker.network_inspect_parse", str(e), {"data": str(data)[:200]})
-            return None
+    Containers: dict | None = field(default_factory=dict)
+    Options: dict | None = field(default_factory=dict)
+    Labels: dict | None = field(default_factory=dict)
 
 
 # =============================================================================
@@ -547,14 +563,21 @@ SERVICES_DIR = CONFIG_DIR / "services"
 IMAGES_DIR = CONFIG_DIR / "images"  # <name>.toml + <name>.Dockerfile [+ <name>/ build context]
 SECRETS_FILE = CONFIG_DIR / "secrets.toml"  # flat `key = "value"`, 0600, never versioned; [secrets] picks keys from it
 
-# Paths *inside* a spawned container (the dev user's home is /home/dev — see spawn_project).
+# Who a spawned container is for, and that user's home *inside* it, unless the project says otherwise (`user`,
+# `home`: see ProjectConfig). Everything spawn puts in goes under that home, owned by that user.
+# Nothing we run in a project container is left to the image's default `USER`: it runs as the project's user (the
+# clones, the checks, the `enter` shell), or as ROOT for the one thing that takes root: handing over what
+# `docker cp` wrote (it always writes as root). So an image whose USER is root, or anyone, works the same.
+CONTAINER_USER = "dev"
+ROOT = "root"
 CONTAINER_HOME = "/home/dev"
-CONTAINER_WORKSPACE = f"{CONTAINER_HOME}/workspace"
-CONTAINER_BIN = f"{CONTAINER_HOME}/.local/bin"
-CONTAINER_SELF = f"{CONTAINER_BIN}/containerctl"
-CONTAINER_MANIFEST = f"{CONTAINER_HOME}/.config/containerctl/expected.json"
 
 CONTAINER_PREFIX = "cctl-prj-"
+# A project container is made under this prefix and only renamed to cctl-prj-<name> once everything is in it
+# (key, clones, env files). The name is the state: whatever ended a spawn halfway (Ctrl-C, a closed terminal, a
+# crash, the power), what it left is not a project container, so `enter` never attaches to half a workspace. It
+# was never entered either, so it holds nothing of yours: the next spawn asks, removes it and starts over.
+SPAWNING_PREFIX = "cctl-spawning-"
 SERVICE_PREFIX = "cctl-svc-"
 NETWORK_PREFIX = "cctl-net-prj-"  # one per project; mirrors CONTAINER_PREFIX
 LABEL_PROJECT = "cctl.project"
@@ -640,7 +663,7 @@ class RepoSpec:
     """A single git repo to clone into a project's workspace"""
 
     url: str
-    dir: str = ""  # subdirectory under /home/dev/workspace; derived from url when empty
+    dir: str = ""  # subdirectory under the workspace; derived from url when empty
     branch: str = ""
 
     @property
@@ -663,10 +686,22 @@ class ProjectConfig:
     shortcuts: dict[str, str] = field(default_factory=dict)  # alias -> dir relative to the workspace
     env: dict[str, str] = field(default_factory=dict)  # [env]: plain values for the `enter` shell's environment
     secrets: dict[str, str] = field(default_factory=dict)  # [secrets]: env name -> key in secrets.toml
+    user: str = CONTAINER_USER  # the image's user: owns what spawn puts in, runs the clones, checks and shell
+    home: str = CONTAINER_HOME  # that user's home in the image: /home/<user> (/root for root) unless said
+
+    @property
+    def workspace(self) -> str:
+        """Where the repos are cloned, inside the container"""
+        return f"{self.home}/workspace"
 
     @property
     def container_name(self) -> str:
         return f"{CONTAINER_PREFIX}{self.name}"
+
+    @property
+    def spawning_name(self) -> str:
+        """Its container's name for as long as the spawn is not done: see SPAWNING_PREFIX"""
+        return f"{SPAWNING_PREFIX}{self.name}"
 
     @property
     def repos_display(self) -> str:
@@ -688,7 +723,9 @@ class ProjectConfig:
 
         name = path.stem
         if not is_valid_id(name):
-            raise ConfigError("project.config", f"Invalid project name '{name}': must be a-zA-Z0-9-_")
+            raise ConfigError(
+                "project.config", f"Invalid project name '{name}': must be a-zA-Z0-9-_. (not starting with - or .)"
+            )
 
         image = data.get("image", "")
         if not image:
@@ -765,6 +802,16 @@ class ProjectConfig:
         if both := sorted(set(env) & set(secrets)):
             raise ConfigError("project.config", f"Names in both [env] and [secrets] in {path}: {', '.join(both)}")
 
+        # Who the image is built for, whatever its default USER: all we do in it is done as this user (see
+        # CONTAINER_USER). To enter as someone else once: `enter <project> user=<user>`. Spawn fails on an image
+        # that doesn't have this user and this home.
+        user = data.get("user", CONTAINER_USER)
+        if not isinstance(user, str) or not is_valid_id(user):
+            raise ConfigError("project.config", f"Invalid user '{user}' in {path}")
+        home = data.get("home", "/root" if user == "root" else f"/home/{user}")
+        if not isinstance(home, str) or not is_valid_home(home):
+            raise ConfigError("project.config", f"Invalid home '{home}' (an absolute path) in {path}")
+
         return cls(
             name=name,
             image=image,
@@ -774,6 +821,8 @@ class ProjectConfig:
             shortcuts=shortcuts,
             env=env,
             secrets=secrets,
+            user=user,
+            home=home.rstrip("/"),
         )
 
 
@@ -815,7 +864,7 @@ def resolve_enter_target(name: str, projects: dict[str, ProjectConfig]) -> tuple
     if len(hits) != 1:
         return None
     project, rel_dir = hits[0]
-    return project, f"{CONTAINER_WORKSPACE}/{rel_dir}"
+    return project, f"{project.workspace}/{rel_dir}"
 
 
 # =============================================================================
@@ -877,6 +926,14 @@ def is_valid_tmpfs_spec(spec_str: str) -> bool:
     return not options or all(c in VALID_TMPFS_OPTION_CHARS for c in options)
 
 
+# What services still want before they run for months on a server (one line each; drop the line when done):
+# TODO(services): log limits: `--log-opt max-size/max-file`; json-file grows until the disk is full
+# TODO(services): drift: an issue when a running container no longer matches its TOML (label a config hash at run)
+# TODO(services): secrets: `env` values sit in argv and `docker inspect`; give services a [secrets] like projects
+# TODO(services): limits and health: memory / cpus, healthcheck, `--user`, `--security-opt no-new-privileges`
+# TODO(services): updates: say when a pulled image is behind its tag; `recreate` is downtime with no way back
+
+
 @dataclass
 class ServiceConfig:
     """Service configuration loaded from TOML"""
@@ -912,7 +969,9 @@ class ServiceConfig:
 
         name = path.stem
         if not is_valid_id(name):
-            raise ConfigError("service.config", f"Invalid service name '{name}': must be a-zA-Z0-9-_")
+            raise ConfigError(
+                "service.config", f"Invalid service name '{name}': must be a-zA-Z0-9-_. (not starting with - or .)"
+            )
 
         image = data.get("image", "")
         if not image:
@@ -1104,7 +1163,9 @@ class ImageConfig:
             raise ConfigError("image.config", f"Failed to load {path}: {e}") from None
         name = path.stem
         if not is_valid_id(name):
-            raise ConfigError("image.config", f"Invalid image name '{name}': must be a-zA-Z0-9-_")
+            raise ConfigError(
+                "image.config", f"Invalid image name '{name}': must be a-zA-Z0-9-_. (not starting with - or .)"
+            )
         tag = data.get("tag", "")
         if not isinstance(tag, str) or (tag and (not is_valid_image_ref(tag) or "@" in tag)):
             raise ConfigError("image.config", f"Invalid tag '{tag}' in {path}: name[:tag], no digest")
@@ -1242,6 +1303,44 @@ def orphan_issues(names: list[str], projects: set[str], services: set[str]) -> l
     return issues
 
 
+def leftover_note(container: Container) -> str:
+    """What a question says of a container still under its spawning name, before removing it"""
+    return f"{container.Names} ({created_ago(container)}: a spawn still running, or one that died)"
+
+
+def created_ago(container: Container) -> str:
+    """ "created 3 minutes ago", in docker's own words (`RunningFor` is the time since creation, running or not)"""
+    return f"created {container.RunningFor}" if container.RunningFor else "created at an unknown time"
+
+
+def container_age(container: Container) -> float | None:
+    """Seconds since the container was created, from `docker ps`'s CreatedAt ("2026-11-11 12:27:03 +0100 CET");
+    None when that is not a date we can read"""
+    try:
+        created = datetime.datetime.strptime(" ".join(container.CreatedAt.split()[:3]), "%Y-%m-%d %H:%M:%S %z")
+    except ValueError:
+        return None
+    return (datetime.datetime.now(datetime.timezone.utc) - created).total_seconds()
+
+
+def spawning_issues(containers: list[Container]) -> list[Issue]:
+    """Containers still under their spawning name after SPAWN_WARN_AFTER seconds: a spawn that takes its time in
+    another terminal (a big clone), one that is stuck, or one that died. Nothing here can tell which, and the
+    message says so. Younger ones are a spawn doing its job: no warning. An age we can't read counts as old."""
+    issues = []
+    for c in containers:
+        if not c.Names.startswith(SPAWNING_PREFIX):
+            continue
+        age = container_age(c)
+        if age is not None and age < SPAWN_WARN_AFTER:
+            continue
+        msg = f"Container {c.Names} is still spawning ({created_ago(c)}): maybe just slow, maybe stuck or dead"
+        project = c.Names.removeprefix(SPAWNING_PREFIX)
+        hint = f"no spawn of it running? `destroy {project}` asks, then removes it; or docker rm -f {c.Names}"
+        issues.append(Issue(WARNING, "project.spawning", msg, hint))
+    return issues
+
+
 def detect_issues(
     projects: dict[str, ProjectConfig],
     services: dict[str, "ServiceConfig"],
@@ -1264,7 +1363,8 @@ def detect_issues(
             if issue := image_version_issue(name, image, versions, current):
                 issues.append(issue)
     if not listings["containers"].failure:
-        issues += orphan_issues([c.Names for c in listings["containers"].rows], set(projects), set(services))
+        rows = listings["containers"].rows
+        issues += orphan_issues([c.Names for c in rows], set(projects), set(services)) + spawning_issues(rows)
     return issues
 
 
@@ -1291,24 +1391,27 @@ class RepoStatus:
     name: str
     is_git: bool = True
     uncommitted: bool = False  # staged or modified tracked files
-    untracked: bool = False  # files git doesn't know about
+    untracked: bool = False  # files git doesn't know about (ignored ones don't count: they said they can go)
     detached: bool = False  # HEAD not on a branch
-    has_upstream: bool = True  # branch tracks a remote (else we can't prove it's pushed)
-    ahead: int = 0  # commits present locally but not on the upstream
+    unpushed: list[str] = field(default_factory=list)  # one line per local branch not provably on its remote
+    tagged: int = 0  # commits reachable from a tag and from no remote ref
     stashes: int = 0
+    worktrees: list[str] = field(default_factory=list)  # linked worktrees, by path: work may sit in each
+    unknown: list[str] = field(default_factory=list)  # the git calls that failed: what they'd have said, nobody knows
+    # Each checked-out submodule, at any depth, by path: a repo of its own, with its own branches, stashes and
+    # remote. The superproject's `status` only says whether it sits on the recorded commit, not whether that
+    # commit, or anything else in there, is on the submodule's remote.
+    submodules: list["RepoStatus"] = field(default_factory=list)
+    head_unpushed: int = 0  # of a submodule: commits on its HEAD and on none of its remote's refs
+    # Whether this repo keeps the remote's tags apart from its own (see UPSTREAM_TAGS). Asked only when a count
+    # above depends on it: without, a tag the remote has counts like one made here, and the line says how to tell.
+    tags_mirrored: bool = True
+    head_under_tag: bool = False  # no mirror, and some of `head_unpushed` sit under a tag: maybe the remote's
 
     @property
     def clean(self) -> bool:
-        """A repo is clean only if everything is committed *and* verifiably pushed."""
-        return (
-            self.is_git
-            and not self.uncommitted
-            and not self.untracked
-            and not self.detached
-            and self.has_upstream
-            and self.ahead == 0
-            and self.stashes == 0
-        )
+        """A repo is clean only if everything is committed *and* verifiably pushed, on every branch."""
+        return not self.problems()
 
     def problems(self) -> list[str]:
         """Human-readable reasons this dir is not clean (empty when clean)."""
@@ -1321,12 +1424,18 @@ class RepoStatus:
             out.append("untracked files")
         if self.detached:
             out.append("detached HEAD")
-        if not self.has_upstream:
-            out.append("no upstream branch")
-        elif self.ahead:
-            out.append(f"{self.ahead} unpushed commit{'s' if self.ahead != 1 else ''}")
+        out += self.unpushed
+        if self.tagged:
+            theirs = "" if self.tags_mirrored else MAYBE_THE_REMOTES
+            out.append(f"{self.tagged} unpushed commit{'s' if self.tagged != 1 else ''} held by tags only{theirs}")
         if self.stashes:
             out.append(f"{self.stashes} stash{'es' if self.stashes != 1 else ''}")
+        if self.head_unpushed:
+            theirs = MAYBE_THE_REMOTES if self.head_under_tag else ""
+            out.append(f"{self.head_unpushed} unpushed commit{'s' if self.head_unpushed != 1 else ''} on HEAD{theirs}")
+        out += [f"linked worktree {path}" for path in self.worktrees]
+        out += [f"`git {what}` failed, could not check" for what in self.unknown]
+        out += [f"submodule {sub.name}: {problem}" for sub in self.submodules for problem in sub.problems()]
         return out
 
 
@@ -1337,62 +1446,169 @@ class WorkspaceReport:
     statuses: list[RepoStatus] = field(default_factory=list)
     extra: list[str] = field(default_factory=list)  # dirs present but not in the config
     missing: list[str] = field(default_factory=list)  # dirs in the config but absent
+    loose: list[str] = field(default_factory=list)  # what sits in the workspace and is not a dir: in no repo
+    changed: list[str] = field(default_factory=list)  # those of `loose` we injected, no longer as the host has them
 
     @property
     def clean(self) -> bool:
-        return all(s.clean for s in self.statuses) and not self.extra and not self.missing
+        return all(s.clean for s in self.statuses) and not self.extra and not self.missing and not self.loose
 
     @property
     def dirty(self) -> list[str]:
-        """The dir names behind a DIRTY verdict: unclean or unconfigured dirs, then configured-but-absent ones"""
-        return [s.name for s in self.statuses if not s.clean or s.name in self.extra] + list(self.missing)
+        """The names behind a DIRTY verdict: unclean or unconfigured dirs, loose files, then configured-but-absent"""
+        dirs = [s.name for s in self.statuses if not s.clean or s.name in self.extra]
+        return dirs + list(self.loose) + list(self.missing)
 
 
-def inspect_repo(name: str, run_git: Callable[[str, list[str]], tuple[int, str]]) -> RepoStatus:
-    """Build a RepoStatus for one workspace directory using an injected git runner."""
+# One line per local branch: name, upstream ref, how it stands against it ("[ahead 2]", "[gone]", "" when level).
+# Tab-separated (%09): a ref name holds neither tabs nor spaces.
+BRANCH_FORMAT = "--format=%(refname:short)%09%(upstream)%09%(upstream:track)"
+
+# Where spawn's clone (and every fetch after it) mirrors the remote's tags: the remote-tracking refs git has for
+# branches and not for tags. Outside refs/remotes, so `git branch -r` doesn't list them. See inspect_repo.
+UPSTREAM_TAGS = "refs/upstream-tags"
+MIRROR_REFSPEC = f"+refs/tags/*:{UPSTREAM_TAGS}/*"
+CLONE_MIRRORS_TAGS = ["-c", f"remote.origin.fetch={MIRROR_REFSPEC}"]  # `git clone` takes it as is
+# A repo without the mirror (a submodule, a clone made by hand or by an older spawn): said after a count that may
+# then hold the remote's own tagged commits, with what settles it, in that repo, for this fetch and the next ones
+MAYBE_THE_REMOTES = (
+    f" (or the remote's own tags: `git config --add remote.origin.fetch '{MIRROR_REFSPEC}' && git fetch` tells)"
+)
+
+
+def unpushed_branches(listing: str) -> list[str]:
+    """From `git for-each-ref BRANCH_FORMAT refs/heads`: a line for each branch whose commits are not provably
+    on a remote. Every local branch counts, not just the one checked out: they all die with the container.
+    (Against the remote-tracking refs as they are: no fetch, a check never talks to the network.)"""
+    out = []
+    for line in listing.splitlines():
+        branch, _, rest = line.partition("\t")
+        upstream, _, track = rest.partition("\t")
+        if not branch:
+            continue
+        if not upstream:
+            out.append(f"branch {branch}: no upstream")
+        elif not upstream.startswith("refs/remotes/"):  # tracking another local branch proves nothing is pushed
+            out.append(f"branch {branch}: upstream {upstream.removeprefix('refs/heads/')} is local, not a remote")
+        elif "gone" in track:
+            out.append(f"branch {branch}: upstream is gone")
+        elif "ahead" in track:
+            count = track.split("ahead", 1)[1].split(",")[0].strip(" ]")  # "[ahead 2, behind 1]" -> "2"
+            out.append(f"branch {branch}: {count} unpushed commit{'s' if count != '1' else ''}")
+    return out
+
+
+# Prints the path of every checked-out submodule, nested ones included, relative to the repo it is asked in. Git
+# runs the quoted part with sh, once per submodule; one that was never initialized holds nothing and is not listed.
+LIST_SUBMODULES = ["submodule", "foreach", "--quiet", "--recursive", 'echo "$displaypath"']
+
+
+def inspect_repo(name: str, run_git: Callable[[str, list[str]], tuple[int, str]], submodule_of: str = "") -> RepoStatus:
+    """Build a RepoStatus for one workspace directory using an injected git runner. A git call that fails is not
+    read as "nothing to report": it lands in `unknown`, and the dir is not clean.
+
+    Its submodules get the same inspection, each as the repo it is (`submodule_of` is then the workspace dir it
+    was found in, `name` its path there), with one difference: a detached HEAD is where git leaves a submodule,
+    so what is asked instead is whether the commit it sits on is on its remote."""
     status = RepoStatus(name=name)
+    name = f"{submodule_of}/{name}" if submodule_of else name  # where git runs; status.name is what gets shown
 
     rc, _ = run_git(name, ["rev-parse", "--git-dir"])
     if rc != 0:
         status.is_git = False
         return status
 
-    _, porcelain = run_git(name, ["status", "--porcelain"])
-    lines = [ln for ln in porcelain.splitlines() if ln.strip()]
-    status.untracked = any(ln.startswith("??") for ln in lines)
-    status.uncommitted = any(not ln.startswith("??") for ln in lines)
+    def ask(args: list[str]) -> str | None:
+        rc, out = run_git(name, args)
+        if rc != 0:
+            status.unknown.append(args[0])
+            return None
+        return out
 
-    rc, _ = run_git(name, ["symbolic-ref", "-q", "HEAD"])
-    status.detached = rc != 0
+    # --untracked-files: said here, so a `status.showUntrackedFiles = no` in some gitconfig can't hide them
+    if (porcelain := ask(["status", "--porcelain", "--untracked-files=normal"])) is not None:
+        lines = [ln for ln in porcelain.splitlines() if ln.strip()]
+        status.untracked = any(ln.startswith("??") for ln in lines)
+        status.uncommitted = any(not ln.startswith("??") for ln in lines)
 
-    rc, ahead = run_git(name, ["rev-list", "--count", "@{u}..HEAD"])
-    if rc != 0:
-        status.has_upstream = False
+    def count(args: list[str]) -> int:
+        """What a `rev-list --count` says; 0 and a line in `unknown` when it is not a count: not an answer"""
+        if (out := ask(args)) is None:
+            return 0
+        if not out.strip().isdigit():
+            status.unknown.append(args[0])
+            return 0
+        return int(out.strip())
+
+    upstream_tags = f"--glob={UPSTREAM_TAGS}/*"
+    if submodule_of:
+        status.head_unpushed = count(["rev-list", "--count", "HEAD", "--not", "--remotes", upstream_tags])
     else:
-        try:
-            status.ahead = int(ahead.strip() or "0")
-        except ValueError:
-            status.ahead = 0
+        rc, _ = run_git(name, ["symbolic-ref", "-q", "HEAD"])
+        status.detached = rc != 0
 
-    _, stash = run_git(name, ["stash", "list"])
-    status.stashes = len([ln for ln in stash.splitlines() if ln.strip()])
+    if (branches := ask(["for-each-ref", BRANCH_FORMAT, "refs/heads"])) is not None:
+        status.unpushed = unpushed_branches(branches)
+
+    # Commits only a tag holds on to (tagged on a detached HEAD, then moved on): on no branch, so not seen above.
+    # A tag on a pushed commit is not looked at: whether the tag itself was pushed, only the network knows.
+    # Git keeps no word of where a tag came from, so spawn's clone mirrors the remote's own (UPSTREAM_TAGS): what
+    # those hold is on the remote, whatever branch it is on or off. A repo without the mirror (a submodule, one
+    # cloned by hand or by an older spawn) counts every tag off the remote branches: more DIRTY than it should be,
+    # never less. So when a count is not zero, ask whether the mirror is there; `problems` says so when it is not.
+    status.tagged = count(["rev-list", "--count", "--tags", "--not", "--remotes", upstream_tags])
+    if status.tagged or status.head_unpushed:
+        _, refspecs = run_git(name, ["config", "--get-regexp", r"^remote\..*\.fetch$"])  # exits 1 on no match
+        status.tags_mirrored = UPSTREAM_TAGS in refspecs
+        if status.head_unpushed and not status.tags_mirrored:  # only worth saying if a tag could explain any
+            untagged = count(["rev-list", "--count", "HEAD", "--not", "--remotes", "--tags"])
+            status.head_under_tag = untagged < status.head_unpushed
+
+    if (stash := ask(["stash", "list"])) is not None:
+        status.stashes = len([ln for ln in stash.splitlines() if ln.strip()])
+
+    # The first `worktree` line is the main one (this dir, or the repo this dir is a worktree of); every other is
+    # a linked worktree, wherever it lives, prunable ones included: `git worktree remove`/`prune` settles each.
+    if (worktrees := ask(["worktree", "list", "--porcelain"])) is not None:
+        paths = [ln.removeprefix("worktree ") for ln in worktrees.splitlines() if ln.startswith("worktree ")]
+        status.worktrees = paths[1:]
+
+    # --recursive lists them at every depth from here, so a submodule is not asked for its own
+    if not submodule_of and (listed := ask(LIST_SUBMODULES)) is not None:
+        status.submodules = [inspect_repo(path, run_git, submodule_of=name) for path in listed.splitlines() if path]
 
     return status
 
 
 def check_workspace(
     expected: list[str] | None,
-    list_dirs: Callable[[], list[str]],
+    list_entries: Callable[[], dict[str, bool]],
     run_git: Callable[[str, list[str]], tuple[int, str]],
+    injected: dict[str, str] | None = None,
+    digest: Callable[[str], str | None] = lambda name: None,
 ) -> WorkspaceReport:
     """Compare the workspace on disk against the configured repos.
 
+    ``list_entries`` gives everything directly in the workspace, hidden names included: name -> is it a
+    directory. Every directory must be a clean git repo; anything else is loose (in no repo, so nowhere else).
+
     ``expected`` is the list of directory names the config says should be there;
     pass ``None`` to skip extra/missing detection (e.g. no manifest available)
-    and only report per-repo git cleanliness.
+    and only report per-repo git cleanliness (and loose files: no repo list ever expects those).
+
+    ``injected`` is the one exception to loose: the files containerctl itself put in the workspace (see
+    injected_files), name -> sha256 of the host's copy. One that ``digest`` (name -> sha256 of what is there, None
+    when that can't be said) finds unchanged exists on the host too; changed, it is loose like any other.
     """
-    present = sorted(list_dirs())
+    entries = list_entries()
+    present = sorted(name for name, is_dir in entries.items() if is_dir)
     report = WorkspaceReport()
+    for name in sorted(name for name, is_dir in entries.items() if not is_dir):
+        if injected and name in injected:
+            if digest(name) == injected[name]:
+                continue
+            report.changed.append(name)
+        report.loose.append(name)
 
     for name in present:
         report.statuses.append(inspect_repo(name, run_git))
@@ -1409,7 +1625,7 @@ def check_workspace(
 def print_report(label: str, report: WorkspaceReport) -> bool:
     """Print a workspace report; return True when clean."""
     print(f"{label}:")
-    if not report.statuses and not report.missing:
+    if not report.statuses and not report.missing and not report.loose:
         print("  (workspace is empty)")
     for status in report.statuses:
         tag = "extra" if status.name in report.extra else None
@@ -1420,6 +1636,9 @@ def print_report(label: str, report: WorkspaceReport) -> bool:
         if tag:
             reasons = ["not in config", *reasons] if reasons else ["not in config"]
         print(f"  ✗ {status.name} — {', '.join(reasons)}")
+    for name in report.loose:
+        why = "injected, but no longer as the host has it" if name in report.changed else "not a directory, in no repo"
+        print(f"  ✗ {name} — {why}")
     for name in report.missing:
         print(f"  ✗ {name} — configured but absent")
     print("  clean" if report.clean else "  DIRTY")
@@ -1429,26 +1648,96 @@ def print_report(label: str, report: WorkspaceReport) -> bool:
 # --- host-side adapters (run over `docker exec`) --------------------------------
 
 
-def _host_list_dirs(container: str) -> list[str]:
-    """List directory names directly under the container's workspace."""
-    script = f'cd {CONTAINER_WORKSPACE} 2>/dev/null && for d in */; do [ -d "$d" ] && printf "%s\\n" "${{d%/}}"; done'
-    result = Docker.exec_noninteractive(container, ["sh", "-c", script])
-    return [ln for ln in result.stdout.splitlines() if ln.strip()]
+def _host_list_entries(container: str, workspace: str, user: str | None = None) -> dict[str, bool]:
+    """Everything directly under the container's workspace: name -> is a directory (`ls -p` marks those with a
+    trailing slash). No workspace at all is an answer (nothing there). A listing that failed is not: DockerError
+    (a stopped container, most often), where "empty" would have been a guess that reads as "clean"."""
+    script = '[ -d "$1" ] || exit 0; ls -A1p -- "$1"'  # the workspace rides in as $1: data, never code
+    command = ["sh", "-c", script, "sh", workspace]
+    result = Docker.exec_noninteractive(container, command, user=user)
+    if result.returncode != 0:  # docker's failure (stopped, daemon down) or ls's own (unreadable): said as which
+        raise DockerError(docker_failure(["exec", container, *command], result, inside="ls"))
+    return {ln.rstrip("/"): ln.endswith("/") for ln in result.stdout.splitlines() if ln.strip("/")}
 
 
-def _host_git(container: str) -> Callable[[str, list[str]], tuple[int, str]]:
+def _host_git(container: str, workspace: str, user: str | None = None) -> Callable[[str, list[str]], tuple[int, str]]:
     def run_git(name: str, args: list[str]) -> tuple[int, str]:
-        result = Docker.exec_noninteractive(container, ["git", "-C", f"{CONTAINER_WORKSPACE}/{name}", *args])
+        result = Docker.exec_noninteractive(container, ["git", "-C", f"{workspace}/{name}", *args], user=user)
         return result.returncode, result.stdout
 
     return run_git
 
 
+def injected_files(project: "ProjectConfig") -> dict[str, str]:
+    """The env files spawn puts directly in the workspace (in no repo, so `check` would call them loose): name ->
+    sha256 of the host's copy as it is now. One the host can't read is not listed: nothing to match."""
+    out = {}
+    for ef in project.env_files:
+        if os.path.normpath(os.path.dirname(ef.dest)) != os.path.normpath(project.workspace):
+            continue
+        try:
+            with open(ef.src, "rb") as f:
+                out[os.path.basename(ef.dest)] = hashlib.file_digest(f, "sha256").hexdigest()
+        except OSError:
+            pass
+    return out
+
+
+def _host_digest(container: str, workspace: str, user: str | None = None) -> Callable[[str], str | None]:
+    def digest(name: str) -> str | None:
+        result = Docker.exec_noninteractive(container, ["sha256sum", "--", f"{workspace}/{name}"], user=user)
+        return result.stdout.split()[0] if result.returncode == 0 and result.stdout.split() else None
+
+    return digest
+
+
 def project_report(project: "ProjectConfig") -> WorkspaceReport:
-    """Check a project's workspace from the host, over `docker exec`; the container must exist.
-    `check` prints it, `destroy` warns from it (non-blocking: the user still decides)."""
-    name = project.container_name
-    return check_workspace([r.name for r in project.repos], lambda: _host_list_dirs(name), _host_git(name))
+    """Check a project's workspace from the host, over `docker exec`; the container must exist, and run:
+    DockerError when its workspace can't be listed. `check` prints the report, `destroy` asks with it in hand."""
+    name, workspace, user = project.container_name, project.workspace, project.user  # as its user: git's own
+    expected = [r.name for r in project.repos]  # ownership check refuses a repo that is somebody else's
+    return check_workspace(
+        expected,
+        lambda: _host_list_entries(name, workspace, user),
+        _host_git(name, workspace, user),
+        injected_files(project),
+        _host_digest(name, workspace, user),
+    )
+
+
+@dataclass
+class DestroyQuestion:
+    """What `destroy` would remove, and what must be known before saying yes. Built once, for the CLI and the
+    TUI alike: what one discloses, the other does."""
+
+    names: list[str] = field(default_factory=list)  # the containers the question is about: only those may go
+    verdict: str = ""  # of the workspace check, when it is not "clean"
+    report: WorkspaceReport | None = None  # the check itself, when it ran
+    text: str = ""  # the question; empty when there is nothing to destroy
+
+
+def destroy_question(project: "ProjectConfig") -> DestroyQuestion:
+    """Look at what a project has (one `ps`), `check` the workspace of its container, and word the question: the
+    verdict (DIRTY, or a check that could not run) is in it, and so is what an unfinished spawn left (never
+    entered, so nothing to check, but it may be a spawn still running elsewhere)."""
+    container, leftover = Docker.project_containers(project)
+    question = DestroyQuestion(names=[c.Names for c in (container, leftover) if c])
+    what = []
+    if container:
+        try:
+            question.report = project_report(project)
+        except DockerError as e:  # stopped, most often: nothing says the workspace is clean; still the user's call
+            log_error("docker.command", e.failure.detail)
+            question.verdict = f"its workspace could NOT be checked ({e})"
+        else:
+            if not question.report.clean:
+                question.verdict = f"its workspace is DIRTY ({', '.join(question.report.dirty)})"
+        what.append(f"{project.container_name}{', though ' + question.verdict if question.verdict else ''}")
+    if leftover:
+        what.append(leftover_note(leftover))
+    if what:
+        question.text = f"Destroy {' and '.join(what)}?"
+    return question
 
 
 # --- local adapters (run inside the container, plain git) -----------------------
@@ -1458,11 +1747,12 @@ def _local_workspace() -> Path:
     return Path.home() / "workspace"
 
 
-def _local_list_dirs() -> list[str]:
+def _local_list_entries() -> dict[str, bool]:
+    """Same answer as _host_list_entries, from inside: hidden names included, a symlink is not a directory"""
     ws = _local_workspace()
     if not ws.is_dir():
-        return []
-    return [p.name for p in ws.iterdir() if p.is_dir()]
+        return {}
+    return {p.name: p.is_dir() and not p.is_symlink() for p in ws.iterdir()}
 
 
 def _local_git(name: str, args: list[str]) -> tuple[int, str]:
@@ -1472,6 +1762,28 @@ def _local_git(name: str, args: list[str]) -> tuple[int, str]:
         text=True,
     )
     return result.returncode, result.stdout
+
+
+def _local_digest(name: str) -> str | None:
+    try:
+        with open(_local_workspace() / name, "rb") as f:
+            return hashlib.file_digest(f, "sha256").hexdigest()
+    except OSError:
+        return None
+
+
+def read_injected() -> dict[str, str]:
+    """Read, inside a container, what install_self said of the files injected in the workspace (see
+    injected_files): as the host had them at the last `enter`. Nothing readable is nothing injected."""
+    path = Path.home() / ".config" / "containerctl" / "injected.json"
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if isinstance(data, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in data.items()):
+        return data
+    return {}
 
 
 def read_manifest() -> list[str] | None:
@@ -1487,51 +1799,65 @@ def read_manifest() -> list[str] | None:
     return None
 
 
-def install_self(container: str, expected: list[str]) -> bool:
-    """Copy containerctl + the expected-repos manifest into a container.
+def install_self(
+    container: str,
+    expected: list[str],
+    user: str = CONTAINER_USER,
+    home: str = CONTAINER_HOME,
+    injected: dict[str, str] | None = None,
+) -> bool:
+    """Copy containerctl + the expected-repos manifest into a container, under `home`, for `user` (the
+    project's: see ProjectConfig), and beside the manifest what `injected_files` says: `check-local` has no
+    host to ask.
 
-    Makes ``containerctl check-local`` available on the dev user's PATH. Best
-    effort: failures are logged, never fatal to the spawn/enter flow.
+    Makes ``containerctl check-local`` available on that user's PATH. False
+    when a copy failed (logged): that fails a spawn, `enter` goes on without.
 
     Runs on every `enter`, so it must only touch what it owns: directories are
-    created as dev, and the two files `docker cp` writes (as root, always) are
-    chowned by name. Nothing recursive, nothing else in the home is affected.
+    created as the user, and the three files `docker cp` writes (as root, always) are
+    chowned by name, as root. Nothing recursive, nothing else in the home is affected.
     """
     self_path = Path(__file__).resolve()
     ok = True
-
-    Docker.exec_noninteractive(
-        container, ["mkdir", "-p", CONTAINER_BIN, f"{CONTAINER_HOME}/.config/containerctl"], user="dev"
+    bin_dir, config_dir = f"{home}/.local/bin", f"{home}/.config/containerctl"
+    self_dest, manifest, injected_dest = (
+        f"{bin_dir}/containerctl",
+        f"{config_dir}/expected.json",
+        f"{config_dir}/injected.json",
     )
-    if not Docker.cp(str(self_path), container, CONTAINER_SELF):
+
+    Docker.exec_noninteractive(container, ["mkdir", "-p", bin_dir, config_dir], user=user)
+    if not Docker.cp(str(self_path), container, self_dest):
         return False
-    Docker.exec_noninteractive(container, ["chmod", "+x", CONTAINER_SELF])
+    Docker.exec_noninteractive(container, ["chmod", "+x", self_dest], user=ROOT)
 
-    # Write the manifest atomically to a temp file, then copy it in.
-    tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
-    try:
-        json.dump(expected, tmp)
-        tmp.flush()
-        tmp.close()
-        if not Docker.cp(tmp.name, container, CONTAINER_MANIFEST):
-            ok = False
-    finally:
-        os.unlink(tmp.name)
+    # Write each to a temp file, whole, then copy it in.
+    for content, dest in ((expected, manifest), (injected or {}, injected_dest)):
+        tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        try:
+            json.dump(content, tmp)
+            tmp.flush()
+            tmp.close()
+            if not Docker.cp(tmp.name, container, dest):
+                ok = False
+        finally:
+            os.unlink(tmp.name)
 
-    Docker.exec_noninteractive(container, ["chown", "dev:dev", CONTAINER_SELF, CONTAINER_MANIFEST])
-    # Ensure ~/.local/bin is on PATH for future interactive shells (idempotent, as dev so a
+    # "user:" = its own group
+    Docker.exec_noninteractive(container, ["chown", f"{user}:", self_dest, manifest, injected_dest], user=ROOT)
+    # Ensure ~/.local/bin is on PATH for future interactive shells (idempotent, as the user so a
     # missing .bashrc is created with the right owner).
     # Shell required here: the conditional append (`grep -qs ... || echo ... >>`) has
-    # no argv equivalent. Both interpolated values are module-level constants, but
-    # charset-check them at the call site anyway (defense in depth) since they land
+    # no argv equivalent. The home was validated when the config was parsed, but
+    # charset-check both values at the call site anyway (defense in depth) since they land
     # in a shell string; the single-quote check guards the `'...'` quoting below.
-    bashrc = f"{CONTAINER_HOME}/.bashrc"
+    bashrc = f"{home}/.bashrc"
     path_line = 'export PATH="$HOME/.local/bin:$PATH"'
-    if all(c in VALID_PATH_CHARS for c in bashrc) and "'" not in path_line:
+    if all(c in VALID_PATH_CHARS for c in bashrc) and "'" not in bashrc + path_line:
         Docker.exec_noninteractive(
             container,
             ["sh", "-c", f"grep -qs '.local/bin' '{bashrc}' || echo '{path_line}' >> '{bashrc}'"],
-            user="dev",
+            user=user,
         )
     else:
         log_error("install_self.unsafe_shell_value", f"Refusing shell interpolation for {bashrc!r}")
@@ -1737,28 +2063,112 @@ class Screen:
 # =============================================================================
 
 
+REFUSED = 2  # exit code of a call we never made: an argument failed validation (what, is in the log)
+
+
 class Docker:
     """Docker CLI wrapper using subprocess"""
 
     @staticmethod
     def _run(
-        args: list[str], capture: bool = True, stdin=None, input: str | None = None
+        args: list[str],
+        capture: bool = True,
+        stdin=None,
+        input: str | None = None,
+        timeout: float | None = None,
+        own_group: bool = False,
     ) -> subprocess.CompletedProcess:
-        """Run docker command; `input` feeds stdin from a string, `stdin` from a file (never both)"""
+        """Run docker command; `input` feeds stdin from a string, `stdin` from a file (never both). With a
+        `timeout` (seconds; see QUERY_TIMEOUT), a call that hasn't answered by then is killed.
+
+        `own_group` takes the call out of the terminal's foreground process group, and off its stdin: a Ctrl-C
+        goes to that whole group, whichever thread started the process and whatever it reads from, and a listing
+        the fetcher is waiting on must not die of a Ctrl-C meant for an action (see App.handle_key). Out of the
+        group, nothing the terminal sends reaches it (Ctrl-C, the hangup of a closed window), so we end it
+        ourselves: see _run_own_group. Always captured, `stdin` and `input` don't apply."""
         cmd = ["docker"] + args
         try:
+            if own_group:
+                return Docker._run_own_group(cmd, timeout)
             if input is not None:
-                return subprocess.run(cmd, capture_output=capture, text=True, input=input)
-            return subprocess.run(cmd, capture_output=capture, text=True, stdin=stdin)
+                return subprocess.run(cmd, capture_output=capture, text=True, input=input, timeout=timeout)
+            return subprocess.run(cmd, capture_output=capture, text=True, timeout=timeout, stdin=stdin)
         except FileNotFoundError:  # no docker on PATH: reads as a failed call, which every caller already reports
             return subprocess.CompletedProcess(cmd, 127, "", "docker: command not found on PATH")
+        except subprocess.TimeoutExpired:  # so does a daemon that hangs
+            return subprocess.CompletedProcess(cmd, TIMED_OUT, "", f"{NO_ANSWER} {timeout}s")
+
+    _own_group: set[subprocess.Popen] = set()  # the own_group calls in flight, whichever thread waits on them
+    _own_group_lock = threading.Lock()
+    _leaving = False  # set at exit (see kill_own_group): no own_group call starts after it
 
     @staticmethod
-    def _list(args: list[str], parse: Callable[[dict], object]) -> Listing:
+    def _run_own_group(cmd: list[str], timeout: float | None) -> subprocess.CompletedProcess:
+        """subprocess.run for a call in its own process group (see _run), which we keep track of while it runs:
+        whoever waits on it kills it when its time is up or the wait is interrupted, and kill_own_group gets the
+        ones nobody waits on any more (the fetcher's, a daemon thread, when we exit)."""
+        pipe = subprocess.PIPE
+        with Docker._own_group_lock:  # started and noted as one step: kill_own_group misses none, and none starts after
+            if Docker._leaving:
+                return subprocess.CompletedProcess(cmd, 1, "", "containerctl: leaving, not asked")
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=pipe, stderr=pipe, text=True, process_group=0)
+            Docker._own_group.add(proc)
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except BaseException:  # its time is up, Ctrl-C, an exit: it does not outlive the wait
+            proc.kill()
+            proc.communicate()
+            raise
+        finally:
+            with Docker._own_group_lock:
+                Docker._own_group.discard(proc)
+        return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+    @staticmethod
+    def kill_own_group(leaving: bool = False) -> None:
+        """Kill the own_group calls still in flight: a `docker ps` waiting on a hung daemon must not stay behind
+        us. When the TUI stops its fetcher, and with `leaving` at exit (see leave_cleanly), after which none may
+        start: the fetcher is a daemon thread, still running while we go. What can't be covered is our own
+        SIGKILL, or the power: such a client is then left waiting, harmless, until the daemon answers or restarts."""
+        with Docker._own_group_lock:
+            Docker._leaving = Docker._leaving or leaving
+            procs = list(Docker._own_group)
+        for proc in procs:
+            try:
+                proc.kill()
+            except OSError:  # already gone
+                pass
+
+    @staticmethod
+    def _absent(args: list[str], result: subprocess.CompletedProcess) -> bool:
+        """For a call asking "does it exist?": False when it does, True when docker said there is no such thing,
+        DockerError for any other failure (no answer in time, daemon down, ...). Not knowing is neither yes nor
+        no, and a caller that read it as "no" would create, pull or report over something that is there."""
+        if result.returncode == 0:
+            return False
+        failure, text = docker_failure(args, result), (result.stderr or "").lower()
+        # A failure we know first: "docker: command not found" is not docker saying the image was not found
+        if failure.msg == UNKNOWN_DOCKER_FAILURE[0] and any(words in text for words in NO_SUCH):
+            return True
+        raise DockerError(failure)
+
+    @staticmethod
+    def _stream(args: list[str], env: dict[str, str] | None = None) -> int:
+        """Run a docker command on our own terminal (logs, exec: nothing captured) and hand back its exit code.
+        `env` extends the client's environment for this one call (see exec)."""
+        kwargs = {"env": {**os.environ, **env}} if env else {}
+        try:
+            return subprocess.run(["docker"] + args, **kwargs).returncode
+        except FileNotFoundError:
+            log_error("docker.command", "docker: command not found on PATH")
+            return 127
+
+    @staticmethod
+    def _list(args: list[str], parse: Callable[[dict], object], timeout: float = QUERY_TIMEOUT) -> Listing:
         """Run a listing whose output is one JSON object per line (JSON Lines: `--format '{{json .}}'`), so each
         line stands alone: one that isn't JSON, or isn't a row we can use, is skipped and the others still count.
         Nothing is logged here: the failure or the skipped lines are handed back."""
-        result = Docker._run(args)
+        result = Docker._run(args, timeout=timeout, own_group=True)
         if result.returncode != 0:
             return Listing(failure=docker_failure(args, result))
         listing = Listing()
@@ -1775,39 +2185,42 @@ class Docker:
     # (an issue), a one-shot caller takes `.logged()` (a log line, no rows) or `.required()` (DockerError).
 
     @staticmethod
-    def list_containers(all_containers: bool = True, include_size: bool = False) -> Listing:
+    def list_containers(
+        all_containers: bool = True, include_size: bool = False, timeout: float = QUERY_TIMEOUT
+    ) -> Listing:
         """`docker ps`.
 
         `--size=false` matters: with the `{{json .}}` template the docker CLI otherwise computes every
-        container's disk usage, which walks their filesystems and turns a 75ms `ps` into seconds."""
+        container's disk usage, which walks their filesystems and turns a 75ms `ps` into seconds: asked for,
+        it gets SIZE_TIMEOUT whatever `timeout` says."""
         args = ["ps", "--format", "{{json .}}"]
         if all_containers:
             args.insert(1, "-a")
         if not include_size:
             args.insert(1, "--size=false")
-        return Docker._list(args, Container.from_dict)
+        return Docker._list(args, Container.from_dict, SIZE_TIMEOUT if include_size else timeout)
 
     @staticmethod
-    def list_images() -> Listing:
-        return Docker._list(["images", "--format", "{{json .}}"], Image.from_dict)
+    def list_images(timeout: float = QUERY_TIMEOUT) -> Listing:
+        return Docker._list(["images", "--format", "{{json .}}"], Image.from_dict, timeout)
 
     @staticmethod
-    def list_volumes() -> Listing:
-        return Docker._list(["volume", "ls", "--format", "{{json .}}"], Volume.from_dict)
+    def list_volumes(timeout: float = QUERY_TIMEOUT) -> Listing:
+        return Docker._list(["volume", "ls", "--format", "{{json .}}"], Volume.from_dict, timeout)
 
     @staticmethod
-    def list_networks() -> Listing:
-        return Docker._list(["network", "ls", "--format", "{{json .}}"], Network.from_dict)
+    def list_networks(timeout: float = QUERY_TIMEOUT) -> Listing:
+        return Docker._list(["network", "ls", "--format", "{{json .}}"], Network.from_dict, timeout)
 
     @staticmethod
-    def listings() -> dict[str, Listing]:
-        """The four listings, by tab key (see LISTINGS). Each is its own call with its own outcome: one failing
-        says nothing about the next, so all four always run."""
+    def listings(timeout: float = QUERY_TIMEOUT) -> dict[str, Listing]:
+        """The four listings, by tab key (see LISTINGS). Each is its own call with its own outcome, a timeout
+        included: one failing says nothing about the next, so all four always run."""
         return {
-            "containers": Docker.list_containers(),
-            "images": Docker.list_images(),
-            "volumes": Docker.list_volumes(),
-            "networks": Docker.list_networks(),
+            "containers": Docker.list_containers(timeout=timeout),
+            "images": Docker.list_images(timeout),
+            "volumes": Docker.list_volumes(timeout),
+            "networks": Docker.list_networks(timeout),
         }
 
     @staticmethod
@@ -1867,7 +2280,9 @@ class Docker:
         if not is_valid_image_ref(ref):
             log_error("docker.invalid_id", f"Invalid image ref: {ref}")
             return False
-        return Docker._run(["image", "inspect", ref]).returncode == 0
+        args = ["image", "inspect", ref]
+        # DockerError when docker could not say: ensure_image would build or pull over an image that is there
+        return not Docker._absent(args, Docker._run(args, timeout=QUERY_TIMEOUT))
 
     @staticmethod
     def build_image(image: "ImageConfig") -> bool:
@@ -1895,14 +2310,27 @@ class Docker:
         return True
 
     @staticmethod
+    def pull_image(ref: str) -> bool:
+        """`docker pull`, streaming the progress"""
+        if not is_valid_image_ref(ref):
+            log_error("docker.invalid_id", f"Invalid image ref: {ref}")
+            return False
+        return Docker._run(["pull", ref], capture=False).returncode == 0
+
+    @staticmethod
     def ensure_image(ref: str) -> bool:
-        """Before `docker run`: build the image from its recipe when it is absent and a recipe claims the tag.
-        Without a recipe docker pulls as usual. Never rebuilds an existing image: `image build` is the explicit way."""
+        """Before `docker run`: get the image when it is absent. Built from its recipe when one claims the tag,
+        pulled otherwise: here rather than left to `docker run`, whose output we capture, so the progress shows.
+        Never rebuilds or re-pulls an existing image: `image build` is the explicit way."""
+        if not is_valid_image_ref(ref):  # image_exists says False to that too, and False here means "get it"
+            log_error("docker.invalid_id", f"Invalid image ref: {ref}")
+            return False
         if Docker.image_exists(ref):
             return True
         image = find_image_recipe(ref, load_images())
         if image is None:
-            return True
+            print(f"Pulling {ref}...")
+            return Docker.pull_image(ref)
         print(f"Building {image.tag} from {image.dockerfile}...")
         return Docker.build_image(image)
 
@@ -1930,8 +2358,9 @@ class Docker:
         if not is_valid_id(name):
             log_error("docker.invalid_id", f"Invalid network name: {name}")
             return False
-        result = Docker._run(["network", "inspect", name])
-        if result.returncode == 0:
+        args = ["network", "inspect", name]
+        # DockerError when docker could not say: the create below would fail on "already exists"
+        if not Docker._absent(args, Docker._run(args, timeout=QUERY_TIMEOUT)):
             return True
         result = Docker._run(["network", "create", name])
         if result.returncode != 0:
@@ -1958,18 +2387,18 @@ class Docker:
         return result.returncode == 0
 
     @staticmethod
-    def logs(container_id: str, follow: bool = False, tail: int | None = None) -> None:
-        """Show container logs (streams to stdout)"""
+    def logs(container_id: str, follow: bool = False, tail: int | None = None) -> int:
+        """Show container logs (streams to stdout); docker's exit code, 2 when we refused the call"""
         if not is_valid_id(container_id):
             log_error("docker.invalid_id", f"Invalid container ID: {container_id}")
-            return
+            return REFUSED
         args = ["logs"]
         if follow:
             args.append("-f")
         if tail:
             args.extend(["--tail", str(tail)])
         args.append(container_id)
-        subprocess.run(["docker"] + args)
+        return Docker._stream(args)
 
     @staticmethod
     def exec(
@@ -1979,27 +2408,30 @@ class Docker:
         user: str | None = None,
         workdir: str | None = None,
         env: dict[str, str] | None = None,
-    ) -> None:
-        """Execute command in container.
+    ) -> int:
+        """Execute command in container; its exit code (docker hands the command's through), 2 when we refused
+        the call.
 
         `env` is passed as bare `-e NAME` flags: docker fills each value from the client's environment,
         which we extend for this one call, so a secret never appears in argv (`ps`) or on any disk."""
         if not is_valid_id(container_id):
             log_error("docker.invalid_id", f"Invalid container ID: {container_id}")
-            return
+            return REFUSED
         if user is not None and (not user or not is_valid_id(user)):
             log_error("docker.invalid_user", f"Invalid user: {user}")
-            return
+            return REFUSED
         if workdir is not None and (not workdir or not all(c in VALID_PATH_CHARS for c in workdir)):
             log_error("docker.invalid_workdir", f"Invalid workdir: {workdir}")
-            return
+            return REFUSED
         for name in env or {}:
             if not is_valid_env_name(name):
                 log_error("docker.invalid_env", f"Invalid env name: {name}")
-                return
+                return REFUSED
         args = ["exec"]
         if interactive:
-            args.extend(["-it"])
+            # -i: our stdin is theirs. -t: a terminal, when we have one to lend. Without (a pipe, cron, CI) docker
+            # would refuse -t ("the input device is not a TTY"); the output comes through either way.
+            args.append("-it" if stdin_is_tty() else "-i")
         if user is not None:
             args.extend(["-u", user])
         if workdir is not None:
@@ -2008,74 +2440,32 @@ class Docker:
             args.extend(["-e", name])
         args.append(container_id)
         args.extend(command)
-        if env:
-            subprocess.run(["docker"] + args, env={**os.environ, **env})
-        else:
-            subprocess.run(["docker"] + args)
+        return Docker._stream(args, env=env)
 
     @staticmethod
-    def shell(container_id: str, shell: str = "/bin/sh") -> None:
-        """Open interactive shell in container"""
-        if not is_valid_id(container_id):
-            log_error("docker.invalid_id", f"Invalid container ID: {container_id}")
-            return
-        Docker.exec(container_id, [shell], interactive=True)
+    def shell(container_id: str, shell: str = "/bin/sh") -> int:
+        """Open interactive shell in container; see exec for what comes back"""
+        return Docker.exec(container_id, [shell], interactive=True)
 
     @staticmethod
-    def _inspect_raw(object_id: str) -> dict | None:
-        """Inspect a Docker object (raw dict output) - caller must validate ID"""
-        result = Docker._run(["inspect", object_id])
-        if result.returncode != 0:
+    def inspect(cls: type[Inspected], ref: str):
+        """`docker inspect` one object as `cls` (ContainerInspect, ImageInspect, ...); None when there is no such
+        object, or (after logging) when `ref` or the answer is not something we can use. DockerError when docker
+        could not say (no answer, daemon down, ...): that is not "no such object", and every caller reads None
+        as one. `--type` keeps a container and a network of the same name apart."""
+        if not cls.VALID(ref):
+            log_error("docker.invalid_id", f"Invalid {cls.TYPE}: {ref}")
+            return None
+        args = ["inspect", "--type", cls.TYPE, ref]
+        result = Docker._run(args, timeout=QUERY_TIMEOUT)
+        if Docker._absent(args, result):
             return None
         try:
             data = json.loads(result.stdout)
-            return data[0] if data else None
         except json.JSONDecodeError:
+            log_error(cls.CAT, f"docker {' '.join(args)}: not JSON", {"data": result.stdout[:200]})
             return None
-
-    @staticmethod
-    def inspect_container(container_id: str) -> ContainerInspect | None:
-        """Inspect a container, returning typed ContainerInspect"""
-        if not is_valid_id(container_id):
-            log_error("docker.invalid_id", f"Invalid container ID: {container_id}")
-            return None
-        raw = Docker._inspect_raw(container_id)
-        if not raw:
-            return None
-        return ContainerInspect.from_dict(raw)
-
-    @staticmethod
-    def inspect_image(image_id: str) -> ImageInspect | None:
-        """Inspect an image, returning typed ImageInspect"""
-        if not is_valid_image_ref(image_id):
-            log_error("docker.invalid_id", f"Invalid image ref: {image_id}")
-            return None
-        raw = Docker._inspect_raw(image_id)
-        if not raw:
-            return None
-        return ImageInspect.from_dict(raw)
-
-    @staticmethod
-    def inspect_volume(volume_name: str) -> VolumeInspect | None:
-        """Inspect a volume, returning typed VolumeInspect"""
-        if not is_valid_id(volume_name):
-            log_error("docker.invalid_id", f"Invalid volume name: {volume_name}")
-            return None
-        raw = Docker._inspect_raw(volume_name)
-        if not raw:
-            return None
-        return VolumeInspect.from_dict(raw)
-
-    @staticmethod
-    def inspect_network(network_id: str) -> NetworkInspect | None:
-        """Inspect a network, returning typed NetworkInspect"""
-        if not is_valid_id(network_id):
-            log_error("docker.invalid_id", f"Invalid network ID: {network_id}")
-            return None
-        raw = Docker._inspect_raw(network_id)
-        if not raw:
-            return None
-        return NetworkInspect.from_dict(raw)
+        return cls.from_dict(data[0]) if data else None
 
     @staticmethod
     def investigate_source(container_id: str) -> dict:
@@ -2086,7 +2476,7 @@ class Docker:
         result = {"source": "cli", "details": []}
 
         # Get container info
-        info = Docker.inspect_container(container_id)
+        info = Docker.inspect(ContainerInspect, container_id)
         if not info:
             return result
 
@@ -2173,21 +2563,28 @@ class Docker:
         return Docker.containers_by_name().get(f"{CONTAINER_PREFIX}{project_name}")
 
     @staticmethod
-    def create_project_container(project: "ProjectConfig") -> bool:
-        """Create and start a container for a project"""
+    def project_containers(project: "ProjectConfig") -> tuple[Container | None, Container | None]:
+        """(the project's container, what an unfinished spawn of it left), each None when there is none; one `ps`"""
+        existing = Docker.containers_by_name()
+        return existing.get(project.container_name), existing.get(project.spawning_name)
+
+    @staticmethod
+    def create_project_container(project: "ProjectConfig", name: str | None = None) -> str | None:
+        """Create and start a container for a project, as `name` (spawn's temporary one) when given. Its ID, as
+        `docker run -d` prints it (its name, should docker print nothing usable); None when it failed."""
         network_name = f"{NETWORK_PREFIX}{project.name}"
         if not Docker.ensure_network(network_name):
-            log_error("project.create", f"Failed to ensure network {network_name}")
-            return False
+            log_error("project.create", f"Failed to ensure network {network_name}", echo=True)
+            return None
         if not Docker.ensure_image(project.image):
-            log_error("project.create", f"Failed to build image {project.image}")
-            return False
+            log_error("project.create", f"Failed to build or pull image {project.image}", echo=True)
+            return None
         args = [
             "run",
             "-d",
             "--init",  # PID 1 is `sleep infinity`, which never reaps the children `docker exec` leaves behind
             "--name",
-            project.container_name,
+            name or project.container_name,
             "--network",
             network_name,
             "--label",
@@ -2198,9 +2595,10 @@ class Docker:
         args.extend([project.image, "sleep", "infinity"])
         result = Docker._run(args)
         if result.returncode != 0:
-            log_error("project.create", f"Failed to create container: {result.stderr.strip()}")
-            return False
-        return True
+            log_error("project.create", f"Failed to create container: {result.stderr.strip()}", echo=True)
+            return None
+        container_id = result.stdout.strip()
+        return container_id if is_valid_id(container_id) else name or project.container_name
 
     @staticmethod
     def cp(src: str, container_id: str, dest: str) -> bool:
@@ -2218,8 +2616,23 @@ class Docker:
         workdir: str | None = None,
         user: str | None = None,
         input: str | None = None,
+        capture: bool = True,
     ) -> subprocess.CompletedProcess:
-        """Execute command in container non-interactively (capture output); `input` is fed to its stdin"""
+        """Execute command in container non-interactively; `input` is fed to its stdin. Output is captured,
+        unless `capture` is off: it then goes to our terminal as it comes (a clone's progress).
+
+        Like `exec`, checks what becomes a docker option or name here too, wherever the values came from: a
+        refused call is a result with the REFUSED exit code, and the reason in the log."""
+        refused = None
+        if not is_valid_id(container_id):
+            refused = ("docker.invalid_id", f"Invalid container ID: {container_id}")
+        elif user is not None and not is_valid_id(user):
+            refused = ("docker.invalid_user", f"Invalid user: {user}")
+        elif workdir is not None and not is_valid_home(workdir):
+            refused = ("docker.invalid_workdir", f"Invalid workdir: {workdir}")
+        if refused:
+            log_error(*refused)
+            return subprocess.CompletedProcess(["docker", "exec"], REFUSED, "", refused[1])
         args = ["exec"]
         if input is not None:
             args.append("-i")
@@ -2228,48 +2641,88 @@ class Docker:
         if workdir is not None:
             args.extend(["-w", workdir])
         args.append(container_id)
-        return Docker._run(args + command, input=input)
+        return Docker._run(args + command, input=input, capture=capture)
 
     @staticmethod
     def spawn_project(project: "ProjectConfig") -> bool:
-        """Full spawn flow: create container, copy SSH key, clone repo, inject env files"""
+        """Full spawn flow: create the container, put everything in it (see _provision), and only then give it
+        its project name. Nothing here cleans up after an interruption: an unfinished spawn keeps its spawning
+        name, which is all the next one needs to know (see SPAWNING_PREFIX)."""
+        name = project.spawning_name
+        # Before anything is created: finding out after the clones would cost a whole spawn
+        wanted = ([project.ssh_key] if project.ssh_key else []) + [ef.src for ef in project.env_files]
+        if missing := [path for path in wanted if not os.path.isfile(path)]:
+            log_error("project.spawn", f"not found on this host: {', '.join(missing)}. Nothing spawned.", echo=True)
+            return False
+        if leftover := Docker.containers_by_name().get(name):
+            # It may also be a spawn still running in another terminal: only the user knows, so the user says
+            print(
+                f"{name} exists ({created_ago(leftover)}): a spawn still running elsewhere, or one that never finished."
+            )
+            if not confirm_cli("Remove it and start over?"):
+                print(f"Not removed: nothing spawned (to remove it yourself: docker rm -f {name})", file=sys.stderr)
+                return False
+            if not Docker.remove_container(leftover.ID, force=True):  # by ID: the one the question was about
+                log_error("project.spawn", f"Could not remove {name}", echo=True)
+                return False
         print(f"Creating container {project.container_name}...")
-        if not Docker.create_project_container(project):
+        # From here on by ID: the spawning name may change hands (another terminal said yes to "start over"), and
+        # what we put in, rename or clean up must be the container we made
+        container_id = Docker.create_project_container(project, name=name)
+        if container_id is None:
+            return False
+        if not Docker._provision(project, container_id):
+            return False
+        result = Docker._run(["rename", container_id, project.container_name])
+        if result.returncode != 0:  # it stays under its spawning name, complete: the Issues tab says what to do
+            msg = f"Could not rename {name} to {project.container_name}: {result.stderr.strip()}"
+            log_error("project.spawn", msg, echo=True)
+            return False
+        print(f"Container {project.container_name} ready!")
+        return True
+
+    @staticmethod
+    def _provision(project: "ProjectConfig", name: str) -> bool:
+        """What spawn puts in the fresh container `name` (its ID: see spawn_project): SSH key, forge host keys,
+        clones, env files, containerctl. Any of it failing fails the spawn, and the container is removed: the
+        project name is only given to a container that has all of it."""
+
+        def fail(msg: str) -> bool:
+            log_error("project.spawn", f"{project.name}: {msg}", echo=True)
+            print(f"Cleaning up container {project.spawning_name}...", file=sys.stderr)
+            Docker.remove_container(name, force=True)
             return False
 
         # Copy SSH key if configured
         if project.ssh_key:
             if not os.path.isfile(project.ssh_key):
-                print(f"Error: SSH key not found: {project.ssh_key}", file=sys.stderr)
-                Docker.remove_container(project.container_name, force=True)
-                return False
+                return fail(f"SSH key not found: {project.ssh_key}")
             print("Injecting SSH key...")
-            Docker.exec_noninteractive(project.container_name, ["mkdir", "-p", "/home/dev/.ssh"])
-            if not Docker.cp(project.ssh_key, project.container_name, "/home/dev/.ssh/id_ed25519"):
-                print("Error: failed to copy SSH key into container", file=sys.stderr)
-                Docker.remove_container(project.container_name, force=True)
-                return False
-            Docker.exec_noninteractive(project.container_name, ["chmod", "600", "/home/dev/.ssh/id_ed25519"])
-            Docker.exec_noninteractive(project.container_name, ["chown", "-R", "dev:dev", "/home/dev/.ssh"])
-            # Verify key is accessible
-            result = Docker.exec_noninteractive(project.container_name, ["test", "-r", "/home/dev/.ssh/id_ed25519"])
+            ssh_dir, user = f"{project.home}/.ssh", project.user
+            key = f"{ssh_dir}/id_ed25519"
+            Docker.exec_noninteractive(name, ["mkdir", "-p", ssh_dir], user=user)
+            if not Docker.cp(project.ssh_key, name, key):
+                return fail("failed to copy SSH key into container")
+            Docker.exec_noninteractive(name, ["chmod", "600", key], user=ROOT)
+            Docker.exec_noninteractive(name, ["chown", f"{user}:", key], user=ROOT)  # "user:" = its own group
+            # Verify the key is there for who will use it: this is also where a wrong `user` or `home` shows
+            result = Docker.exec_noninteractive(name, ["test", "-r", key], user=user)
             if result.returncode != 0:
-                print("Error: SSH key not readable inside container", file=sys.stderr)
-                Docker.remove_container(project.container_name, force=True)
-                return False
-            # Pinned forge host keys (see KNOWN_HOSTS), appended as dev so ssh can keep adding to the file
+                return fail(f"SSH key not readable by {user} inside container: {result.stderr.strip()}")
+            # Pinned forge host keys (see KNOWN_HOSTS), appended as the user so ssh can keep adding to the file
             result = Docker.exec_noninteractive(
-                project.container_name, ["tee", "-a", "/home/dev/.ssh/known_hosts"], user="dev", input=KNOWN_HOSTS
+                name, ["tee", "-a", f"{ssh_dir}/known_hosts"], user=project.user, input=KNOWN_HOSTS
             )
             if result.returncode != 0:
-                log_error("project.spawn", f"Could not write known_hosts in {project.container_name}: {result.stderr}")
+                return fail(f"could not write known_hosts: {result.stderr.strip()}")
 
         # Clone repos if configured (each into its own dir under the workspace)
         if project.repos:
-            Docker.exec_noninteractive(project.container_name, ["mkdir", "-p", "/home/dev/workspace"])
+            Docker.exec_noninteractive(name, ["mkdir", "-p", project.workspace], user=project.user)
             for repo in project.repos:
                 print(f"Cloning {repo.url}...")
-                clone = ["git", "clone"]
+                clone = ["git", "clone", "--progress"]  # not captured: a long clone shows it is alive
+                clone += CLONE_MIRRORS_TAGS
                 if repo.branch:
                     clone += ["-b", repo.branch]
                 # `--` ends option parsing so a URL starting with `-` can't be read as a git option
@@ -2277,12 +2730,11 @@ class Docker:
                 clone.append(repo.url)
                 if repo.dir:
                     clone.append(repo.dir)
-                result = Docker.exec_noninteractive(project.container_name, clone, workdir="/home/dev/workspace")
+                result = Docker.exec_noninteractive(
+                    name, clone, workdir=project.workspace, user=project.user, capture=False
+                )
                 if result.returncode != 0:
-                    print(f"Error: git clone failed for {repo.url}: {result.stderr.strip()}", file=sys.stderr)
-                    print(f"Cleaning up container {project.container_name}...", file=sys.stderr)
-                    Docker.remove_container(project.container_name, force=True)
-                    return False
+                    return fail(f"git clone failed for {repo.url}")  # git just said why
 
         # Copy env files
         for ef in project.env_files:
@@ -2290,52 +2742,66 @@ class Docker:
                 print(f"Injecting {ef.dest}...")
                 # Ensure destination directory exists
                 dest_dir = os.path.dirname(ef.dest)
-                Docker.exec_noninteractive(project.container_name, ["mkdir", "-p", dest_dir])
-                Docker.cp(ef.src, project.container_name, ef.dest)
-            else:
-                print(f"Warning: env file {ef.src} not found, skipping", file=sys.stderr)
+                # Under the home it is the user's, like the rest; anywhere else (/etc/...) it is root's business
+                theirs = ef.dest.startswith(f"{project.home}/")
+                Docker.exec_noninteractive(name, ["mkdir", "-p", dest_dir], user=project.user if theirs else ROOT)
+                if not Docker.cp(ef.src, name, ef.dest):
+                    return fail(f"failed to copy {ef.src} to {ef.dest}")
+                if theirs:
+                    Docker.exec_noninteractive(name, ["chown", f"{project.user}:", ef.dest], user=ROOT)
+            else:  # it was there when the spawn started
+                return fail(f"env file {ef.src} not found")
 
         # Install containerctl + the expected-repos manifest so `containerctl
-        # check-local` is available from inside the container. Best-effort.
-        if not install_self(project.container_name, [r.name for r in project.repos]):
-            log_error("project.install_self", f"Failed to install containerctl into {project.container_name}")
+        # check-local` is available from inside the container.
+        repo_names = [r.name for r in project.repos]
+        if not install_self(name, repo_names, project.user, project.home, injected_files(project)):
+            return fail(
+                f"failed to install containerctl under {project.home} as {project.user}: when the image has"
+                " another user or home, say so in the project file (`user`, `home`)"
+            )
 
-        print(f"Container {project.container_name} ready!")
         return True
 
     @staticmethod
-    def enter_project(project: "ProjectConfig", user: str | None = None, workdir: str | None = None) -> None:
-        """Enter a project: spawn if needed, start if stopped, then attach a shell.
+    def enter_project(project: "ProjectConfig", user: str | None = None, workdir: str | None = None) -> int | None:
+        """Enter a project: spawn if needed, start if stopped, then attach a shell. The shell's exit code (see
+        exec), or None when no shell was entered: the spawn failed or was declined, and has said why. What to
+        do with that is the caller's: the CLI exits with it, the TUI stays up.
 
-        `workdir` (a shortcut target) overrides the default landing directory."""
+        `workdir` (a shortcut target) overrides the default landing directory; `user` who the shell is for
+        (the project's user unless said: never the image's default, see CONTAINER_USER)."""
         container = Docker.find_project_container(project.name)
 
         if container is None:
             # No container — spawn it
             if not Docker.spawn_project(project):
                 print(f"Failed to spawn project {project.name}", file=sys.stderr)
-                sys.exit(1)
+                return None
         else:
             state = container.State.lower()
             if state != "running":
                 print(f"Starting {project.container_name}...")
-                Docker.start(project.container_name)
+                if not Docker.start(project.container_name):
+                    log_error("project.enter", f"Could not start {project.container_name}", echo=True)
+                    return None
             # Keep the in-container checker + manifest fresh (config may have changed,
             # or the container predates this feature). Best-effort.
-            install_self(project.container_name, [r.name for r in project.repos])
+            repo_names = [r.name for r in project.repos]
+            install_self(project.container_name, repo_names, project.user, project.home, injected_files(project))
 
         # Pick the landing directory:
         #   - exactly one repo  -> enter that repo's dir
         #   - multiple repos     -> enter the shared workspace root
         #   - no repo            -> home
         if workdir is None:
-            workdir = "/home/dev"
+            workdir = project.home
             if len(project.repos) == 1:
                 repo_name = project.repos[0].name
                 if repo_name and all(c in VALID_REPO_NAME_CHARS for c in repo_name):
-                    workdir = f"/home/dev/workspace/{repo_name}"
+                    workdir = f"{project.workspace}/{repo_name}"
             elif len(project.repos) > 1:
-                workdir = "/home/dev/workspace"
+                workdir = project.workspace
         # [env] values and [secrets] looked up in secrets.toml ride into this shell's process environment
         # only. Their problems are echoed right before the prompt, where they matter (they stay in the log too).
         seen = len(get_errors())
@@ -2344,25 +2810,30 @@ class Docker:
             if problem.cat.startswith("env."):
                 print(f"env: {problem.msg}", file=sys.stderr)
         # cd into the landing dir if it exists, else fall back home - done atomically inside the
-        # container (no TOCTOU, unlike a separate `test -d` probe then `-w`). workdir rides in as
-        # $1 (data, never interpolated as code); `--` stops cd option-parsing a leading dash.
-        Docker.exec(
+        # container (no TOCTOU, unlike a separate `test -d` probe then `-w`). workdir and home ride in
+        # as $1 and $2 (data, never interpolated as code); `--` stops cd option-parsing a leading dash.
+        return Docker.exec(
             project.container_name,
-            ["bash", "-c", 'cd -- "$1" 2>/dev/null || cd /home/dev; exec bash', "bash", workdir],
-            user=user,
+            ["bash", "-c", 'cd -- "$1" 2>/dev/null || cd -- "$2"; exec bash', "bash", workdir, project.home],
+            user=user or project.user,
             env=env,
         )
 
     @staticmethod
-    def destroy_project(project: "ProjectConfig") -> bool:
-        """Stop and remove a project container"""
-        container = Docker.find_project_container(project.name)
-        if container is None:
+    def destroy_project(project: "ProjectConfig", names: list[str] | None = None) -> bool:
+        """Stop and remove a project's containers. `names` are the ones the user was asked about: only those go,
+        by name, whatever appeared since (a spawn started meanwhile was in no question; one that finished
+        meanwhile no longer has the name that was agreed to). Unset: all that exist now, an unfinished spawn's
+        leftover included."""
+        if names is None:
+            names = [c.Names for c in Docker.project_containers(project) if c]
+        if not names:
             print(f"No container found for project {project.name}")
             return False
-        print(f"Destroying {project.container_name}...")
-        if not Docker.remove_container(project.container_name, force=True):
-            return False
+        for name in names:
+            print(f"Destroying {name}...")
+            if not Docker.remove_container(name, force=True):
+                return False
         # Best-effort network cleanup
         network_name = f"{NETWORK_PREFIX}{project.name}"
         Docker.remove_network(network_name)
@@ -2383,7 +2854,7 @@ class Docker:
                 log_error("service.create", f"Failed to ensure network {network}")
                 return False
         if not Docker.ensure_image(service.image):
-            log_error("service.create", f"Failed to build image {service.image}")
+            log_error("service.create", f"Failed to build or pull image {service.image}")
             return False
         args = [
             "run",
@@ -2431,10 +2902,10 @@ class Docker:
         `already` skips the inspect (used right after `run --network`). Networks the container
         is on but the config no longer lists are left alone: `recreate` is the way to drop them."""
         if already is None:
-            info = Docker.inspect_container(service.container_name)
+            info = Docker.inspect(ContainerInspect, service.container_name)
             if info is None:
                 return False
-            already = set((info.NetworkSettings.get("Networks") or {}).keys())
+            already = set(((info.NetworkSettings or {}).get("Networks") or {}).keys())
         ok = True
         for network in service.networks:
             if network in already:
@@ -2554,6 +3025,7 @@ class DataFetcher:
     def stop(self) -> None:
         """Stop background fetching"""
         self._stop_event.set()
+        Docker.kill_own_group()  # the listing it may be waiting on: quitting doesn't wait for a docker that hangs
         if self._thread:
             self._thread.join(timeout=1.0)
 
@@ -2599,7 +3071,7 @@ class DataFetcher:
 
     def _fetch(self) -> tuple[dict[str, list], dict[str, Listing]]:
         """Fetch all data from Docker and the config files, and detect the issues in them"""
-        listings = Docker.listings()
+        listings = Docker.listings(timeout=POLL_TIMEOUT)
         projects_config, broken_projects = read_projects()
         services_config, broken_services = read_services()
         images_config, broken_images = read_images()
@@ -2643,7 +3115,6 @@ class Tab:
     key: str
     columns: list[tuple[str, str, int]]  # (key, header, width)
     id_key: str
-    actions: dict[str, Callable[[str], bool]]
     empty: str = ""  # what the list area says when there are no rows; "No <name> found" when unset
     anchor: tuple[str, ...] = ()  # the fields that name a row from one fetch to the next; (id_key,) when unset
 
@@ -2756,12 +3227,23 @@ class UI:
             scr.write(text[:width])
 
     @staticmethod
-    def confirm(prompt: str, row: int) -> bool:
-        """Show confirmation prompt and get y/n response (flushes immediately)"""
+    def confirm(prompt: str, row: int, cols: int | None = None) -> bool:
+        """Show confirmation prompt and get y/n response (flushes immediately). On line `row`; one that would not
+        fit in `cols` (a DIRTY list, a leftover) is asked in a box instead, wrapped, and scrolling when tall."""
+        if cols is not None and len(prompt) + len(" [y/N] ") > cols:
+            lines = textwrap.wrap(prompt, max(20, cols - 8))
+            return bool(UI.info_box("Confirm", lines, row + 1, cols, answer=True))
         sys.stdout.write(f"\033[{row};1H" + Term.CLEAR_LINE)
         sys.stdout.write(Term.style(f"{prompt} [y/N] ", Term.YELLOW))
         sys.stdout.flush()
+        try:
+            return UI._yes()
+        except KeyboardInterrupt:  # Ctrl-C answers no: it closes the question, not the TUI
+            return False
 
+    @staticmethod
+    def _yes() -> bool:
+        """Read keys until one answers the y/N on screen"""
         while True:
             key = Term.getch()
             if key.lower() == "y":
@@ -2770,53 +3252,61 @@ class UI:
                 return False
 
     @staticmethod
-    def info_box(title: str, lines: list[str], rows: int, cols: int, ok: bool = False) -> None:
+    def info_box(
+        title: str, lines: list[str], rows: int, cols: int, ok: bool = False, answer: bool = False
+    ) -> bool | None:
         """Display an info box modal and wait for a keypress to dismiss it: any key, or with `ok` Enter alone (a
-        warning must be read, and a key that was already on its way must not be what closes it)"""
-        # Calculate box dimensions
+        warning must be read, and a key that was already on its way must not be what closes it). Content taller
+        than the screen scrolls: i / k (or the arrows) move it a line up / down, and are then not keys that close.
+        With `answer` it asks: y is True; n, Enter or Esc False (see confirm). Ctrl-C closes any of them, an `ok`
+        one included, and answers no: it ends the modal that is open, not the TUI under it."""
         content_width = max(len(title), max((len(line) for line in lines), default=20)) + 4
         box_width = min(content_width, cols - 4)
-        box_height = len(lines) + 4
-        start_row = (rows - box_height) // 2
-        start_col = (cols - box_width) // 2
+        view = min(len(lines), max(1, rows - 6))  # content lines on screen at once: frame and hint must fit too
+        tall = len(lines) > view
+        start_row = max(1, (rows - (view + 4)) // 2)
+        start_col = max(1, (cols - box_width) // 2)
+        closing = "[Press Enter: ok]" if ok else "[Press any key to close]"
+        if answer:
+            closing = "[y: yes] [n / Enter: no]"
+        out = sys.stdout.write
 
-        # Draw box
-        top_border = "┌" + "─" * (box_width - 2) + "┐"
-        bottom_border = "└" + "─" * (box_width - 2) + "┘"
+        def at(row: int) -> str:
+            return f"\033[{start_row + row};{start_col}H"
 
-        sys.stdout.write(f"\033[{start_row};{start_col}H" + Term.style(top_border, Term.CYAN))
-        sys.stdout.write(
-            f"\033[{start_row + 1};{start_col}H"
-            + Term.style("│ ", Term.CYAN)
-            + Term.style(title.center(box_width - 4), Term.BOLD)
-            + Term.style(" │", Term.CYAN)
-        )
-        sys.stdout.write(
-            f"\033[{start_row + 2};{start_col}H" + Term.style("├" + "─" * (box_width - 2) + "┤", Term.CYAN)
-        )
-
-        for i, line in enumerate(lines):
-            display_line = line[: box_width - 4].ljust(box_width - 4)
-            sys.stdout.write(
-                f"\033[{start_row + 3 + i};{start_col}H"
+        top = 0
+        while True:
+            out(at(0) + Term.style("┌" + "─" * (box_width - 2) + "┐", Term.CYAN))
+            out(
+                at(1)
                 + Term.style("│ ", Term.CYAN)
-                + display_line
+                + Term.style(title[: box_width - 4].center(box_width - 4), Term.BOLD)
                 + Term.style(" │", Term.CYAN)
             )
+            out(at(2) + Term.style("├" + "─" * (box_width - 2) + "┤", Term.CYAN))
+            for i, line in enumerate(lines[top : top + view]):
+                display_line = line[: box_width - 4].ljust(box_width - 4)
+                out(at(3 + i) + Term.style("│ ", Term.CYAN) + display_line + Term.style(" │", Term.CYAN))
+            out(at(3 + view) + Term.style("└" + "─" * (box_width - 2) + "┘", Term.CYAN))
+            hint = f"[i/k: scroll, {top + 1}-{top + view} of {len(lines)}] {closing}" if tall else closing
+            out(at(4 + view) + Term.DIM + hint.center(box_width)[: cols - start_col + 1] + Term.RESET)
+            sys.stdout.flush()
 
-        sys.stdout.write(f"\033[{start_row + 3 + len(lines)};{start_col}H" + Term.style(bottom_border, Term.CYAN))
-        sys.stdout.write(
-            f"\033[{start_row + 4 + len(lines)};{start_col}H"
-            + Term.DIM
-            + ("[Press Enter: ok]" if ok else "[Press any key to close]").center(box_width)
-            + Term.RESET
-        )
-        sys.stdout.flush()
-
-        # Wait for a keypress: any closes a plain box, an `ok` box keeps reading until it is Enter
-        key = Term.getch()
-        while ok and key != Term.KEY_ENTER:
-            key = Term.getch()
+            try:
+                key = Term.getch()
+            except KeyboardInterrupt:
+                return False if answer else None
+            if tall and key in ("i", Term.KEY_UP):
+                top = max(0, top - 1)
+            elif tall and key in ("k", Term.KEY_DOWN):
+                top = min(len(lines) - view, top + 1)
+            elif answer:
+                if key.lower() == "y":
+                    return True
+                if key.lower() == "n" or key in (Term.KEY_ENTER, Term.KEY_ESC):
+                    return False
+            elif not ok or key == Term.KEY_ENTER:
+                return None
 
 
 # =============================================================================
@@ -2832,17 +3322,23 @@ class App:
     # nothing, a box says so, and it is for the user to press it again. Moving the cursor yourself, or the box's
     # ok, ends the wait.
     SWITCH_GRACE = 2.0
+    # busy() invites a Ctrl-C; one pressed as the action ends lands in the main loop, where it would quit. For this
+    # long after such an action, a Ctrl-C is taken as meant for it: said, and nothing more. The next one quits.
+    LATE_CTRL_C = 1.0
     REDRAW_POLL = 0.2  # seconds between two looks at whether a fetch landed, while no key comes
     MOVE_KEYS = ("i", "k", "g", "G", "j", "l", *"123456789")
     MOVE_KEYS += (Term.KEY_UP, Term.KEY_DOWN, Term.KEY_LEFT, Term.KEY_RIGHT, Term.KEY_TAB)
 
     def __init__(self):
         self.running = True
+        self.invited_ctrl_c = False  # busy() said "Ctrl-C to stop waiting" during the action in progress
+        self.spare_until = 0.0  # time.monotonic() until which a Ctrl-C in the main loop is a late one: LATE_CTRL_C
         self.current_tab = 0
         self.selected_index = 0
         self.scroll_offset = 0
         self.rendered: tuple | None = None  # (tab key, index, anchor) of the selection as last drawn: see locate
         self.switched_at: float | None = None  # when the cursor last fell onto another row by itself: see locate
+        self.resized = False  # the terminal changed size and the screen doesn't know yet: see run
         self.message_text = ""
         self.message_style = ""
         self.scr = Screen()  # Buffered screen for flicker-free rendering
@@ -2875,11 +3371,6 @@ class App:
                     ("Ports", "PORTS", 0),
                 ],
                 id_key="ID",
-                actions={
-                    "s": lambda id: Docker.start(id),
-                    "S": lambda id: Docker.stop(id),
-                    "r": lambda id: Docker.restart(id),
-                },
             ),
             Tab(
                 name="Images",
@@ -2891,7 +3382,6 @@ class App:
                     ("ID", "ID", 0),
                 ],
                 id_key="ID",
-                actions={},
                 anchor=("ID", "Repository", "Tag"),  # one image, several tags: several rows with one ID
             ),
             Tab(
@@ -2903,7 +3393,6 @@ class App:
                     ("Mountpoint", "MOUNTPOINT", 0),
                 ],
                 id_key="Name",
-                actions={},
             ),
             Tab(
                 name="Networks",
@@ -2915,7 +3404,6 @@ class App:
                     ("ID", "ID", 0),
                 ],
                 id_key="ID",
-                actions={},
             ),
             Tab(
                 name="Projects",
@@ -2927,7 +3415,6 @@ class App:
                     ("Repo", "REPO", 0),
                 ],
                 id_key="Name",
-                actions={},
                 empty=f"No projects configured: add TOML to {PROJECTS_DIR}/",
             ),
             Tab(
@@ -2940,7 +3427,6 @@ class App:
                     ("Ports", "PORTS", 0),
                 ],
                 id_key="Name",
-                actions={},
                 empty=f"No services configured: add TOML to {SERVICES_DIR}/",
             ),
             Tab(
@@ -2953,7 +3439,6 @@ class App:
                     ("hint", "HINT", 0),
                 ],
                 id_key="cat",
-                actions={},
                 empty="No issues",
                 anchor=("level", "cat", "msg"),
             ),
@@ -2966,7 +3451,6 @@ class App:
                     ("msg", "MESSAGE", 0),
                 ],
                 id_key="cat",
-                actions={},
                 empty="No errors",
                 anchor=("ts", "cat", "msg"),
             ),
@@ -3042,11 +3526,52 @@ class App:
         return alerts
 
     def banner(self) -> str:
-        """The one thing worth saying on every tab: why docker is unreachable, when all four listings failed for
-        the same reason. A partial failure is its panel's and the Issues tab's business."""
+        """The one thing worth saying on every tab: why docker is unreachable (a daemon that hangs included: each
+        listing gives up after POLL_TIMEOUT and says so), when all four listings failed for the same reason. A
+        partial failure is its panel's and the Issues tab's business."""
         failures = self.fetcher.get_failures()
         reasons = {failures.get(key, "") for key in LISTINGS}
         return reasons.pop() if len(reasons) == 1 else ""
+
+    def busy(self, text: str) -> None:
+        """Say what is about to block the loop, on the message line, before it does: a `docker stop` takes its
+        ten seconds, and a screen that just sits there says nothing. The next render replaces it."""
+        rows, cols = Term.size()
+        UI.message(self.scr, f"{text}... (Ctrl-C to stop waiting)", rows - 1, cols, Term.YELLOW)
+        self.scr.flush()
+        self.invited_ctrl_c = True
+
+    @staticmethod
+    def pause() -> None:
+        """On the main screen, before going back to ours: time to read what was just printed there"""
+        try:
+            input("\nPress Enter to return...")
+        except EOFError:  # Ctrl-D is an answer too
+            pass
+
+    def shell_ended(self, where: str, code: int, container: str) -> None:
+        """Back from a shell: say a non-zero exit code, which the main screen showed for an instant at best.
+        The code alone can't tell whose it is: a shell hands back that of the last command typed in it (1, 130:
+        an ordinary session), and docker its own when it never ran the shell (125-127, but also 1 for a container
+        that is not running). So docker is asked: when `container` no longer runs, or on 125-127, it goes to the
+        log too, with what is known."""
+        if not code:
+            return
+        self.set_message(f"Shell in {where} exited with code {code}", Term.YELLOW)
+        try:
+            info = Docker.inspect(ContainerInspect, container)
+        except DockerError as e:  # docker could not say: that is not "it no longer exists"
+            log_error("docker.exec", f"Shell in {where} exited with code {code}; then: {e.failure.detail}")
+            self.set_message(
+                f"Shell in {where} exited with code {code}, and {container} could not be read: {e}", Term.RED
+            )
+            return
+        if info is None or not info.State.get("Running"):
+            why = "no longer exists" if info is None else f"is not running ({info.State.get('Status', 'unknown')})"
+            log_error("docker.exec", f"Shell in {where} exited with code {code}: {container} {why}")
+            self.set_message(f"Shell in {where} exited with code {code}: {container} {why}", Term.RED)
+        elif code in (125, 126, 127):
+            log_error("docker.exec", f"Shell in {where} exited with code {code}: docker may not have run it at all")
 
     def set_message(self, text: str, style: str = "") -> None:
         """Set status message"""
@@ -3127,6 +3652,10 @@ class App:
             text = failure or self.current().empty or f"No {self.current().name.lower()} found"
             UI.message(scr, f"  {text}", list_start, cols, Term.RED if failure else Term.DIM)
 
+        # The row between the list and the message line holds nothing of ours, but a tall box draws on it
+        scr.move(rows - 2, 1)
+        scr.clear_line()
+
         # Clear message line if no message
         if self.message_text:
             UI.message(scr, self.message_text, rows - 1, cols, self.message_style)
@@ -3156,13 +3685,22 @@ class App:
         scr.flush()
 
     def handle_key(self, key: str) -> None:
-        """Handle keypress. An action that needed an answer docker didn't give stops there and says why."""
+        """Handle keypress. An action that needed an answer docker didn't give stops there and says why. Ctrl-C
+        while an action runs (or asks) gives up on that action, not on the TUI: the docker client we were waiting
+        on dies with it, what the daemon had already been told may still happen, and the next fetch shows it."""
         try:
             self._handle_key(key)
+        except KeyboardInterrupt:
+            self.enter_tui()  # the action may have left for the main screen
+            self.set_message("Interrupted: what docker was already doing may still finish", Term.YELLOW)
         except DockerError as e:
             log_error("docker.command", e.failure.detail)
             self.enter_tui()  # the action may have left for the main screen before it failed
             self.set_message(f"{e}: {e.failure.hint}", Term.RED)
+        finally:
+            if self.invited_ctrl_c:
+                self.invited_ctrl_c = False
+                self.spare_until = time.monotonic() + self.LATE_CTRL_C
 
     def _handle_key(self, key: str) -> None:
         rows, cols = Term.size()
@@ -3244,18 +3782,21 @@ class App:
             container_id = selected_id
 
             if key == "s":  # Start
+                self.busy(f"Starting {container_id[:12]}")
                 if Docker.start(container_id):
                     self.set_message(f"Started {container_id[:12]}", Term.GREEN)
                 else:
                     self.set_message(f"Failed to start {container_id[:12]}", Term.RED)
 
             elif key == "S":  # Stop
+                self.busy(f"Stopping {container_id[:12]}")
                 if Docker.stop(container_id):
                     self.set_message(f"Stopped {container_id[:12]}", Term.GREEN)
                 else:
                     self.set_message(f"Failed to stop {container_id[:12]}", Term.RED)
 
             elif key == "r":  # Restart
+                self.busy(f"Restarting {container_id[:12]}")
                 if Docker.restart(container_id):
                     self.set_message(f"Restarted {container_id[:12]}", Term.GREEN)
                 else:
@@ -3264,17 +3805,19 @@ class App:
             elif key == "L":  # Logs
                 self.exit_tui_temporarily()
                 Docker.logs(container_id, tail=100)
-                input("\nPress Enter to return...")
+                self.pause()
                 self.enter_tui()
 
             elif key == "e":  # Exec
                 self.exit_tui_temporarily()
-                Docker.shell(container_id)
+                code = Docker.shell(container_id)
                 self.enter_tui()
+                self.shell_ended(selected.Names, code, container_id)
 
             elif key == "d":  # Delete
                 name = selected.Names
-                if UI.confirm(f"Delete container '{name}'?", rows - 1):
+                if UI.confirm(f"Delete container '{name}'?", rows - 1, cols):
+                    self.busy(f"Deleting {name}")
                     if Docker.remove_container(container_id, force=True):
                         self.set_message(f"Deleted {name}", Term.GREEN)
                     else:
@@ -3294,7 +3837,8 @@ class App:
             tag = selected.Tag
             name = f"{repo}:{tag}" if tag else repo
 
-            if UI.confirm(f"Delete image '{name}'?", rows - 1):
+            if UI.confirm(f"Delete image '{name}'?", rows - 1, cols):
+                self.busy(f"Deleting {name}")
                 if Docker.remove_image(image_id, force=True):
                     self.set_message(f"Deleted {name}", Term.GREEN)
                 else:
@@ -3304,7 +3848,7 @@ class App:
         elif self.current().key == "volumes" and key == "d" and selected_id:
             volume_name = selected_id
 
-            if UI.confirm(f"Delete volume '{volume_name}'?", rows - 1):
+            if UI.confirm(f"Delete volume '{volume_name}'?", rows - 1, cols):
                 if Docker.remove_volume(volume_name):
                     self.set_message(f"Deleted {volume_name}", Term.GREEN)
                 else:
@@ -3316,14 +3860,14 @@ class App:
             name = selected.Name
 
             if key == "d":  # Delete
-                if UI.confirm(f"Delete network '{name}'?", rows - 1):
+                if UI.confirm(f"Delete network '{name}'?", rows - 1, cols):
                     if Docker.remove_network(network_id):
                         self.set_message(f"Deleted {name}", Term.GREEN)
                     else:
                         self.set_message(f"Failed to delete {name}", Term.RED)
 
             elif key == "e":  # Edit — show connected containers
-                info = Docker.inspect_network(network_id)
+                info = Docker.inspect(NetworkInspect, network_id)
                 if info:
                     containers = info.Containers
                     if containers:
@@ -3342,16 +3886,23 @@ class App:
 
             if project and key == "e":  # Enter
                 self.exit_tui_temporarily()
-                Docker.enter_project(project)
+                code = Docker.enter_project(project)
+                if code is None:  # why is on the main screen (and in the log): leave time to read it
+                    self.pause()
                 self.enter_tui()
+                if code is None:
+                    self.set_message(f"{project_name} was not entered: see Errors", Term.RED)
+                else:
+                    self.shell_ended(project_name, code, project.container_name)
 
             elif project and key == "d":  # Destroy, the prompt carrying `check`'s verdict when it is DIRTY
-                if Docker.find_project_container(project_name):
-                    prompt = f"Destroy project '{project_name}'?"
-                    if dirty := project_report(project).dirty:
-                        prompt = f"{prompt} Workspace is DIRTY: {', '.join(dirty)}."
-                    if UI.confirm(prompt, rows - 1):
-                        if Docker.destroy_project(project):
+                self.busy(f"Checking the workspace of {project_name}")
+                question = destroy_question(project)
+                if question.names:
+                    if UI.confirm(question.text, rows - 1, cols):
+                        self.busy(f"Destroying {project_name}")
+                        # Only what the prompt named: what appeared while it was up was never agreed to
+                        if Docker.destroy_project(project, question.names):
                             self.set_message(f"Destroyed {project_name}", Term.GREEN)
                         else:
                             self.set_message(f"Failed to destroy {project_name}", Term.RED)
@@ -3367,12 +3918,13 @@ class App:
             if service and key == "u":  # Up
                 self.exit_tui_temporarily()
                 Docker.service_up(service)
-                input("\nPress Enter to return...")
+                self.pause()
                 self.enter_tui()
 
             elif service and key == "d":  # Down
                 if Docker.find_service_container(service_name):
-                    if UI.confirm(f"Stop service '{service_name}'?", rows - 1):
+                    if UI.confirm(f"Stop service '{service_name}'?", rows - 1, cols):
+                        self.busy(f"Stopping {service_name}")
                         if Docker.service_down(service):
                             self.set_message(f"Stopped {service_name}", Term.GREEN)
                         else:
@@ -3381,13 +3933,13 @@ class App:
                     self.set_message(f"No container for {service_name}", Term.YELLOW)
 
             elif service and key == "r":  # Recreate
-                if UI.confirm(f"Recreate service '{service_name}'?", rows - 1):
+                if UI.confirm(f"Recreate service '{service_name}'?", rows - 1, cols):
                     self.exit_tui_temporarily()
                     if Docker.service_recreate(service):
                         print(f"Recreated {service_name}")
                     else:
                         print(f"Failed to recreate {service_name}")
-                    input("\nPress Enter to return...")
+                    self.pause()
                     self.enter_tui()
 
         # What a row clips, in full: an issue's message and hint, a log entry's message and context
@@ -3408,7 +3960,7 @@ class App:
             UI.info_box(f"{event.time}  {event.cat}", lines, rows, cols)
 
         elif self.current().key == "errors" and key == "c" and items:
-            if UI.confirm("Clear the error log?", rows - 1):
+            if UI.confirm("Clear the error log?", rows - 1, cols):
                 self.set_message(f"Cleared {clear_errors()} errors", Term.GREEN)
 
     def enter_tui(self) -> None:
@@ -3429,9 +3981,11 @@ class App:
     def run(self) -> None:
         """Main TUI loop"""
 
-        # Set up signal handler for window resize
+        # A resize is only noted here, and drawn by the loop below. A handler runs wherever the main thread
+        # happens to be: drawing from it paints the list over the shell or the logs we handed the terminal to
+        # (the loop doesn't turn while one of those runs), or lands in the middle of a frame being built.
         def handle_resize(signum, frame):
-            self.render()
+            self.resized = True
 
         signal.signal(signal.SIGWINCH, handle_resize)
 
@@ -3441,14 +3995,23 @@ class App:
         self.enter_tui()
         try:
             while self.running:
-                version = self.fetcher.version  # read before drawing: a fetch landing meanwhile is drawn next
-                self.render()
-                key = ""
-                while not key and self.fetcher.version == version:  # a key, or a fetch to show: whichever first
-                    key = Term.getch(timeout=self.REDRAW_POLL)
-                if key:
-                    self.handle_key(key)
-        except KeyboardInterrupt:  # Ctrl-C quits, from the list as from a prompt or a docker call that hangs
+                try:
+                    # Read before drawing: what changes meanwhile is drawn next
+                    self.resized = False
+                    version = self.fetcher.version
+                    self.render()
+                    key = ""
+                    # A key, a fetch to show, a new size: whichever first
+                    while not key and not self.resized and self.fetcher.version == version:
+                        key = Term.getch(timeout=self.REDRAW_POLL)
+                    if key:
+                        self.handle_key(key)
+                except KeyboardInterrupt:
+                    if time.monotonic() >= self.spare_until:
+                        raise
+                    self.spare_until = 0.0  # one late Ctrl-C is spared, not every one for a second
+                    self.set_message("Too late to interrupt: that had just finished", Term.YELLOW)
+        except KeyboardInterrupt:  # Ctrl-C quits from the list; during an action it only ends that (handle_key)
             pass
         finally:
             self.fetcher.stop()
@@ -3502,7 +4065,7 @@ def _table_width(wide: bool) -> int | None:
 
 def cli_ps(args: argparse.Namespace) -> None:
     """List containers"""
-    containers = Docker.list_containers(all_containers=not args.running).logged()
+    containers = Docker.list_containers(all_containers=not args.running).required()
 
     if args.quiet:
         for c in containers:
@@ -3527,7 +4090,7 @@ def cli_ps(args: argparse.Namespace) -> None:
 
 def cli_images(args: argparse.Namespace) -> None:
     """List images"""
-    images = Docker.list_images().logged()
+    images = Docker.list_images().required()
 
     if args.quiet:
         for img in images:
@@ -3546,7 +4109,7 @@ def cli_images(args: argparse.Namespace) -> None:
 
 def cli_volumes(args: argparse.Namespace) -> None:
     """List volumes"""
-    volumes = Docker.list_volumes().logged()
+    volumes = Docker.list_volumes().required()
 
     if args.quiet:
         for v in volumes:
@@ -3563,7 +4126,7 @@ def cli_volumes(args: argparse.Namespace) -> None:
 
 def cli_networks(args: argparse.Namespace) -> None:
     """List networks"""
-    networks = Docker.list_networks().logged()
+    networks = Docker.list_networks().required()
 
     if args.quiet:
         for n in networks:
@@ -3609,17 +4172,22 @@ def cli_restart(args: argparse.Namespace) -> None:
 
 def cli_logs(args: argparse.Namespace) -> None:
     """Show container logs"""
-    Docker.logs(args.container, follow=args.follow, tail=args.tail)
+    sys.exit(Docker.logs(args.container, follow=args.follow, tail=args.tail))
 
 
 def cli_exec(args: argparse.Namespace) -> None:
-    """Execute command in container"""
-    Docker.exec(args.container, args.command)
+    """Execute command in container. Everything after the container is the command, dashes included
+    (`exec <id> ls -la`); a leading `--` is accepted and dropped."""
+    command = args.command[1:] if args.command[:1] == ["--"] else args.command
+    if not command:
+        print("Usage: containerctl exec <id> <cmd...>", file=sys.stderr)
+        sys.exit(2)
+    sys.exit(Docker.exec(args.container, command))
 
 
 def cli_shell(args: argparse.Namespace) -> None:
     """Open shell in container"""
-    Docker.shell(args.container, args.shell)
+    sys.exit(Docker.shell(args.container, args.shell))
 
 
 def cli_enter(args: argparse.Namespace) -> None:
@@ -3644,7 +4212,9 @@ def cli_enter(args: argparse.Namespace) -> None:
             print(f"Invalid user: {value}", file=sys.stderr)
             sys.exit(1)
         user = value
-    Docker.enter_project(project, user=user, workdir=workdir)
+    code = Docker.enter_project(project, user=user, workdir=workdir)
+    if code != 0:  # no shell (None), or the shell's own exit code, as `shell` and `exec` hand it back
+        sys.exit(1 if code is None else code)
 
 
 def cli_spawn(args: argparse.Namespace) -> None:
@@ -3661,19 +4231,44 @@ def cli_spawn(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def stdin_is_tty() -> bool:
+    """Is somebody at a terminal on the other end of our stdin?"""
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except ValueError:  # closed after startup; closed before it (`<&-`), there is no sys.stdin at all
+        return False
+
+
+def confirm_cli(prompt: str) -> bool:
+    """y/N on the terminal. No when there is nobody to ask: a script, a pipe, a closed stdin."""
+    if not stdin_is_tty():
+        return False
+    try:
+        return input(f"{prompt} [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
 def cli_destroy(args: argparse.Namespace) -> None:
-    """Destroy a project container, after a `check` of its workspace: a DIRTY verdict is printed, not enforced"""
+    """Destroy a project container, after a `check` of its workspace and a yes: the verdict (DIRTY, or a check
+    that could not run) is in the question, and so is what an unfinished spawn left (it may still be running).
+    `--force` skips the question, not the check: the verdict is still printed, as a warning."""
     projects = load_projects()
     if args.project not in projects:
         print(f"Unknown project: {args.project}", file=sys.stderr)
         sys.exit(1)
     project = projects[args.project]
-    if Docker.find_project_container(project.name):
-        report = project_report(project)
-        if not report.clean:
-            print_report(f"{project.name} ({project.container_name})", report)
-            print(f"warning: {project.name} is DIRTY, destroying anyway ({', '.join(report.dirty)})", file=sys.stderr)
-    if not Docker.destroy_project(project):
+    question = destroy_question(project)
+    if question.report and not question.report.clean:
+        print_report(f"{project.name} ({project.container_name})", question.report)
+    if args.force:
+        if question.verdict:
+            print(f"warning: {project.name}: {question.verdict}, destroying anyway (--force)", file=sys.stderr)
+    elif question.text and not confirm_cli(question.text):
+        nobody = "" if stdin_is_tty() else ": no terminal to ask on, use --force"
+        print(f"Not destroyed{nobody}", file=sys.stderr)
+        sys.exit(1)
+    if not Docker.destroy_project(project, question.names):  # what was asked about
         sys.exit(1)
     print(f"Destroyed {args.project}")
 
@@ -3710,13 +4305,19 @@ def cli_projects(args: argparse.Namespace) -> None:
 def _check_one(project: "ProjectConfig") -> bool | None:
     """Check a single project's workspace over docker exec.
 
-    Returns True if clean, False if dirty, None if there is no container.
+    Returns True if clean, False if dirty or impossible to check, None if there is no container.
     """
     container = Docker.find_project_container(project.name)
     if container is None:
         print(f"{project.name}: no container (nothing to check)")
         return None
-    return print_report(f"{project.name} ({project.container_name})", project_report(project))
+    try:
+        report = project_report(project)
+    except DockerError as e:  # no verdict is not a clean one; with --all, the others still get theirs
+        log_error("docker.command", e.failure.detail)
+        print(f"{project.name} ({project.container_name}):\n  could NOT be checked: {e} ({e.failure.hint})")
+        return False
+    return print_report(f"{project.name} ({project.container_name})", report)
 
 
 def cli_check(args: argparse.Namespace) -> None:
@@ -3790,7 +4391,11 @@ def cli_check_local(args: argparse.Namespace) -> None:
     expected = read_manifest()
     if expected is None:
         print("Warning: no manifest found; skipping extra/missing detection", file=sys.stderr)
-    report = check_workspace(expected, _local_list_dirs, _local_git)
+    try:
+        report = check_workspace(expected, _local_list_entries, _local_git, read_injected(), _local_digest)
+    except OSError as e:  # a workspace we can't list, or no git here: no verdict, and that is not "clean"
+        print(f"error: could not check the workspace: {e}", file=sys.stderr)
+        sys.exit(1)
     clean = print_report("workspace", report)
     if not clean:
         sys.exit(1)
@@ -3848,7 +4453,7 @@ def cli_service_script(args: argparse.Namespace) -> None:
     if container is None:
         print(f"No container found for service {service.name} (run 'service up' first)", file=sys.stderr)
         sys.exit(1)
-    Docker.exec(service.container_name, service.scripts[args.script])
+    sys.exit(Docker.exec(service.container_name, service.scripts[args.script]))
 
 
 def cli_service_scripts(args: argparse.Namespace) -> None:
@@ -3925,8 +4530,8 @@ def image_state(image: "ImageConfig", rows: list[Image]) -> ImageState:
     elif tag_id is None:
         built = "not built"
     else:
-        info = Docker.inspect_image(image.tag)
-        label = (info.Config.get("Labels") or {}).get(LABEL_RECIPE) if info else None
+        info = Docker.inspect(ImageInspect, image.tag)
+        label = ((info.Config or {}).get("Labels") or {}).get(LABEL_RECIPE) if info else None
         built = "built elsewhere" if label is None else ("up to date" if label == recipe else "stale")
     return ImageState(versions, current, built)
 
@@ -3996,13 +4601,59 @@ def cli_image_check(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
-def usage() -> int:
-    """Display usage information"""
+# `help full`: the why and the concepts, ahead of the commands. Written for me in two years, and for whoever reads
+# the README, which is this output (a test holds them equal). Say what a thing is and why it is that way, not how
+# to type it: the commands below it do that.
+CONCEPTS = [
+    "Why: I work in throwaway containers and keep a few services up. I want that in one file I can read,",
+    "stdlib only, on top of the docker CLI I already know. No daemon of its own, no state of its own:",
+    "what exists is what `docker ps` says, what should exist is a few TOML files. Not compose, not k8s.",
+    "──────────────────────────────────────────────",
+    "Concepts",
+    "- project  ==> a throwaway dev container (cctl-prj-<name>, own network cctl-net-prj-<name>) from a TOML:",
+    "               image, ssh key, repos cloned in ~/workspace, env files. `enter` spawns it when",
+    "               missing, then drops you in a shell. Nothing is mounted from the host: what is not pushed",
+    "               dies with the container. That is the point, and why `check` exists. It is made as",
+    "               cctl-spawning-<name> and renamed once all of that is in: a spawn that died halfway is",
+    "               not a project container: the next `enter` says how old it is, asks, and starts over.",
+    "- check    ==> is it safe to destroy? Everything in the workspace must be a configured repo, and every",
+    "               repo boring: nothing uncommitted or untracked, no stash, no detached HEAD, no linked",
+    "               worktree, every local branch on its upstream. Anything else is DIRTY, what could not be",
+    "               read included. Submodules, nested ones too, are repos of their own and checked as such.",
+    "               No network: it trusts the remote refs as last fetched. `destroy` runs it first, then asks.",
+    "- shortcut ==> a name for a dir of a project: `enter <shortcut>` lands there. Global: keep them unique.",
+    "- env      ==> of a project: [env] plain values, [secrets] names of keys in secrets.toml. Both reach the",
+    "               `enter` shell only: never argv, never the container's config, never a project file.",
+    "- service  ==> a long-lived container (cctl-svc-<name>): `docker run` written as TOML, plus scripts to",
+    "               exec in it. `up` creates or starts (and connects new networks), it never changes a",
+    "               container: any other TOML edit needs `recreate`. Its `env` is plain `docker run -e`:",
+    "               anyone who can `docker inspect` reads it.",
+    "- image    ==> a recipe: a Dockerfile (+ context dir) beside a TOML. Each build is its own tag,",
+    "               <repo>:cctl-local-NNNNNN, and the recipe tag is re-pointed at it: the previous build is",
+    "               still there to go back to. `spawn` / `up` build a missing image, never rebuild one.",
+    "               `image check` says when the build is stale, and diffs the Dockerfile against upstream.",
+    "               A project image must have: the project's user and its home (`dev` and /home/dev,",
+    "               unless its TOML says another `user` / `home`), bash, git (+ ssh for git@ repos),",
+    "               coreutils. python3 too, for `check-local` to run inside. Its USER does not matter: the",
+    "               clones, the checks and the `enter` shell all run as the project's user.",
+    "- issue    ==> true right now and wants an action: docker down, a TOML that doesn't parse, a container",
+    "               with no config left, ... Detected, never stored: fix it and it is gone.",
+    "- error    ==> something that failed once: a log. A tab in the TUI; a CLI run prints its own at the end.",
+    "- TUI      ==> no argument. One tab per kind of thing, refreshed every 2s. i/k up/down, j/l or 1-9 for",
+    "               tabs, g/G top/bottom, q quits; the bottom line has the keys of the tab you are on.",
+    "──────────────────────────────────────────────",
+]
+
+
+def usage(full: bool = False) -> int:
+    """Display usage information: the commands, after the concepts when `full`"""
     output_lines = [
         "containerctl - KISS containers CLI/TUI manager",
         "──────────────────────────────────────────────",
+        *(CONCEPTS if full else []),
         "- containerctl                          ==> launch TUI",
         "- containerctl help                     ==> show this help",
+        "- containerctl help full                ==> the why and the concepts, then this help (= the README)",
         "- containerctl help config              ==> example project, service, image and secrets TOML",
         "──────────────────────────────────────────────",
         "- containerctl ps                       ==> list containers",
@@ -4024,7 +4675,7 @@ def usage() -> int:
         "- containerctl logs <id> -f             ==> follow container logs",
         "- containerctl logs <id> -n 100         ==> show last 100 lines",
         "──────────────────────────────────────────────",
-        "- containerctl exec <id> <cmd...>       ==> execute command in container",
+        "- containerctl exec <id> <cmd...>       ==> execute command in container (exits with its code)",
         "- containerctl shell <id>               ==> open shell in container",
         "- containerctl shell <id> -s /bin/bash  ==> open bash in container",
         "──────────────────────────────────────────────",
@@ -4032,11 +4683,12 @@ def usage() -> int:
         "- containerctl enter <proj> user=root   ==> enter project as another user",
         "- containerctl enter <shortcut>         ==> enter project, landing in a [shortcuts] dir",
         "- containerctl spawn <project>          ==> force-create project container",
-        "- containerctl destroy <project>        ==> stop and remove project container (warns when DIRTY)",
+        "- containerctl destroy <project>        ==> stop and remove project container (checks, then asks)",
+        "- containerctl destroy <project> -f     ==> same, without asking (--force; DIRTY is still said)",
         "- containerctl projects                 ==> list configured projects",
         "- containerctl projects -w              ==> wide: full shortcut lists, never clip",
         "──────────────────────────────────────────────",
-        "- containerctl check <project>          ==> is the workspace safe to destroy? (uncommitted/unpushed/extra)",
+        "- containerctl check <project>          ==> is the workspace safe to destroy? (exit 1 when DIRTY)",
         "- containerctl check --all              ==> check every configured project",
         "- containerctl check-local              ==> run the same check from inside a container",
         "- containerctl issues                   ==> what wants an action: docker down, broken config, shortcuts, ...",
@@ -4066,17 +4718,21 @@ def config_usage() -> int:
     """Display example project and service configs (every supported field)"""
     output_lines = [
         f"# {PROJECTS_DIR}/<name>.toml  -  the file name is the project name",
+        "# The image must have: the user and home below, bash, git (+ ssh for git@ repos), coreutils;",
+        "# python3 too, for `containerctl check-local` to run inside. A spawn into an image without them fails.",
         'image = "ubuntu:24.04"                    # or pin by digest: "ubuntu@sha256:..."',
-        'ssh_key = "~/.ssh/id_ed25519"             # copied to /home/dev/.ssh/id_ed25519 (optional)',
-        "repos = [                                 # cloned under /home/dev/workspace (optional)",
+        'user = "ubuntu"                           # who clones, checks and enters; owns what follows (default: "dev")',
+        'home = "/home/ubuntu"                     # its home there (default: /home/<user>, /root for root)',
+        'ssh_key = "~/.ssh/id_ed25519"             # copied to <home>/.ssh/id_ed25519 (optional)',
+        "repos = [                                 # cloned under <home>/workspace (optional)",
         '  "git@github.com:you/app.git",',
         '  { url = "https://github.com/you/lib.git", dir = "lib", branch = "main" },',
         "]",
         "env_files = [                             # copied into the container (optional)",
-        '  { src = "~/.secrets/app.env", dest = "/home/dev/workspace/app/.env" },',
+        '  { src = "~/.secrets/app.env", dest = "/home/ubuntu/workspace/app/.env" },',
         "]",
         "[shortcuts]                               # `containerctl enter <alias>` lands there (optional)",
-        'app = "app"                               # relative to /home/dev/workspace',
+        'app = "app"                               # relative to <home>/workspace',
         'lib = "lib/src"',
         "[env]                                     # plain values for the `enter` shell's environment (optional)",
         'TZ = "UTC"',
@@ -4111,13 +4767,28 @@ def config_usage() -> int:
     return 0
 
 
+def leave_cleanly() -> None:
+    """However we go, go the same way. A closed terminal (SIGHUP) or a `kill` (SIGTERM) becomes an ordinary exit,
+    so every `finally` on the way out runs (the TUI gives the terminal back), and at any exit the docker calls
+    still in flight in their own process group are killed: nothing else would (see Docker._run)."""
+
+    def leave(signum, frame):
+        sys.exit(128 + signum)
+
+    for sig in (signal.SIGHUP, signal.SIGTERM):
+        if signal.getsignal(sig) is not signal.SIG_IGN:  # ignored on purpose (`nohup`) stays ignored
+            signal.signal(sig, leave)
+    atexit.register(Docker.kill_own_group, leaving=True)
+
+
 def main() -> None:
     """Main entry point"""
+    leave_cleanly()
     # Check for help before argparse
     if len(sys.argv) > 1 and sys.argv[1] in ("help", "-h", "--help"):
         if sys.argv[2:] == ["config"]:
             sys.exit(config_usage())
-        sys.exit(usage())
+        sys.exit(usage(full=sys.argv[2:] == ["full"]))
 
     parser = argparse.ArgumentParser(
         description="containerctl - containers CLI/TUI manager",
@@ -4174,7 +4845,7 @@ def main() -> None:
     # exec
     exec_parser = subparsers.add_parser("exec", help="Execute command in container")
     exec_parser.add_argument("container", help="Container ID or name")
-    exec_parser.add_argument("command", nargs="+", help="Command to run")
+    exec_parser.add_argument("command", nargs=argparse.REMAINDER, help="Command to run")
     exec_parser.set_defaults(func=cli_exec)
 
     # shell
@@ -4197,6 +4868,7 @@ def main() -> None:
     # destroy
     destroy_parser = subparsers.add_parser("destroy", help="Destroy a project container")
     destroy_parser.add_argument("project", help="Project name")
+    destroy_parser.add_argument("-f", "--force", action="store_true", help="Don't ask, even when DIRTY")
     destroy_parser.set_defaults(func=cli_destroy)
 
     # check
@@ -4282,8 +4954,11 @@ def main() -> None:
             log_error("docker.command", e.failure.detail)
             print(f"error: {e} ({e.failure.hint})", file=sys.stderr)
             sys.exit(1)
+        except KeyboardInterrupt:  # Ctrl-C: the docker client we were waiting on got it too; no traceback
+            print("\ninterrupted", file=sys.stderr)
+            sys.exit(130)
         finally:
-            if errors := get_errors():
+            if errors := [e for e in get_errors() if not e.echoed]:
                 print_errors(errors, file=sys.stderr)
 
 

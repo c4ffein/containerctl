@@ -54,12 +54,14 @@ class RunRecorder:
         self.calls = []
         self.stdins = []  # one entry per call: the stdin= of a no-context `build -` lands here
         self.inputs = []  # one entry per call: the input= string of an `exec -i` lands here
+        self.own_groups = []  # one entry per call: was it taken out of the terminal's process group?
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
 
-    def __call__(self, args, capture=True, stdin=None, input=None):
+    def __call__(self, args, capture=True, stdin=None, input=None, timeout=None, own_group=False):
         self.calls.append(list(args))
+        self.own_groups.append(own_group)
         self.stdins.append(stdin)
         self.inputs.append(input)
         return subprocess.CompletedProcess(
@@ -72,6 +74,37 @@ class RunRecorder:
     @property
     def last(self):
         return self.calls[-1] if self.calls else None
+
+
+class PopenRecorder:
+    """Stand-in for ``subprocess.Popen``, which only the listings go through (they run in their own process
+    group, tracked: see ``Docker._run_own_group``). Records each cmd, kwargs and the fake process handed back;
+    with ``hang`` the first ``communicate`` of each raises TimeoutExpired, as for a daemon that does not answer."""
+
+    def __init__(self, returncode=0, stdout="", stderr="", hang=False):
+        self.calls, self.kwargs, self.procs = [], [], []
+        self.returncode, self.stdout, self.stderr, self.hang = returncode, stdout, stderr, hang
+
+    def __call__(self, cmd, **kwargs):
+        self.calls.append(list(cmd))
+        self.kwargs.append(dict(kwargs))
+        self.procs.append(FakeProcess(self, cmd))
+        return self.procs[-1]
+
+
+class FakeProcess:
+    def __init__(self, recorder, cmd):
+        self.recorder, self.cmd, self.returncode = recorder, cmd, recorder.returncode
+        self.killed, self.timeouts = False, []  # the timeout= of each communicate
+
+    def communicate(self, timeout=None):
+        self.timeouts.append(timeout)
+        if self.recorder.hang and not self.killed:
+            raise subprocess.TimeoutExpired(self.cmd, timeout)
+        return self.recorder.stdout, self.recorder.stderr
+
+    def kill(self):
+        self.killed = True
 
 
 class SubprocessRecorder:

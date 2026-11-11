@@ -19,12 +19,19 @@ class IsValidIdTests(unittest.TestCase):
         self.assertTrue(is_valid_id("abc123"))
         self.assertTrue(is_valid_id("my-container_1"))
 
-    def test_empty_string_is_valid(self):
-        # all() over an empty iterable is True; documented behaviour.
-        self.assertTrue(is_valid_id(""))
+    def test_empty_string_is_rejected(self):
+        self.assertFalse(is_valid_id(""))
+
+    def test_dots_are_accepted_as_docker_does_in_names(self):
+        self.assertTrue(is_valid_id("my.volume_1"))
+
+    def test_a_leading_dash_or_dot_is_rejected(self):
+        # `-x` would be read by docker as an option; `.`/`..` are never names
+        for bad in ["-a", "--help", ".", "..", ".hidden"]:
+            self.assertFalse(is_valid_id(bad), bad)
 
     def test_rejects_shell_metacharacters(self):
-        for bad in ["a;b", "a b", "a$b", "a|b", "a/b", "a:b", "a.b", "a\nb"]:
+        for bad in ["a;b", "a b", "a$b", "a|b", "a/b", "a:b", "a\nb"]:
             self.assertFalse(is_valid_id(bad), bad)
 
 

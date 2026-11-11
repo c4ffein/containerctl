@@ -7,6 +7,7 @@ Rendered text is compared after stripping ANSI escapes.
 
 import io
 import re
+import subprocess
 import time
 import unittest
 from contextlib import redirect_stdout
@@ -64,7 +65,7 @@ def keys(*seq):
 
 
 def tab(columns, id_key="ID", key="containers"):
-    return Tab(name="T", key=key, columns=columns, id_key=id_key, actions={})
+    return Tab(name="T", key=key, columns=columns, id_key=id_key)
 
 
 class ScreenTests(unittest.TestCase):
@@ -193,6 +194,36 @@ class UIWidgetTests(unittest.TestCase):
         self.assertTrue("".join(self.scr.buf).endswith(Term.GREEN + "hello" + Term.RESET))
 
 
+class WideConfirmTests(unittest.TestCase):
+    """A question that does not fit on the bottom line is asked in a box: wrapped, and scrolling when tall"""
+
+    PROMPT = "Destroy project 'demo'? Workspace is DIRTY: " + ", ".join(f"repo-{n}" for n in range(60)) + "."
+
+    def _confirm(self, prompt, *seq, rows=12):
+        with mock.patch.object(Term, "getch", keys(*seq)):
+            with redirect_stdout(io.StringIO()) as out:
+                result = UI.confirm(prompt, rows - 1, 60)
+        return result, plain(out.getvalue())
+
+    def test_a_question_that_fits_stays_on_its_line(self):
+        result, out = self._confirm("Sure?", "y")
+        self.assertTrue(result)
+        self.assertIn("Sure? [y/N]", out)
+        self.assertNotIn("┌", out)
+
+    def test_a_wide_one_is_a_box_with_all_of_it_reachable(self):
+        result, out = self._confirm(self.PROMPT, *"k" * 40, "y")
+        self.assertTrue(result)
+        self.assertIn("[y: yes] [n / Enter: no]", out)
+        self.assertIn("i/k: scroll", out)
+        for n in range(60):
+            self.assertIn(f"repo-{n}", out)
+
+    def test_only_y_says_yes(self):
+        for key in ("n", Term.KEY_ENTER, Term.KEY_ESC):
+            self.assertFalse(self._confirm(self.PROMPT, "x", key)[0])  # x: neither answer, still asking
+
+
 class ConfirmAndInfoBoxTests(unittest.TestCase):
     def _confirm(self, *seq):
         with mock.patch.object(Term, "getch", keys(*seq)):
@@ -224,6 +255,15 @@ class ConfirmAndInfoBoxTests(unittest.TestCase):
         self.assertIn("[Press any key to close]", text)
         getch.assert_called_once()
 
+    def test_ctrl_c_closes_the_modal_that_is_open_and_answers_no(self):
+        # It ends what is in front, not the TUI under it: nothing reaches handle_key, let alone run
+        with mock.patch.object(Term, "getch", side_effect=KeyboardInterrupt), redirect_stdout(io.StringIO()):
+            self.assertIsNone(UI.info_box("Title", ["line"], 24, 80))
+            self.assertIsNone(UI.info_box("Title", ["line"], 24, 80, ok=True))  # even one that wants Enter
+            self.assertIs(UI.info_box("Confirm", ["sure?"], 24, 80, answer=True), False)
+            self.assertIs(UI.confirm("Delete?", 23, 80), False)
+            self.assertIs(UI.confirm("Delete " + "x" * 100 + "?", 23, 80), False)  # the boxed one
+
     def test_a_warning_box_only_closes_on_enter(self):
         getch = mock.Mock(side_effect=["d", "y", "x", Term.KEY_ENTER, "z"])
         with mock.patch.object(Term, "getch", getch):
@@ -231,6 +271,47 @@ class ConfirmAndInfoBoxTests(unittest.TestCase):
                 UI.info_box("Title", ["line"], 24, 80, ok=True)
         self.assertIn("[Press Enter: ok]", plain(out.getvalue()))
         self.assertEqual(getch.call_count, 4)
+
+    def test_a_box_taller_than_the_screen_scrolls_with_i_and_k(self):
+        lines = [f"line {n}" for n in range(30)]
+        frames = []
+
+        def getch(timeout=None, script=iter(["i", "k", "k", Term.KEY_UP, "x"])):
+            frames.append(plain(out.getvalue()))
+            out.seek(0)
+            out.truncate()
+            return next(script)
+
+        with mock.patch.object(Term, "getch", getch):
+            with redirect_stdout(io.StringIO()) as out:
+                UI.info_box("Title", lines, 16, 80)  # 16 rows: 10 lines of content at once
+        self.assertEqual(len(frames), 5)  # i at the top stays put; k, k, up move; x closes
+        self.assertIn("[i/k: scroll, 1-10 of 30]", frames[0])
+        self.assertIn("line 0 ", frames[0])
+        self.assertNotIn("line 10", frames[0])
+        self.assertIn("1-10 of 30", frames[1])
+        self.assertIn("3-12 of 30", frames[3])
+        self.assertNotIn("line 1 ", frames[3])
+        self.assertIn("line 11", frames[3])
+        self.assertIn("2-11 of 30", frames[4])
+        for frame in frames:  # never drawn above the first row
+            self.assertNotIn("\x1b[0;", frame)
+
+    def test_scrolling_stops_at_the_last_line(self):
+        getch = mock.Mock(side_effect=["k"] * 50 + ["x"])
+        with mock.patch.object(Term, "getch", getch):
+            with redirect_stdout(io.StringIO()) as out:
+                UI.info_box("T", [f"line {n}" for n in range(12)], 16, 80)
+        self.assertIn("3-12 of 12", plain(out.getvalue()))
+        self.assertNotIn("4-13", plain(out.getvalue()))
+
+    def test_a_box_that_fits_closes_on_i_and_k_like_on_any_key(self):
+        getch = mock.Mock(return_value="k")
+        with mock.patch.object(Term, "getch", getch):
+            with redirect_stdout(io.StringIO()) as out:
+                UI.info_box("T", ["one"], 24, 80)
+        getch.assert_called_once()
+        self.assertNotIn("scroll", plain(out.getvalue()))
 
     def test_info_box_clips_lines_to_terminal_width(self):
         with mock.patch.object(Term, "getch", keys("x")):
@@ -261,7 +342,8 @@ class AppBase(unittest.TestCase):
         self.app.scroll_offset = 0
 
     def feed(self, key):
-        self.app.handle_key(key)
+        with redirect_stdout(io.StringIO()) as self.out:  # the "busy" line an action draws before it blocks
+            self.app.handle_key(key)
 
     def rendered(self):
         with redirect_stdout(io.StringIO()) as out:
@@ -356,6 +438,13 @@ class AppRenderTests(AppBase):
             out = self.rendered()
             self.assertIn(text[: self.COLS - 2], out, key)
             self.assertIn("0 items", out, key)
+
+    def test_every_row_is_repainted_so_nothing_a_box_drew_stays(self):
+        # A tall box reaches the row between the list and the message line, which holds nothing of ours
+        with redirect_stdout(io.StringIO()) as out:
+            self.app.render()
+        for row in range(1, self.ROWS + 1):
+            self.assertIn(f"\033[{row};1H", out.getvalue(), f"row {row} is never written")
 
     def test_a_failed_listing_says_why_in_its_panel_and_only_there(self):
         self.app.fetcher.failures = {"images": "Unknown docker failure"}
@@ -602,10 +691,17 @@ class AppContainerActionTests(AppBase):
         self.assertEqual(self.app.message_text, "Failed to start id0000000001")
         self.assertEqual(self.app.message_style, Term.RED)
 
+    def test_ctrl_c_at_a_confirmation_cancels_it_quietly(self):
+        with mock.patch.object(Term, "getch", side_effect=KeyboardInterrupt):
+            self.feed("d")
+        self.assertEqual(self.rec.calls, [])  # nothing deleted
+        self.assertTrue(self.app.running)
+        self.assertEqual(self.app.message_text, "")  # and nothing was interrupted: no docker call was running
+
     def test_delete_requires_confirmation(self):
         with mock.patch.object(UI, "confirm", return_value=False) as confirm:
             self.feed("d")
-        confirm.assert_called_once_with("Delete container 'c1'?", self.ROWS - 1)
+        confirm.assert_called_once_with("Delete container 'c1'?", self.ROWS - 1, self.COLS)
         self.assertEqual(self.rec.calls, [])
         with mock.patch.object(UI, "confirm", return_value=True):
             self.feed("d")
@@ -629,6 +725,62 @@ class AppContainerActionTests(AppBase):
         ):
             self.feed("e")
         self.assertEqual(order, ["exit", "shell:id0000000001", "enter"])
+
+    def _shell(self, code, state):
+        """Press e, the shell handing back `code`; `state` is what docker then says of the container (None:
+        no such container)"""
+        info = state and mock.Mock(State=state)
+        with (
+            mock.patch.object(self.app, "exit_tui_temporarily"),
+            mock.patch.object(Docker, "shell", return_value=code),
+            mock.patch.object(Docker, "inspect", return_value=info) as self.inspect,
+            mock.patch.object(self.app, "enter_tui"),
+        ):
+            self.feed("e")
+        return self.app.message_text, self.app.message_style, [e.cat for e in containerctl.get_errors()]
+
+    def test_a_shell_that_exits_zero_asks_nothing(self):
+        self.assertEqual(self._shell(0, {"Running": True}), ("", "", []))
+        self.inspect.assert_not_called()
+
+    def test_a_non_zero_exit_in_a_running_container_is_the_shells_own(self):
+        text, style, errors = self._shell(1, {"Running": True, "Status": "running"})
+        self.assertEqual((text, style, errors), ("Shell in c1 exited with code 1", Term.YELLOW, []))
+        self.inspect.assert_called_once_with(containerctl.ContainerInspect, "id0000000001")
+
+    def test_a_non_zero_exit_from_a_container_that_does_not_run_is_logged_whatever_the_code(self):
+        # `docker exec` on a stopped container: exit 1, and its message gone with the main screen
+        text, style, errors = self._shell(1, {"Running": False, "Status": "exited"})
+        self.assertEqual(text, "Shell in c1 exited with code 1: id0000000001 is not running (exited)")
+        self.assertEqual((style, errors), (Term.RED, ["docker.exec"]))
+        self.assertEqual(containerctl.get_errors()[0].msg, text)
+
+    def test_a_non_zero_exit_from_a_container_that_is_gone_is_logged(self):
+        text, _, errors = self._shell(137, None)
+        self.assertEqual(text, "Shell in c1 exited with code 137: id0000000001 no longer exists")
+        self.assertEqual(errors, ["docker.exec"])
+
+    def test_a_container_docker_could_not_tell_about_is_not_said_to_be_gone(self):
+        down = subprocess.CompletedProcess([], 1, "", "Cannot connect to the Docker daemon at unix:///x.sock.")
+        failed = containerctl.DockerError(containerctl.docker_failure(["inspect", "id0000000001"], down))
+        with (
+            mock.patch.object(self.app, "exit_tui_temporarily"),
+            mock.patch.object(Docker, "shell", return_value=137),
+            mock.patch.object(Docker, "inspect", side_effect=failed),
+            mock.patch.object(self.app, "enter_tui"),
+        ):
+            self.feed("e")
+        self.assertEqual(
+            (self.app.message_text, self.app.message_style),
+            (
+                "Shell in c1 exited with code 137, and id0000000001 could not be read: Docker daemon is not running",
+                Term.RED,
+            ),
+        )
+        self.assertNotIn("no longer exists", self.app.message_text)
+        logged = containerctl.get_errors()
+        self.assertEqual([e.cat for e in logged], ["docker.exec"])
+        self.assertIn("Cannot connect to the Docker daemon", logged[0].msg)
 
     def test_logs_waits_for_enter_before_returning(self):
         with (
@@ -658,7 +810,7 @@ class AppOtherTabActionTests(AppBase):
         self.app.fetcher.data["images"] = [Image("sha", "nginx", "1.27", "1MB")]
         with mock.patch.object(UI, "confirm", return_value=True) as confirm:
             self.feed("d")
-        confirm.assert_called_once_with("Delete image 'nginx:1.27'?", self.ROWS - 1)
+        confirm.assert_called_once_with("Delete image 'nginx:1.27'?", self.ROWS - 1, self.COLS)
         self.assertEqual(self.rec.last, ["rmi", "-f", "sha"])
 
     def test_a_keypress_acts_on_one_snapshot_of_the_list(self):
@@ -673,8 +825,8 @@ class AppOtherTabActionTests(AppBase):
             mock.patch.object(self.app.fetcher, "get", side_effect=swapping),
             mock.patch.object(UI, "confirm", return_value=True) as confirm,
         ):
-            self.app._handle_key("d")
-        confirm.assert_called_once_with("Delete image 'nginx:1.27'?", self.ROWS - 1)
+            self.feed("d")
+        confirm.assert_called_once_with("Delete image 'nginx:1.27'?", self.ROWS - 1, self.COLS)
         self.assertEqual(self.rec.last, ["rmi", "-f", "sha1"])
 
     def test_a_key_acts_on_the_row_that_was_drawn_wherever_it_is_now(self):
@@ -686,7 +838,7 @@ class AppOtherTabActionTests(AppBase):
         self.app.fetcher.data["images"] = [Image("sha0", "alpine", "3", "1MB"), nginx, redis]
         with mock.patch.object(UI, "confirm", return_value=True) as confirm:
             self.feed("d")
-        confirm.assert_called_once_with("Delete image 'nginx:1.27'?", self.ROWS - 1)
+        confirm.assert_called_once_with("Delete image 'nginx:1.27'?", self.ROWS - 1, self.COLS)
         self.assertEqual(self.rec.last, ["rmi", "-f", "sha1"])
         self.assertEqual(self.app.selected_index, 1)  # the selection followed it
 
@@ -699,7 +851,7 @@ class AppOtherTabActionTests(AppBase):
         self.app.fetcher.data["images"] = [new, old]
         with mock.patch.object(UI, "confirm", return_value=False) as confirm:
             self.feed("d")
-        confirm.assert_called_once_with("Delete image 'nginx:1.27'?", self.ROWS - 1)
+        confirm.assert_called_once_with("Delete image 'nginx:1.27'?", self.ROWS - 1, self.COLS)
 
     def test_a_key_for_a_row_that_is_gone_acts_on_nothing_and_says_so(self):
         self.goto("images")
@@ -768,7 +920,7 @@ class AppOtherTabActionTests(AppBase):
         self.goto("networks")
         self.app.fetcher.data["networks"] = [Network("net1", "cctl-net-x", "bridge", "local")]
         info = mock.Mock(Name="cctl-net-x", Containers={"abc": {"Name": "cctl-prj-x"}})
-        with mock.patch.object(Docker, "inspect_network", return_value=info):
+        with mock.patch.object(Docker, "inspect", return_value=info):
             with mock.patch.object(UI, "info_box") as box:
                 self.feed("e")
         box.assert_called_once_with("Network: cctl-net-x", ["cctl-prj-x"], self.ROWS, self.COLS)
@@ -776,7 +928,7 @@ class AppOtherTabActionTests(AppBase):
     def test_network_edit_failure_sets_red_message(self):
         self.goto("networks")
         self.app.fetcher.data["networks"] = [Network("net1", "n", "bridge", "local")]
-        with mock.patch.object(Docker, "inspect_network", return_value=None):
+        with mock.patch.object(Docker, "inspect", return_value=None):
             self.feed("e")
         self.assertEqual(self.app.message_style, Term.RED)
 
@@ -799,12 +951,90 @@ class AppOtherTabActionTests(AppBase):
         project = ProjectConfig(name="demo", image="i")
         with (
             mock.patch.object(containerctl, "read_projects", return_value=({"demo": project}, [])),
-            mock.patch.object(Docker, "find_project_container", return_value=None),
+            mock.patch.object(Docker, "project_containers", return_value=(None, None)),
             mock.patch.object(UI, "confirm") as confirm,
         ):
             self.feed("d")
         confirm.assert_not_called()
         self.assertEqual(self.app.message_style, Term.YELLOW)
+
+    def test_project_enter_that_spawned_nothing_keeps_the_tui_up_and_says_so(self):
+        self.goto("projects")
+        self.app.fetcher.data["projects"] = [containerctl.ProjectRow("demo", "not created", "i", "-")]
+        project = ProjectConfig(name="demo", image="i")
+        with (
+            mock.patch.object(containerctl, "read_projects", return_value=({"demo": project}, [])),
+            mock.patch.object(self.app, "exit_tui_temporarily"),
+            mock.patch.object(Docker, "enter_project", return_value=None),  # spawn failed, or was declined
+            mock.patch("builtins.input") as pause,
+            mock.patch.object(self.app, "enter_tui") as back,
+        ):
+            self.feed("e")
+        pause.assert_called_once()  # what spawn said is on the main screen: time to read it
+        back.assert_called_once()
+        self.assertTrue(self.app.running)
+        self.assertEqual(
+            (self.app.message_text, self.app.message_style), ("demo was not entered: see Errors", Term.RED)
+        )
+
+    def _enter(self, **enter_project):
+        self.goto("projects")
+        self.app.fetcher.data["projects"] = [containerctl.ProjectRow("demo", "running", "i", "-")]
+        project = ProjectConfig(name="demo", image="i")
+        with (
+            mock.patch.object(containerctl, "read_projects", return_value=({"demo": project}, [])),
+            mock.patch.object(self.app, "exit_tui_temporarily"),
+            mock.patch.object(Docker, "enter_project", **enter_project),
+            mock.patch.object(Docker, "inspect", return_value=mock.Mock(State={"Running": True})),
+            mock.patch("builtins.input", side_effect=EOFError),  # Ctrl-D at "Press Enter to return..."
+            mock.patch.object(self.app, "enter_tui") as self.back,
+        ):
+            self.feed("e")
+
+    def test_ctrl_d_at_the_pause_is_an_answer_not_a_crash(self):
+        self._enter(return_value=None)
+        self.back.assert_called_once()
+        self.assertTrue(self.app.running)
+
+    def test_ctrl_c_while_away_on_the_main_screen_comes_back_to_the_tui(self):
+        self._enter(side_effect=KeyboardInterrupt)  # in the middle of a clone, say
+        self.back.assert_called_once()
+        self.assertTrue(self.app.running)
+        self.assertIn("Interrupted", self.app.message_text)
+
+    def test_a_shell_that_exits_non_zero_is_said_and_logged_when_docker_may_not_have_run_it(self):
+        self._enter(return_value=0)
+        self.assertEqual((self.app.message_text, containerctl.get_errors()), ("", []))
+        self._enter(return_value=3)  # the last command typed, most likely
+        self.assertEqual(
+            (self.app.message_text, self.app.message_style), ("Shell in demo exited with code 3", Term.YELLOW)
+        )
+        self.assertEqual(containerctl.get_errors(), [])
+        self._enter(return_value=126)
+        self.assertEqual([e.cat for e in containerctl.get_errors()], ["docker.exec"])
+
+    def test_project_destroy_names_a_spawning_leftover_and_removes_only_what_it_named(self):
+        self.goto("projects")
+        self.app.fetcher.data["projects"] = [containerctl.ProjectRow("demo", "not created", "i", "-")]
+        project = ProjectConfig(name="demo", image="i")
+        leftover = container("cctl-spawning-demo")
+        leftover.RunningFor = "3 minutes ago"
+        note = "cctl-spawning-demo (created 3 minutes ago: a spawn still running, or one that died)"
+        for main, prompt in (
+            (None, f"Destroy {note}?"),
+            (container("cctl-prj-demo"), f"Destroy cctl-prj-demo and {note}?"),
+        ):
+            with (
+                mock.patch.object(containerctl, "read_projects", return_value=({"demo": project}, [])),
+                mock.patch.object(Docker, "project_containers", return_value=(main, leftover)),
+                mock.patch.object(containerctl, "project_report", return_value=WorkspaceReport()) as check,
+                mock.patch.object(UI, "confirm", return_value=True) as confirm,
+                mock.patch.object(Docker, "destroy_project", return_value=True) as destroy,
+            ):
+                self.feed("d")
+            self.assertEqual(check.call_count, 1 if main else 0)  # a leftover was never entered: nothing to check
+            confirm.assert_called_once_with(prompt, self.ROWS - 1, self.COLS)
+            destroy.assert_called_once_with(project, [c.Names for c in (main, leftover) if c])
 
     def _destroy(self, report, answer):
         self.goto("projects")
@@ -812,7 +1042,7 @@ class AppOtherTabActionTests(AppBase):
         project = ProjectConfig(name="demo", image="i")
         with (
             mock.patch.object(containerctl, "read_projects", return_value=({"demo": project}, [])),
-            mock.patch.object(Docker, "find_project_container", return_value=container("cctl-prj-demo")),
+            mock.patch.object(Docker, "project_containers", return_value=(container("cctl-prj-demo"), None)),
             mock.patch.object(containerctl, "project_report", return_value=report) as check,
             mock.patch.object(UI, "confirm", return_value=answer) as confirm,
             mock.patch.object(Docker, "destroy_project", return_value=True) as destroy,
@@ -823,15 +1053,38 @@ class AppOtherTabActionTests(AppBase):
 
     def test_project_destroy_confirmed(self):
         project, confirm, destroy = self._destroy(WorkspaceReport(statuses=[RepoStatus(name="app")]), True)
-        confirm.assert_called_once_with("Destroy project 'demo'?", self.ROWS - 1)
-        destroy.assert_called_once_with(project)
+        confirm.assert_called_once_with("Destroy cctl-prj-demo?", self.ROWS - 1, self.COLS)
+        destroy.assert_called_once_with(project, ["cctl-prj-demo"])
         self.assertEqual(self.app.message_text, "Destroyed demo")
 
     def test_project_destroy_prompt_names_dirty_dirs_and_still_destroys_on_yes(self):
-        report = WorkspaceReport(statuses=[RepoStatus(name="app", ahead=2)], extra=[], missing=["lib"])
+        report = WorkspaceReport(
+            statuses=[RepoStatus(name="app", unpushed=["branch main: 2 unpushed commits"])], extra=[], missing=["lib"]
+        )
         project, confirm, destroy = self._destroy(report, True)
-        confirm.assert_called_once_with("Destroy project 'demo'? Workspace is DIRTY: app, lib.", self.ROWS - 1)
-        destroy.assert_called_once_with(project)
+        # word for word what `containerctl destroy` asks: one question, built once (destroy_question)
+        prompt = "Destroy cctl-prj-demo, though its workspace is DIRTY (app, lib)?"
+        confirm.assert_called_once_with(prompt, self.ROWS - 1, self.COLS)
+        destroy.assert_called_once_with(project, ["cctl-prj-demo"])
+
+    def test_project_destroy_says_when_the_workspace_could_not_be_checked(self):
+        failed = containerctl.DockerError(containerctl.Failure("Container is not running", "start it", "detail"))
+        self.goto("projects")
+        self.app.fetcher.data["projects"] = [containerctl.ProjectRow("demo", "exited", "i", "-")]
+        project = ProjectConfig(name="demo", image="i")
+        with (
+            mock.patch.object(containerctl, "read_projects", return_value=({"demo": project}, [])),
+            mock.patch.object(Docker, "project_containers", return_value=(container("cctl-prj-demo", "exited"), None)),
+            mock.patch.object(containerctl, "project_report", side_effect=failed),
+            mock.patch.object(UI, "confirm", return_value=True) as confirm,
+            mock.patch.object(Docker, "destroy_project", return_value=True) as destroy,
+        ):
+            self.feed("d")
+        prompt = "Destroy cctl-prj-demo, though its workspace could NOT be checked (Container is not running)?"
+        confirm.assert_called_once_with(prompt, self.ROWS - 1, self.COLS)
+        destroy.assert_called_once_with(
+            project, ["cctl-prj-demo"]
+        )  # still the user's call: a stopped project must stay removable
 
     def test_project_destroy_declined_on_dirty_prompt_does_nothing(self):
         _, _, destroy = self._destroy(WorkspaceReport(statuses=[RepoStatus(name="app", untracked=True)]), False)
@@ -849,7 +1102,7 @@ class AppOtherTabActionTests(AppBase):
             mock.patch.object(Docker, "service_down", return_value=True) as down,
         ):
             self.feed("d")
-        confirm.assert_called_once_with("Stop service 'web'?", self.ROWS - 1)
+        confirm.assert_called_once_with("Stop service 'web'?", self.ROWS - 1, self.COLS)
         down.assert_called_once_with(service)
 
     def test_service_recreate_declined_does_nothing(self):
@@ -871,7 +1124,7 @@ class AppOtherTabActionTests(AppBase):
         self.goto("errors")
         with mock.patch.object(UI, "confirm", return_value=False) as confirm:
             self.feed("c")
-        confirm.assert_called_once_with("Clear the error log?", self.ROWS - 1)
+        confirm.assert_called_once_with("Clear the error log?", self.ROWS - 1, self.COLS)
         self.assertEqual(len(containerctl.get_errors()), 2)
         with mock.patch.object(UI, "confirm", return_value=True):
             self.feed("c")
@@ -933,9 +1186,9 @@ class AppOtherTabActionTests(AppBase):
                 mock.patch.object(containerctl, "read_projects", return_value=({"demo": project}, [])),
                 mock.patch.object(Docker, "_run", rec),
                 mock.patch.object(UI, "confirm") as confirm,
-                redirect_stdout(io.StringIO()) as out,
             ):
                 self.feed(key)
+            out = self.out
             confirm.assert_not_called()
             self.assertEqual(
                 (self.app.message_text, self.app.message_style),
@@ -944,6 +1197,15 @@ class AppOtherTabActionTests(AppBase):
             self.assertTrue(out.getvalue().endswith(Term.ALT_SCREEN + Term.HIDE_CURSOR), key)  # back in the TUI
         self.assertEqual({call[0] for call in rec.calls}, {"ps"})
         self.assertEqual([e.cat for e in containerctl.get_errors()], ["docker.command"] * 2)
+
+    def test_ctrl_c_during_an_action_ends_the_action_not_the_tui(self):
+        self.containers(1)
+        with mock.patch.object(Docker, "stop", side_effect=KeyboardInterrupt):
+            self.feed("S")
+        self.assertIn("Stopping id0000000000... (Ctrl-C to stop waiting)", plain(self.out.getvalue()))
+        self.assertTrue(self.app.running)
+        self.assertEqual(self.app.message_style, Term.YELLOW)
+        self.assertIn("Interrupted", self.app.message_text)
 
     def test_a_key_that_is_no_key_is_ignored(self):
         self.feed("")  # stdin at EOF: not a tab number
@@ -993,6 +1255,29 @@ class AppRunLoopTests(AppBase):
         self.assertIn("c0", plain(out.getvalue()))
         self.assertEqual(handled, ["q"])  # a timed-out poll is not a key (it would wipe the status message)
 
+    def test_a_resize_is_only_noted_by_the_handler_and_drawn_by_the_loop(self):
+        handlers = {}
+        script = iter(["", "resize", "", "q"])
+
+        def getch(timeout=None):
+            step = next(script)
+            if step == "resize":
+                handlers[containerctl.signal.SIGWINCH](containerctl.signal.SIGWINCH, None)
+                self.assertEqual(render.call_count, 1)  # the handler drew nothing: we may be in a shell
+                return ""
+            return step
+
+        with (
+            mock.patch.object(containerctl.signal, "signal", lambda sig, handler: handlers.update({sig: handler})),
+            mock.patch.object(self.app.fetcher, "start"),
+            mock.patch.object(self.app.fetcher, "stop"),
+            mock.patch.object(Term, "getch", getch),
+            mock.patch.object(self.app, "render", wraps=self.app.render) as render,
+            redirect_stdout(io.StringIO()),
+        ):
+            self.app.run()
+        self.assertEqual(render.call_count, 2)  # at start, and once for the new size
+
     def test_the_fetcher_counts_the_fetches_that_landed(self):
         with mock.patch.object(self.app.fetcher, "_fetch", side_effect=[RuntimeError("boom")]):
             self.app.fetcher._fetch_all()
@@ -1029,6 +1314,32 @@ class AppRunLoopTests(AppBase):
         stop.assert_called_once()
         self.assertTrue(out.getvalue().endswith(Term.SHOW_CURSOR + Term.MAIN_SCREEN))
 
+    def test_a_ctrl_c_that_comes_just_after_the_action_it_was_for_does_not_quit(self):
+        """busy() invited it; the action ended first, so it lands in the loop. Spared once: the next one quits."""
+        self.containers(1)
+        keys = iter(["S", KeyboardInterrupt, KeyboardInterrupt])
+        messages = []
+
+        def getch(timeout=None):
+            messages.append(self.app.message_text)
+            key = next(keys)
+            if key is KeyboardInterrupt:
+                raise key
+            return key
+
+        with (
+            mock.patch.object(containerctl.signal, "signal"),
+            mock.patch.object(self.app.fetcher, "start"),
+            mock.patch.object(self.app.fetcher, "stop") as stop,
+            mock.patch.object(Docker, "stop", return_value=True),
+            mock.patch.object(Term, "getch", getch),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.app.run()
+        stop.assert_called_once()  # the second Ctrl-C did quit
+        self.assertEqual(len(messages), 3)
+        self.assertEqual(messages[2], "Too late to interrupt: that had just finished")
+
     def test_run_restores_terminal_even_if_rendering_raises(self):
         with (
             mock.patch.object(containerctl.signal, "signal"),
@@ -1061,7 +1372,9 @@ class DataFetcherTests(unittest.TestCase):
         projects = self.projects if projects is None else projects
         services = self.services if services is None else services
         return (
-            mock.patch.object(Docker, "listings", docker or (lambda: listings(failed, containers=self.containers))),
+            mock.patch.object(
+                Docker, "listings", docker or (lambda timeout=None: listings(failed, containers=self.containers))
+            ),
             mock.patch.object(containerctl, "read_projects", return_value=(projects, list(broken))),
             mock.patch.object(containerctl, "read_services", return_value=(services, [])),
             mock.patch.object(containerctl, "read_images", return_value=({}, [])),
@@ -1127,8 +1440,13 @@ class DataFetcherTests(unittest.TestCase):
         self.assertEqual(self.fetcher.get("issues")[0].detail, "docker volumes: plugin exploded")  # to teach from
         self.assertEqual(self.log(), [])
 
+    def test_the_background_fetch_asks_with_its_own_short_timeout(self):
+        asked = mock.Mock(return_value=listings())
+        self._fetch(docker=asked)
+        asked.assert_called_once_with(timeout=containerctl.POLL_TIMEOUT)
+
     def test_an_unreadable_row_is_a_warning_while_it_lasts(self):
-        def docker():
+        def docker(timeout=None):
             result = listings(containers=self.containers)
             result["containers"].skipped.append("docker ps: Missing fields: ['ID'] in {}")
             return result
@@ -1192,7 +1510,7 @@ class DataFetcherTests(unittest.TestCase):
     def test_a_crashing_fetch_does_not_kill_the_background_thread(self):
         calls = []
 
-        def flaky():
+        def flaky(timeout=None):
             calls.append(1)
             if len(calls) == 1:
                 raise PermissionError(13, "Permission denied")
