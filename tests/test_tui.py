@@ -54,7 +54,7 @@ def keys(*seq):
     """A ``Term.getch`` stand-in that replays ``seq`` then fails loudly if asked for more."""
     it = iter(seq)
 
-    def getch():
+    def getch(timeout=None):
         try:
             return next(it)
         except StopIteration:  # pragma: no cover - a test asked for more keys than scripted
@@ -223,6 +223,14 @@ class ConfirmAndInfoBoxTests(unittest.TestCase):
         self.assertIn("│ second    ", text)  # padded to the box width
         self.assertIn("[Press any key to close]", text)
         getch.assert_called_once()
+
+    def test_a_warning_box_only_closes_on_enter(self):
+        getch = mock.Mock(side_effect=["d", "y", "x", Term.KEY_ENTER, "z"])
+        with mock.patch.object(Term, "getch", getch):
+            with redirect_stdout(io.StringIO()) as out:
+                UI.info_box("Title", ["line"], 24, 80, ok=True)
+        self.assertIn("[Press Enter: ok]", plain(out.getvalue()))
+        self.assertEqual(getch.call_count, 4)
 
     def test_info_box_clips_lines_to_terminal_width(self):
         with mock.patch.object(Term, "getch", keys("x")):
@@ -504,6 +512,67 @@ class AppNavigationTests(AppBase):
         self.assertEqual(rec.calls, [])
 
 
+class AppSwitchGraceTests(AppBase):
+    """Its row gone, the cursor fell onto a neighbour by itself: a key landing right after may not be for it. It
+    does nothing, a box to ok says so, and pressing it again is the user's business."""
+
+    def setUp(self):
+        super().setUp()
+        self.containers(2)
+        self.rendered()  # c0 is under the cursor
+        self.rec = RunRecorder()
+        self.now = 100.0
+        for patch in (
+            mock.patch.object(Docker, "_run", self.rec),
+            mock.patch.object(containerctl.time, "monotonic", side_effect=lambda: self.now),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.app.fetcher.data["containers"] = self.app.fetcher.data["containers"][1:]  # c0 is gone
+        self.rendered()  # a redraw: the cursor is on c1 now
+
+    def press(self, key):
+        """The box the key opened, if any; the loop's redraw follows"""
+        with mock.patch.object(UI, "info_box") as box:
+            self.feed(key)
+        self.rendered()
+        return box
+
+    def test_a_key_right_after_does_nothing_and_a_box_says_so(self):
+        self.now += 0.3
+        box = self.press("s")
+        self.assertEqual(self.rec.calls, [])
+        title, lines = box.call_args.args[:2]
+        self.assertEqual(title, "Selection changed")
+        self.assertIn("the selection just moved to 'id0000000001'", lines[0])
+        self.assertEqual(box.call_args.kwargs, {"ok": True})  # Enter alone closes it
+
+    def test_once_oked_the_key_pressed_again_acts(self):
+        self.press("s")
+        self.press("s").assert_not_called()
+        self.assertEqual(self.rec.calls, [["start", "id0000000001"]])  # once: the box retried nothing
+
+    def test_a_key_after_the_grace_period_is_for_the_row_on_screen(self):
+        self.now += App.SWITCH_GRACE
+        self.press("s").assert_not_called()
+        self.assertEqual(self.rec.last, ["start", "id0000000001"])
+
+    def test_moving_the_cursor_by_hand_ends_the_wait(self):
+        self.press("g").assert_not_called()
+        self.press("s").assert_not_called()
+        self.assertEqual(self.rec.last, ["start", "id0000000001"])
+
+    def test_a_key_that_finds_its_row_gone_gets_the_same_box_and_one_ok_is_enough(self):
+        self.now += 10
+        self.app.fetcher.data["containers"] = [Container("id0000000009", "c9", "img", "Up")]  # c1 gone, no redraw
+        box = self.press("s")  # for c1
+        self.assertEqual(box.call_args.args[0], "Selection changed")
+        self.assertIn("the row that key was for is gone", box.call_args.args[1][0])
+        self.assertEqual(self.rec.calls, [])
+        self.press("s").assert_not_called()  # c9 is on screen, the box was oked: no second box
+        self.assertEqual(self.rec.last, ["start", "id0000000009"])
+
+
 class AppContainerActionTests(AppBase):
     def setUp(self):
         super().setUp()
@@ -607,6 +676,86 @@ class AppOtherTabActionTests(AppBase):
             self.app._handle_key("d")
         confirm.assert_called_once_with("Delete image 'nginx:1.27'?", self.ROWS - 1)
         self.assertEqual(self.rec.last, ["rmi", "-f", "sha1"])
+
+    def test_a_key_acts_on_the_row_that_was_drawn_wherever_it_is_now(self):
+        """The screen is only redrawn on a keypress: by then a fetch may have moved the rows under the cursor"""
+        self.goto("images")
+        nginx, redis = Image("sha1", "nginx", "1.27", "1MB"), Image("sha2", "redis", "7", "1MB")
+        self.app.fetcher.data["images"] = [nginx, redis]
+        self.rendered()  # nginx is under the cursor
+        self.app.fetcher.data["images"] = [Image("sha0", "alpine", "3", "1MB"), nginx, redis]
+        with mock.patch.object(UI, "confirm", return_value=True) as confirm:
+            self.feed("d")
+        confirm.assert_called_once_with("Delete image 'nginx:1.27'?", self.ROWS - 1)
+        self.assertEqual(self.rec.last, ["rmi", "-f", "sha1"])
+        self.assertEqual(self.app.selected_index, 1)  # the selection followed it
+
+    def test_tags_of_one_image_are_rows_of_their_own(self):
+        self.goto("images")
+        old, new = Image("sha1", "nginx", "1.26", "1MB"), Image("sha1", "nginx", "1.27", "1MB")
+        self.app.fetcher.data["images"] = [old, new]
+        self.feed("k")
+        self.rendered()  # 1.27 is under the cursor
+        self.app.fetcher.data["images"] = [new, old]
+        with mock.patch.object(UI, "confirm", return_value=False) as confirm:
+            self.feed("d")
+        confirm.assert_called_once_with("Delete image 'nginx:1.27'?", self.ROWS - 1)
+
+    def test_a_key_for_a_row_that_is_gone_acts_on_nothing_and_says_so(self):
+        self.goto("images")
+        self.app.fetcher.data["images"] = [Image("sha1", "nginx", "1.27", "1MB")]
+        self.rendered()
+        self.app.fetcher.data["images"] = [Image("sha2", "redis", "7", "1MB")]  # same index, another image
+        with mock.patch.object(UI, "confirm", return_value=True) as confirm, mock.patch.object(UI, "info_box") as box:
+            self.feed("d")
+        confirm.assert_not_called()
+        self.assertEqual(self.rec.calls, [])
+        self.assertEqual(box.call_args.args[0], "Selection changed")  # a modal: it can't be missed
+        self.rendered()
+        with mock.patch.object(UI, "confirm", return_value=True):  # redis is on screen now: the next key is for it
+            self.feed("d")
+        self.assertEqual(self.rec.last, ["rmi", "-f", "sha2"])
+
+    def test_a_row_that_appeared_in_an_empty_list_is_not_acted_on_unseen(self):
+        self.goto("images")
+        self.rendered()  # "No images found"
+        self.app.fetcher.data["images"] = [Image("sha1", "nginx", "1.27", "1MB")]
+        with mock.patch.object(UI, "confirm", return_value=True) as confirm, mock.patch.object(UI, "info_box") as box:
+            self.feed("d")
+        confirm.assert_not_called()
+        box.assert_called_once()
+        self.assertEqual(self.rec.calls, [])
+
+    def test_a_redraw_keeps_the_row_selected_not_the_position(self):
+        self.goto("volumes")
+        a, b, c = (Volume(name, "local") for name in "abc")
+        self.app.fetcher.data["volumes"] = [a, b, c]
+        self.feed("k")
+        self.rendered()  # b is under the cursor
+        self.app.fetcher.data["volumes"] = [Volume("0", "local"), a, b, c]
+        self.rendered()  # a resize: no key in between
+        self.assertEqual(self.app.selected_item().Name, "b")
+        self.app.fetcher.data["volumes"] = [Volume("0", "local"), a, c]  # b is gone: c took its place
+        self.rendered()
+        self.assertEqual(self.app.selected_item().Name, "c")
+        self.app.fetcher.data["volumes"] = [a]  # nothing at that position anymore: the last line
+        self.rendered()
+        self.assertEqual(self.app.selected_item().Name, "a")
+        with mock.patch.object(UI, "confirm", return_value=True), mock.patch.object(UI, "info_box") as box:
+            self.feed("d")  # right after the cursor fell: a box, nothing done
+            self.assertEqual(self.rec.calls, [])
+            self.feed("d")  # oked, pressed again
+        box.assert_called_once()
+        self.assertEqual(self.rec.last, ["volume", "rm", "a"])
+
+    def test_moving_starts_from_the_row_that_was_drawn(self):
+        self.goto("volumes")
+        a, b, c = (Volume(name, "local") for name in "abc")
+        self.app.fetcher.data["volumes"] = [a, b, c]
+        self.rendered()  # a is under the cursor
+        self.app.fetcher.data["volumes"] = [Volume("0", "local"), a, b, c]
+        self.feed("k")
+        self.assertEqual(self.app.selected_item().Name, "b")
 
     def test_volume_delete(self):
         self.goto("volumes")
@@ -815,6 +964,69 @@ class AppRunLoopTests(AppBase):
         self.assertFalse(self.app.running)
         stop.assert_called_once()
         self.assertTrue(out.getvalue().startswith(Term.ALT_SCREEN + Term.HIDE_CURSOR))
+        self.assertTrue(out.getvalue().endswith(Term.SHOW_CURSOR + Term.MAIN_SCREEN))
+
+    def test_a_fetch_that_lands_is_drawn_without_waiting_for_a_key(self):
+        script = iter(["", "fetch", "", "q"])  # "" is a poll that timed out; "fetch" one during which a fetch landed
+
+        def getch(timeout=None):
+            self.assertEqual(timeout, App.REDRAW_POLL)
+            step = next(script)
+            if step == "fetch":
+                self.containers(1)
+                self.app.fetcher.version += 1
+                return ""
+            return step
+
+        with (
+            mock.patch.object(containerctl.signal, "signal"),
+            mock.patch.object(self.app.fetcher, "start"),
+            mock.patch.object(self.app.fetcher, "stop"),
+            mock.patch.object(Term, "getch", getch),
+            mock.patch.object(self.app, "render", wraps=self.app.render) as render,
+            mock.patch.object(self.app, "handle_key", wraps=self.app.handle_key) as handle,
+            redirect_stdout(io.StringIO()) as out,
+        ):
+            self.app.run()
+        handled = [call.args[0] for call in handle.call_args_list]
+        self.assertEqual(render.call_count, 2)  # at start, and once for the fetch: idle polls draw nothing
+        self.assertIn("c0", plain(out.getvalue()))
+        self.assertEqual(handled, ["q"])  # a timed-out poll is not a key (it would wipe the status message)
+
+    def test_the_fetcher_counts_the_fetches_that_landed(self):
+        with mock.patch.object(self.app.fetcher, "_fetch", side_effect=[RuntimeError("boom")]):
+            self.app.fetcher._fetch_all()
+        self.assertEqual(self.app.fetcher.version, 1)  # a crashed fetch changes what there is to show too
+
+    def test_the_keyboard_is_raw_for_the_session_and_handed_back_around_what_runs_outside(self):
+        calls = []
+        with (
+            mock.patch.object(Term, "raw_on", side_effect=lambda: calls.append("raw")),
+            mock.patch.object(Term, "raw_off", side_effect=lambda: calls.append("cooked")),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.app.enter_tui()
+            self.app.exit_tui_temporarily()  # a docker exec, an input(): the terminal as we found it
+            self.app.enter_tui()
+            self.app.exit_tui()
+        self.assertEqual(calls, ["raw", "cooked", "raw", "cooked"])
+
+    def test_raw_mode_is_left_alone_when_stdin_is_not_a_terminal(self):
+        with mock.patch.object(containerctl.sys, "stdin", io.StringIO()):
+            Term.raw_on()
+            self.assertIsNone(Term._cooked)
+            Term.raw_off()
+
+    def test_ctrl_c_quits_and_restores_the_terminal(self):
+        with (
+            mock.patch.object(containerctl.signal, "signal"),
+            mock.patch.object(self.app.fetcher, "start"),
+            mock.patch.object(self.app.fetcher, "stop") as stop,
+            mock.patch.object(Term, "getch", side_effect=KeyboardInterrupt),
+            redirect_stdout(io.StringIO()) as out,
+        ):
+            self.app.run()  # no traceback: it returns
+        stop.assert_called_once()
         self.assertTrue(out.getvalue().endswith(Term.SHOW_CURSOR + Term.MAIN_SCREEN))
 
     def test_run_restores_terminal_even_if_rendering_raises(self):

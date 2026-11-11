@@ -1598,6 +1598,7 @@ class Term:
     KEY_RIGHT = "\x1b[C"
     KEY_LEFT = "\x1b[D"
     KEY_ENTER = "\r"
+    _cooked: list | None = None  # the terminal's own settings while we hold it raw: see raw_on
     KEY_ESC = "\x1b"
     KEY_TAB = "\t"
     KEY_BACKSPACE = "\x7f"
@@ -1630,24 +1631,66 @@ class Term:
         Term.write(text)
 
     @staticmethod
-    def getch() -> str:
-        """Read single keypress in raw mode"""
+    def raw_on() -> None:
+        """Take the keyboard for a session: every key at once, none echoed, until raw_off. Held from one end of
+        the TUI to the other, not per key read: a mode that flips back between two reads leaves gaps in which a
+        typed character is echoed over the screen. No-op when already on, or when stdin isn't a terminal.
+
+        tty.setraw, less two things. Output processing stays as it was (a "\n" is still a new line). Ctrl-C
+        still interrupts, a docker call that hangs included; Ctrl-Z and Ctrl-Backslash are plain keys: suspending or
+        dumping core here would leave the shell with this mode. Set without setraw's default flush (TCSAFLUSH),
+        which drops whatever was typed since the last read."""
+        if Term._cooked is not None or not sys.stdin.isatty():
+            return
         fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
+        Term._cooked = termios.tcgetattr(fd)
+        tty.setraw(fd, termios.TCSANOW)
+        mode = termios.tcgetattr(fd)
+        mode[1] |= Term._cooked[1] & termios.OPOST
+        mode[3] |= termios.ISIG
+        off = os.fpathconf(fd, "PC_VDISABLE")
+        mode[6][termios.VSUSP] = mode[6][termios.VQUIT] = bytes([off])
+        termios.tcsetattr(fd, termios.TCSANOW, mode)
+
+    @staticmethod
+    def raw_off() -> None:
+        """Give the keyboard back as raw_on found it (to a shell, a docker exec, an input()). No-op when off."""
+        if Term._cooked is not None:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, Term._cooked)
+            Term._cooked = None
+
+    @staticmethod
+    def getch(timeout: float | None = None) -> str:
+        """Read single keypress; with a `timeout` (seconds), "" when none came in time. Inside a raw_on session
+        the mode is left alone; outside one, it is raw for this read only.
+
+        Bytes are read off the fd itself, never through sys.stdin: its buffer takes every byte that is there on
+        the first read, and select, which only sees the fd, then reports nothing left while the rest of an arrow
+        key or of a burst sits in Python."""
+        fd = sys.stdin.fileno()
+        ours = Term._cooked is None
+        if ours:
+            Term.raw_on()
+
+        def ready(seconds: float) -> bool:
+            return bool(select.select([fd], [], [], seconds)[0])
+
+        def read() -> str:
+            return os.read(fd, 1).decode(errors="replace")
+
         try:
-            tty.setraw(fd)
-            ch = sys.stdin.read(1)
-            # Handle escape sequences
-            if ch == "\x1b":
-                # Try to read more characters for escape sequences
-                if select.select([sys.stdin], [], [], 0.1)[0]:
-                    ch += sys.stdin.read(1)
-                    if ch[-1] == "[":
-                        if select.select([sys.stdin], [], [], 0.1)[0]:
-                            ch += sys.stdin.read(1)
+            if timeout is not None and not ready(timeout):
+                return ""
+            ch = read()
+            # Handle escape sequences: the rest follows at once, a lone Esc is followed by nothing
+            if ch == "\x1b" and ready(0.1):
+                ch += read()
+                if ch[-1] == "[" and ready(0.1):
+                    ch += read()
             return ch
         finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            if ours:
+                Term.raw_off()
 
     @staticmethod
     def style(text: str, *styles: str) -> str:
@@ -2494,6 +2537,7 @@ class DataFetcher:
             "services": [],
             "issues": [],  # list[Issue]: what the last fetch detected, errors first
         }
+        self.version = 0  # how many fetches landed: the TUI redraws when it moves
         self.failures: dict[str, str] = {}  # tab key -> why the last fetch has nothing to show there (our words)
         self.notes: dict[str, str] = {}  # tab key -> why the rows listed there may not be all of them
         self._stop_event = threading.Event()
@@ -2551,6 +2595,7 @@ class DataFetcher:
             self.data.update(data)
             self.failures = shown
             self.notes = notes
+            self.version += 1
 
     def _fetch(self) -> tuple[dict[str, list], dict[str, Listing]]:
         """Fetch all data from Docker and the config files, and detect the issues in them"""
@@ -2600,6 +2645,7 @@ class Tab:
     id_key: str
     actions: dict[str, Callable[[str], bool]]
     empty: str = ""  # what the list area says when there are no rows; "No <name> found" when unset
+    anchor: tuple[str, ...] = ()  # the fields that name a row from one fetch to the next; (id_key,) when unset
 
 
 class UI:
@@ -2724,8 +2770,9 @@ class UI:
                 return False
 
     @staticmethod
-    def info_box(title: str, lines: list[str], rows: int, cols: int) -> None:
-        """Display an info box modal and wait for keypress to dismiss"""
+    def info_box(title: str, lines: list[str], rows: int, cols: int, ok: bool = False) -> None:
+        """Display an info box modal and wait for a keypress to dismiss it: any key, or with `ok` Enter alone (a
+        warning must be read, and a key that was already on its way must not be what closes it)"""
         # Calculate box dimensions
         content_width = max(len(title), max((len(line) for line in lines), default=20)) + 4
         box_width = min(content_width, cols - 4)
@@ -2761,13 +2808,15 @@ class UI:
         sys.stdout.write(
             f"\033[{start_row + 4 + len(lines)};{start_col}H"
             + Term.DIM
-            + "[Press any key to close]".center(box_width)
+            + ("[Press Enter: ok]" if ok else "[Press any key to close]").center(box_width)
             + Term.RESET
         )
         sys.stdout.flush()
 
-        # Wait for keypress
-        Term.getch()
+        # Wait for a keypress: any closes a plain box, an `ok` box keeps reading until it is Enter
+        key = Term.getch()
+        while ok and key != Term.KEY_ENTER:
+            key = Term.getch()
 
 
 # =============================================================================
@@ -2778,11 +2827,22 @@ class UI:
 class App:
     """Main TUI application"""
 
+    # When its row disappears, the cursor falls onto a neighbour by itself. A key that lands within this many
+    # seconds may have been on its way to the row that was there (a finger is slower than a redraw): it does
+    # nothing, a box says so, and it is for the user to press it again. Moving the cursor yourself, or the box's
+    # ok, ends the wait.
+    SWITCH_GRACE = 2.0
+    REDRAW_POLL = 0.2  # seconds between two looks at whether a fetch landed, while no key comes
+    MOVE_KEYS = ("i", "k", "g", "G", "j", "l", *"123456789")
+    MOVE_KEYS += (Term.KEY_UP, Term.KEY_DOWN, Term.KEY_LEFT, Term.KEY_RIGHT, Term.KEY_TAB)
+
     def __init__(self):
         self.running = True
         self.current_tab = 0
         self.selected_index = 0
         self.scroll_offset = 0
+        self.rendered: tuple | None = None  # (tab key, index, anchor) of the selection as last drawn: see locate
+        self.switched_at: float | None = None  # when the cursor last fell onto another row by itself: see locate
         self.message_text = ""
         self.message_style = ""
         self.scr = Screen()  # Buffered screen for flicker-free rendering
@@ -2832,6 +2892,7 @@ class App:
                 ],
                 id_key="ID",
                 actions={},
+                anchor=("ID", "Repository", "Tag"),  # one image, several tags: several rows with one ID
             ),
             Tab(
                 name="Volumes",
@@ -2894,6 +2955,7 @@ class App:
                 id_key="cat",
                 actions={},
                 empty="No issues",
+                anchor=("level", "cat", "msg"),
             ),
             Tab(
                 name="Errors",
@@ -2906,6 +2968,7 @@ class App:
                 id_key="cat",
                 actions={},
                 empty="No errors",
+                anchor=("ts", "cat", "msg"),
             ),
         ]
 
@@ -2920,6 +2983,39 @@ class App:
             errors.reverse()  # newest first
             return errors
         return self.fetcher.get(self.current().key)
+
+    def anchor_of(self, item: object) -> tuple:
+        """What names this row from one fetch to the next"""
+        tab = self.current()
+        return tuple(getattr(item, name) for name in tab.anchor or (tab.id_key,))
+
+    def locate(self, items: list) -> tuple[object | None, bool]:
+        """(the selected row, whether it is gone) in a fresh snapshot. What is selected is a row, named by its
+        anchor as last drawn; the index is only where it was. The fetcher swaps the lists every tick, so the
+        selection follows its row wherever it is now, and when the row is gone it falls to the closest line: the
+        one that took its place, or the last. A redraw just shows that; a key meant for the gone row acts on
+        nothing (its neighbour was never on screen under the cursor). Before anything was drawn for this tab and
+        index (a tab switch, a jump), the index is all there is."""
+        index = self.selected_index
+        here = items[index] if 0 <= index < len(items) else None
+        if self.rendered is None or self.rendered[:2] != (self.current().key, index):
+            return here, False
+        anchor = self.rendered[2]
+        if here is not None and self.anchor_of(here) == anchor:
+            return here, False
+        for found, item in enumerate(items):
+            if self.anchor_of(item) == anchor:
+                self.scroll_offset = max(0, self.scroll_offset + found - index)  # same line on screen
+                self.selected_index = found
+                return item, False
+        self.selected_index = max(0, min(index, len(items) - 1))
+        if items:  # the cursor now sits on a row nobody put it on: see SWITCH_GRACE
+            self.switched_at = time.monotonic()
+        return None, bool(items) or anchor is not None
+
+    def just_switched(self) -> bool:
+        """Whether the cursor fell onto its row by itself less than SWITCH_GRACE seconds ago"""
+        return self.switched_at is not None and time.monotonic() - self.switched_at < self.SWITCH_GRACE
 
     def selected_item(self) -> object | None:
         """Get currently selected item"""
@@ -2963,9 +3059,12 @@ class App:
         scr = self.scr
         items = self.items()  # Get from cache once
 
-        # Adjust selection if needed
+        # The selection is a row, not a position: follow it where it went, else fall to the row that took its place
+        self.locate(items)
         if self.selected_index >= len(items):
             self.selected_index = max(0, len(items) - 1)
+        anchor = self.anchor_of(items[self.selected_index]) if items else None
+        self.rendered = (self.current().key, self.selected_index, anchor)  # what a key will act on: see locate
 
         # Layout calculations
         tab_row = 1
@@ -3079,10 +3178,13 @@ class App:
 
         # One snapshot for the whole keypress: the fetcher swaps the lists under us, and a row looked up twice may
         # be two different rows (the prompt naming one image, the delete taking another), or gone the second time.
+        # In it, the row the key is for is the one that was on screen (see locate), not whatever sits at its index.
         # The branches below are one elif chain: the ones that move the selection never reach the ones that use it.
         items = self.items()
-        selected = items[self.selected_index] if 0 <= self.selected_index < len(items) else None
+        selected, gone = self.locate(items)
         selected_id = getattr(selected, self.current().id_key) if selected else None
+        if key in self.MOVE_KEYS:  # moved by hand: wherever the cursor ends up is the user's choice
+            self.switched_at = None
 
         # Navigation (jikl: j=left, i=up, k=down, l=right)
 
@@ -3126,6 +3228,16 @@ class App:
                 self.current_tab = idx
                 self.selected_index = 0
                 self.scroll_offset = 0
+
+        # Not a key that moves around: it was for a row that isn't there anymore, or the cursor only just fell
+        # onto this one. Either way nothing is done and nothing is retried: a box to ok, then the key is the
+        # user's to press again, for the row then on screen.
+        elif gone or (selected_id and self.just_switched()):
+            self.switched_at = None
+            self.rendered = None  # oked: the redraw that follows starts from where the cursor is, not a new fall
+            what = "the row that key was for is gone" if gone else f"the selection just moved to '{selected_id}'"
+            lines = [f"The list changed: {what}.", "Nothing was done: press the key again if you still mean it."]
+            UI.info_box("Selection changed", lines, rows, cols, ok=True)
 
         # Container-specific actions
         elif self.current().key == "containers" and selected_id:
@@ -3300,16 +3412,19 @@ class App:
                 self.set_message(f"Cleared {clear_errors()} errors", Term.GREEN)
 
     def enter_tui(self) -> None:
-        """Enter TUI mode"""
+        """Enter TUI mode: our screen, and the keyboard raw for as long as we stay"""
+        Term.raw_on()
         print(Term.ALT_SCREEN + Term.HIDE_CURSOR, end="", flush=True)
 
     def exit_tui_temporarily(self) -> None:
-        """Exit TUI mode temporarily (for exec/logs)"""
+        """Exit TUI mode temporarily (for exec/logs): what runs next gets the terminal as we found it"""
         print(Term.SHOW_CURSOR + Term.MAIN_SCREEN, end="", flush=True)
+        Term.raw_off()
 
     def exit_tui(self) -> None:
         """Exit TUI mode completely"""
         print(Term.SHOW_CURSOR + Term.MAIN_SCREEN, end="", flush=True)
+        Term.raw_off()
 
     def run(self) -> None:
         """Main TUI loop"""
@@ -3326,9 +3441,15 @@ class App:
         self.enter_tui()
         try:
             while self.running:
+                version = self.fetcher.version  # read before drawing: a fetch landing meanwhile is drawn next
                 self.render()
-                key = Term.getch()
-                self.handle_key(key)
+                key = ""
+                while not key and self.fetcher.version == version:  # a key, or a fetch to show: whichever first
+                    key = Term.getch(timeout=self.REDRAW_POLL)
+                if key:
+                    self.handle_key(key)
+        except KeyboardInterrupt:  # Ctrl-C quits, from the list as from a prompt or a docker call that hangs
+            pass
         finally:
             self.fetcher.stop()
             self.exit_tui()
