@@ -10,7 +10,7 @@ from unittest import mock
 
 import containerctl
 from containerctl import ProjectConfig, RepoStatus, WorkspaceReport, config_usage, format_table, usage
-from tests.helper import RunRecorder, reset_errors
+from tests.helper import RunRecorder, container, listings, reset_errors
 
 
 def readme_block(section):
@@ -26,6 +26,9 @@ def readme_block(section):
 
 
 class UsageTests(unittest.TestCase):
+    def setUp(self):
+        reset_errors()
+
     def test_usage_returns_zero_and_prints_help(self):
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -228,14 +231,14 @@ class CliDestroyTests(unittest.TestCase):
 
     def test_dirty_workspace_is_reported_then_destroyed_anyway(self):
         report = WorkspaceReport(statuses=[RepoStatus(name="app", uncommitted=True)], missing=["lib"])
-        check, out, err = self._destroy({"State": "running"}, report)
+        check, out, err = self._destroy(container("cctl-prj-demo"), report)
         check.assert_called_once_with(self.project)
         self.assertIn("✗ app — uncommitted changes", out)
         self.assertIn("Destroyed demo", out)
         self.assertEqual(err, "warning: demo is DIRTY, destroying anyway (app, lib)\n")
 
     def test_clean_workspace_destroys_quietly(self):
-        _, out, err = self._destroy({"State": "running"}, WorkspaceReport(statuses=[RepoStatus(name="app")]))
+        _, out, err = self._destroy(container("cctl-prj-demo"), WorkspaceReport(statuses=[RepoStatus(name="app")]))
         self.assertEqual(out, "Destroyed demo\n")
         self.assertEqual(err, "")
 
@@ -245,7 +248,7 @@ class CliDestroyTests(unittest.TestCase):
         self.assertEqual(err, "")
 
 
-class MainReportsIssuesTests(unittest.TestCase):
+class MainReportsErrorsTests(unittest.TestCase):
     """A CLI run ends with whatever its loaders and docker calls complained about, as one table on stderr (in place
     of the old JSON dump), even when the command exits non-zero."""
 
@@ -269,18 +272,29 @@ class MainReportsIssuesTests(unittest.TestCase):
     def test_quiet_run_prints_nothing(self):
         self.assertEqual(self._main(lambda args: None), (0, ""))
 
-    def test_problems_are_one_table_on_stderr_not_events(self):
+    def test_what_the_run_logged_is_one_table_on_stderr(self):
         def complain(args):
             containerctl.log_error("project.config", "Failed to load p.toml")
 
         code, err = self._main(complain)
         self.assertEqual(code, 0)
-        self.assertIn("LEVEL", err)
-        self.assertIn("error", err)
+        self.assertIn("ERROR", err)
         self.assertIn("project.config", err)
         self.assertIn("Failed to load p.toml", err)
         self.assertNotIn("{", err)  # not the JSON dump
-        self.assertEqual(containerctl.get_errors(), [])
+
+    def test_a_command_docker_gave_no_answer_to_stops_and_says_why(self):
+        def needs_docker(args):
+            call = containerctl.subprocess.CompletedProcess(
+                ["docker", "ps"], 1, "", "Cannot connect to the Docker daemon"
+            )
+            raise containerctl.DockerError(containerctl.docker_failure(["ps"], call))
+
+        code, err = self._main(needs_docker)
+        self.assertEqual(code, 1)
+        self.assertTrue(err.startswith("error: Docker daemon is not running (start docker)\n"))
+        self.assertIn("docker ps: Cannot connect to the Docker daemon", err)  # what docker said, in the report
+        self.assertNotIn("Traceback", err)
 
     def test_report_survives_sys_exit(self):
         def complain_and_fail(args):
@@ -293,19 +307,21 @@ class MainReportsIssuesTests(unittest.TestCase):
 
 
 class CliIssuesTests(unittest.TestCase):
-    """`issues` is the Issues tab for one run: collected config loads + state checks, then this run's events."""
+    """`issues` is the Issues tab for one run: what is broken is in the list (not in the log), and exits 1."""
+
+    DOWN = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"
 
     def setUp(self):
         reset_errors()
 
-    def _run(self, load_projects=lambda: {}, docker_images=lambda: []):
+    def _run(self, projects=None, broken=(), failed=None):
         out = io.StringIO()
         with (
-            mock.patch.object(containerctl, "load_projects", side_effect=load_projects),
-            mock.patch.object(containerctl, "load_services", return_value={}),
-            mock.patch.object(containerctl, "load_images", return_value={}),
+            mock.patch.object(containerctl, "read_projects", return_value=(projects or {}, list(broken))),
+            mock.patch.object(containerctl, "read_services", return_value=({}, [])),
+            mock.patch.object(containerctl, "read_images", return_value=({}, [])),
             mock.patch.object(containerctl, "SECRETS_FILE", Path("/nonexistent/secrets.toml")),
-            mock.patch.object(containerctl.Docker, "images", side_effect=docker_images),
+            mock.patch.object(containerctl.Docker, "listings", return_value=listings(failed)),
             redirect_stdout(out),
         ):
             code = 0
@@ -318,38 +334,73 @@ class CliIssuesTests(unittest.TestCase):
     def test_nothing_to_report(self):
         self.assertEqual(self._run(), (0, "No issues\n"))
 
-    def test_warning_condition_is_listed_with_its_hint_and_exits_zero(self):
+    def test_a_warning_is_listed_with_its_hint_and_exits_zero(self):
         projects = {
             "lib": ProjectConfig(name="lib", image="i"),
             "a": ProjectConfig(name="a", image="i", shortcuts={"lib": "lib"}),
         }
-        code, out = self._run(load_projects=lambda: projects)
+        code, out = self._run(projects=projects)
         self.assertEqual(code, 0)
-        self.assertIn("LEVEL", out)
+        self.assertEqual(out.split("\n")[0].split(), ["LEVEL", "CATEGORY", "MESSAGE", "HINT"])
         self.assertIn("warning", out)
         self.assertIn("project.shortcut", out)
         self.assertIn("rename it in a.toml", out)
 
-    def test_broken_config_is_an_error_condition_and_exits_one(self):
-        def loader():
-            containerctl.log_error("project.config", "Failed to load p.toml")
-            return {}
-
-        code, out = self._run(load_projects=loader)
+    def test_a_broken_config_is_an_error_issue_and_exits_one(self):
+        broken = [containerctl.Issue(containerctl.ERROR, "project.config", "Failed to load p.toml", "edit p.toml")]
+        code, out = self._run(broken=broken)
         self.assertEqual(code, 1)
         self.assertIn("error", out)
         self.assertIn("Failed to load p.toml", out)
-        self.assertEqual(containerctl.get_errors(), [])  # collected, not logged
+        self.assertEqual(containerctl.get_errors(), [])  # said once, on stdout: main has nothing to add
 
-    def test_docker_failures_of_this_run_are_listed_too(self):
-        def docker_down():
-            containerctl.log_error("docker.command", "docker images: cannot connect")
-            return []
-
-        code, out = self._run(docker_images=docker_down)
+    def test_docker_down_is_one_error_issue_first_in_the_list_and_exits_one(self):
+        projects = {
+            "lib": ProjectConfig(name="lib", image="i"),
+            "a": ProjectConfig(name="a", image="i", shortcuts={"lib": "lib"}),
+        }
+        code, out = self._run(projects=projects, failed=dict.fromkeys(containerctl.LISTINGS, self.DOWN))
+        table, details = out.strip().split("\n\n")
+        rows = table.split("\n")[2:]  # past the header and its rule
         self.assertEqual(code, 1)
-        self.assertIn("docker.command", out)
-        self.assertIn("cannot connect", out)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(  # what docker said, raw, under the table: the TUI's Enter
+            details.split("\n"),
+            ["docker: Docker daemon is not running (containers, images, volumes, networks)"]
+            + [f"  docker {key}: {self.DOWN}" for key in containerctl.LISTINGS],
+        )
+        self.assertIn("Docker daemon is not running (containers, images, volumes, networks)", rows[0])
+        self.assertIn("start docker", rows[0])
+        self.assertIn("project.shortcut", rows[1])
+        self.assertEqual(containerctl.get_errors(), [])
+
+
+class ListingsWhenPsFailsTests(unittest.TestCase):
+    """`projects` / `services` with `docker ps` failing: nobody knows the status, so it doesn't say "not created"."""
+
+    def setUp(self):
+        reset_errors()
+
+    def _run(self, func, **loaders):
+        out = io.StringIO()
+        rec = RunRecorder(returncode=1, stderr="Cannot connect to the Docker daemon. Is the docker daemon running?")
+        with mock.patch.object(containerctl.Docker, "_run", rec), redirect_stdout(out):
+            with mock.patch.multiple(containerctl, **loaders):
+                func(argparse.Namespace(wide=True))
+        return out.getvalue().strip().split("\n")[2:], rec.calls
+
+    def test_projects_status_is_unknown(self):
+        projects = {"a": ProjectConfig(name="a", image="i"), "b": ProjectConfig(name="b", image="i")}
+        rows, calls = self._run(containerctl.cli_projects, load_projects=lambda: projects)
+        self.assertEqual([row.split()[:2] for row in rows], [["a", "unknown"], ["b", "unknown"]])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([e.cat for e in containerctl.get_errors()], ["docker.command"])  # main's report says why
+
+    def test_services_status_is_unknown(self):
+        services = {"web": containerctl.ServiceConfig(name="web", image="n")}
+        rows, _ = self._run(containerctl.cli_services, load_services=lambda: services)
+        self.assertEqual([row.split()[:2] for row in rows], [["web", "unknown"]])
+        self.assertEqual([e.cat for e in containerctl.get_errors()], ["docker.command"])
 
 
 class ListingsQueryDockerOnceTests(unittest.TestCase):
@@ -464,14 +515,21 @@ class CliImageTests(unittest.TestCase):
         (self.dir / f"{name}.Dockerfile").write_text(dockerfile)
 
     def run_cli(self, func, image=None, versions=([], None, False), label=None, fetch=None):
-        """Fake docker: `versions` is image_versions()' answer; `label` the cctl.recipe label on the tagged image."""
+        """Fake docker: `versions` is (local versions, the one the tag points at, whether the tag exists), turned
+        into `docker images` rows for the hermes recipe; `label` the cctl.recipe label on the tagged image."""
+        local, current, tagged = versions
+        rows = [containerctl.Image(f"id{n}", "hermes", f"cctl-local-{n:06d}", "1MB") for n in local]
+        if tagged:
+            rows.append(
+                containerctl.Image("elsewhere" if current is None else f"id{current}", "hermes", "latest", "1MB")
+            )
 
         def inspect(ref):
             return mock.Mock(Config={"Labels": {"cctl.recipe": label} if label else {}})
 
         out = io.StringIO()
         with (
-            mock.patch.object(containerctl.Docker, "image_versions", return_value=versions),
+            mock.patch.object(containerctl.Docker, "list_images", return_value=containerctl.Listing(rows)),
             mock.patch.object(containerctl.Docker, "inspect_image", side_effect=inspect) as inspected,
             mock.patch.object(containerctl, "fetch_upstream", side_effect=fetch or (lambda url: None)) as fetched,
             redirect_stdout(out),
@@ -482,6 +540,14 @@ class CliImageTests(unittest.TestCase):
             except SystemExit as e:
                 code = e.code
         return code, out.getvalue(), inspected, fetched
+
+    def test_a_failed_listing_is_not_read_as_nothing_built(self):
+        self.recipe()
+        failed = listings({"images": "Cannot connect to the Docker daemon"})["images"]
+        with mock.patch.object(containerctl.Docker, "list_images", return_value=failed), redirect_stdout(io.StringIO()):
+            for func in (containerctl.cli_image_ls, containerctl.cli_image_check):
+                with self.assertRaises(containerctl.DockerError):  # main says why and exits 1
+                    func(argparse.Namespace(image=None))
 
     def test_no_recipes(self):
         code, out, _, _ = self.run_cli(containerctl.cli_image_check)

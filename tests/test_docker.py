@@ -8,6 +8,7 @@ import base64
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -16,7 +17,7 @@ from unittest import mock
 
 import containerctl
 from containerctl import KNOWN_HOSTS, Docker, ProjectConfig, RepoSpec, ServiceConfig, get_errors
-from tests.helper import RunRecorder, SubprocessRecorder, reset_errors
+from tests.helper import RunRecorder, SubprocessRecorder, container, reset_errors
 
 
 class CommandConstructionTests(unittest.TestCase):
@@ -53,11 +54,11 @@ class CommandConstructionTests(unittest.TestCase):
 
     def test_containers_passes_all_flag_and_never_computes_size_by_default(self):
         # --size=false was dropped once by accident and `ps` went from 75ms to seconds; keep it pinned
-        Docker.containers(all_containers=True)
+        Docker.list_containers(all_containers=True).logged()
         self.assertEqual(self.rec.last, ["ps", "--size=false", "-a", "--format", "{{json .}}"])
-        Docker.containers(all_containers=False)
+        Docker.list_containers(all_containers=False).logged()
         self.assertEqual(self.rec.last, ["ps", "--size=false", "--format", "{{json .}}"])
-        Docker.containers(include_size=True)
+        Docker.list_containers(include_size=True).logged()
         self.assertEqual(self.rec.last, ["ps", "-a", "--format", "{{json .}}"])
 
     def test_returncode_propagates_to_bool(self):
@@ -88,7 +89,7 @@ class IdGuardTests(unittest.TestCase):
     def test_start_rejects_bad_id(self):
         self.assertFalse(Docker.start("a;rm -rf /"))
         self.assertEqual(self.rec.calls, [])
-        self.assertEqual(get_errors()[0]["cat"], "docker.invalid_id")
+        self.assertEqual(get_errors()[0].cat, "docker.invalid_id")
 
     def test_remove_volume_rejects_bad_name(self):
         self.assertFalse(Docker.remove_volume("bad name"))
@@ -103,24 +104,110 @@ class JsonParsingTests(unittest.TestCase):
     def setUp(self):
         reset_errors()
 
-    def test_run_json_parses_lines_and_skips_blanks(self):
+    def test_list_parses_lines_and_skips_blanks(self):
         rec = RunRecorder(stdout='{"a": 1}\n\n{"a": 2}\n')
         with mock.patch.object(Docker, "_run", rec):
-            items = Docker._run_json(["ps"])
-        self.assertEqual(items, [{"a": 1}, {"a": 2}])
+            listing = Docker._list(["ps"], dict)
+        self.assertEqual((listing.rows, listing.failure), ([{"a": 1}, {"a": 2}], None))
 
-    def test_run_json_nonzero_returns_empty_and_logs(self):
+    def test_list_hands_a_failed_call_back_without_logging(self):
+        rec = RunRecorder(returncode=1, stderr="boom\n")
+        with mock.patch.object(Docker, "_run", rec):
+            listing = Docker._list(["ps", "-a"], dict)
+        self.assertEqual(listing.rows, [])
+        self.assertEqual(
+            listing.failure, containerctl.Failure(*containerctl.UNKNOWN_DOCKER_FAILURE, "docker ps -a: boom")
+        )
+        self.assertEqual(get_errors(), [])  # the caller's call: an issue for the fetcher, a log line for the CLI
+
+    def test_the_one_shot_flavour_logs_the_failure_and_reads_as_no_rows(self):
         rec = RunRecorder(returncode=1, stderr="boom")
         with mock.patch.object(Docker, "_run", rec):
-            self.assertEqual(Docker._run_json(["ps"]), [])
-        self.assertEqual(get_errors()[0]["cat"], "docker.command")
+            self.assertEqual(Docker.list_containers().logged(), [])
+            self.assertEqual(Docker.list_images().logged(), [])
+        self.assertEqual(
+            [(e.cat, e.msg) for e in get_errors()],
+            [
+                ("docker.command", "docker ps --size=false -a --format {{json .}}: boom"),
+                ("docker.command", "docker images --format {{json .}}: boom"),
+            ],
+        )
 
-    def test_run_json_bad_line_logs_parse_error(self):
-        rec = RunRecorder(stdout='{"a": 1}\nnot json\n')
+    def test_each_line_stands_alone_a_bad_one_is_skipped_and_handed_back(self):
+        good = '{"ID": "abc", "Names": "web", "Image": "nginx", "Status": "Up"}'
+        rec = RunRecorder(stdout=f'{good}\nnot json\n{{"Names": "x"}}\n{good}\n')
         with mock.patch.object(Docker, "_run", rec):
-            items = Docker._run_json(["ps"])
-        self.assertEqual(items, [{"a": 1}])
-        self.assertEqual(get_errors()[0]["cat"], "docker.json_parse")
+            listing = Docker._list(["ps"], containerctl.Container.from_dict)
+        self.assertEqual([c.Names for c in listing.rows], ["web", "web"])
+        self.assertIsNone(listing.failure)
+        self.assertEqual(len(listing.skipped), 2)
+        self.assertRegex(listing.skipped[0], r"^docker ps: Expecting value.* in not json$")
+        self.assertEqual(
+            listing.skipped[1], """docker ps: Missing fields: ['ID', 'Image', 'Status'] in {"Names": "x"}"""
+        )
+        self.assertEqual(get_errors(), [])
+
+    def test_a_lookup_does_not_read_a_failed_ps_as_no_such_container(self):
+        rec = RunRecorder(returncode=1, stderr="Cannot connect to the Docker daemon. Is the docker daemon running?")
+        with mock.patch.object(Docker, "_run", rec):
+            for lookup in (Docker.find_project_container, Docker.find_service_container):
+                with self.assertRaises(containerctl.DockerError) as raised:
+                    lookup("demo")
+                self.assertEqual(str(raised.exception), "Docker daemon is not running")
+                self.assertEqual(raised.exception.failure.hint, "start docker")
+        with mock.patch.object(Docker, "_run", RunRecorder(stdout="")):
+            self.assertIsNone(Docker.find_project_container("demo"))  # docker answered: there is none
+
+    def test_nothing_is_created_or_removed_when_ps_failed(self):
+        """`up` must not create over a container it couldn't see, `check` must not say there is nothing to check"""
+        rec = RunRecorder(returncode=1, stderr="boom")
+        service = ServiceConfig(name="web", image="nginx")
+        project = ProjectConfig(name="demo", image="i")
+        actions = (
+            lambda: Docker.service_up(service),
+            lambda: Docker.service_down(service),
+            lambda: Docker.service_recreate(service),
+            lambda: Docker.destroy_project(project),
+            lambda: Docker.enter_project(project),
+            lambda: containerctl._check_one(project),
+        )
+        with mock.patch.object(Docker, "_run", rec), redirect_stdout(io.StringIO()) as out:
+            for action in actions:
+                with self.assertRaises(containerctl.DockerError):
+                    action()
+        self.assertEqual({call[0] for call in rec.calls}, {"ps"})  # the listing, and nothing after it
+        self.assertEqual(out.getvalue(), "")
+
+    def test_the_one_shot_flavour_logs_skipped_rows(self):
+        rec = RunRecorder(stdout='{"Names": "x"}\n')
+        with mock.patch.object(Docker, "_run", rec):
+            self.assertEqual(Docker.list_containers().logged(), [])
+        self.assertEqual([e.cat for e in get_errors()], ["docker.row_parse"])
+
+    def test_known_failures_get_our_words_and_a_hint(self):
+        def classify(stderr, returncode=1):
+            call = subprocess.CompletedProcess(["docker", "ps"], returncode, "", stderr)
+            failure = containerctl.docker_failure(["ps"], call)
+            return failure.msg, failure.hint
+
+        down = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"
+        denied = "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock"
+        self.assertEqual(classify(down), ("Docker daemon is not running", "start docker"))
+        self.assertEqual(classify(denied), ("No permission on the docker socket", "add yourself to the docker group"))
+        self.assertEqual(
+            classify("docker: command not found on PATH", 127),
+            ("docker is not installed", "install docker, or fix PATH"),
+        )
+        self.assertEqual(classify("something new"), containerctl.UNKNOWN_DOCKER_FAILURE)
+
+    def test_a_silent_failure_still_has_something_to_log(self):
+        call = subprocess.CompletedProcess(["docker", "ps"], 3, "", "")
+        self.assertEqual(containerctl.docker_failure(["ps"], call).detail, "docker ps: exit code 3")
+
+    def test_no_docker_on_path_is_classified_end_to_end(self):
+        with mock.patch.object(containerctl.subprocess, "run", side_effect=FileNotFoundError):
+            listing = Docker.list_volumes()
+        self.assertEqual(listing.failure.msg, "docker is not installed")
 
     def test_containers_filters_invalid_rows(self):
         # One good row, one missing required field -> only the good one survives.
@@ -128,9 +215,9 @@ class JsonParsingTests(unittest.TestCase):
         bad = '{"Names": "x"}'
         rec = RunRecorder(stdout=f"{good}\n{bad}\n")
         with mock.patch.object(Docker, "_run", rec):
-            rows = Docker.containers()
+            rows = Docker.list_containers().logged()
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["Names"], "web")
+        self.assertEqual(rows[0].Names, "web")
 
 
 class StreamingCommandTests(unittest.TestCase):
@@ -165,7 +252,7 @@ class StreamingCommandTests(unittest.TestCase):
         for bad in ("ro;ot", ""):
             Docker.exec("abc", ["ls"], user=bad)
         self.assertEqual(self.rec.calls, [])
-        self.assertEqual({e["cat"] for e in get_errors()}, {"docker.invalid_user"})
+        self.assertEqual({e.cat for e in get_errors()}, {"docker.invalid_user"})
 
     def test_exec_with_workdir_inserts_flag(self):
         Docker.exec("abc", ["bash"], workdir="/home/dev/workspace")
@@ -175,7 +262,7 @@ class StreamingCommandTests(unittest.TestCase):
         for bad in ("/home;rm -rf /", ""):
             Docker.exec("abc", ["bash"], workdir=bad)
         self.assertEqual(self.rec.calls, [])
-        self.assertEqual({e["cat"] for e in get_errors()}, {"docker.invalid_workdir"})
+        self.assertEqual({e.cat for e in get_errors()}, {"docker.invalid_workdir"})
 
     def test_shell_delegates_to_exec(self):
         Docker.shell("abc", shell="/bin/bash")
@@ -184,7 +271,7 @@ class StreamingCommandTests(unittest.TestCase):
     def test_logs_rejects_bad_id(self):
         Docker.logs("bad;id")
         self.assertEqual(self.rec.calls, [])
-        self.assertEqual(get_errors()[0]["cat"], "docker.invalid_id")
+        self.assertEqual(get_errors()[0].cat, "docker.invalid_id")
 
 
 class ProjectAndServiceRunTests(unittest.TestCase):
@@ -314,7 +401,7 @@ class ServiceUpNetworkTests(unittest.TestCase):
         return mock.patch.object(Docker, "inspect_container", return_value=info)
 
     def test_running_container_gets_missing_networks_only(self):
-        with mock.patch.object(Docker, "find_service_container", return_value={"State": "running"}):
+        with mock.patch.object(Docker, "find_service_container", return_value=container("c")):
             with self._inspect("proxy"), redirect_stdout(io.StringIO()):
                 self.assertTrue(Docker.service_up(self.service))
         self.assertEqual(
@@ -322,13 +409,13 @@ class ServiceUpNetworkTests(unittest.TestCase):
         )
 
     def test_already_connected_everywhere_is_a_noop(self):
-        with mock.patch.object(Docker, "find_service_container", return_value={"State": "running"}):
+        with mock.patch.object(Docker, "find_service_container", return_value=container("c")):
             with self._inspect("proxy", "backend", "bridge"), redirect_stdout(io.StringIO()):
                 self.assertTrue(Docker.service_up(self.service))
         self.assertEqual(self.rec.calls, [])  # extra networks (bridge) are left alone
 
     def test_stopped_container_is_started_then_connected(self):
-        with mock.patch.object(Docker, "find_service_container", return_value={"State": "exited"}):
+        with mock.patch.object(Docker, "find_service_container", return_value=container("c", "exited")):
             with self._inspect(), redirect_stdout(io.StringIO()):
                 self.assertTrue(Docker.service_up(self.service))
         self.assertEqual(self.rec.calls[0], ["start", "cctl-svc-web"])
@@ -342,11 +429,11 @@ class ServiceUpNetworkTests(unittest.TestCase):
         self.assertTrue(any(c[0] == "run" for c in self.rec.calls))
 
     def test_connect_failure_is_reported(self):
-        with mock.patch.object(Docker, "find_service_container", return_value={"State": "running"}):
+        with mock.patch.object(Docker, "find_service_container", return_value=container("c")):
             with self._inspect("proxy"), redirect_stdout(io.StringIO()):
                 self.rec.returncode = 1
                 self.assertFalse(Docker.service_up(self.service))
-        self.assertEqual(get_errors()[-1]["cat"], "service.network")
+        self.assertEqual(get_errors()[-1].cat, "service.network")
 
 
 class SpawnAndEnterShellFreeTests(unittest.TestCase):
@@ -422,7 +509,7 @@ class SpawnAndEnterShellFreeTests(unittest.TestCase):
     ENTER_SCRIPT = 'cd -- "$1" 2>/dev/null || cd /home/dev; exec bash'
 
     def _enter(self, **kwargs):
-        with mock.patch.object(Docker, "find_project_container", return_value={"State": "running"}):
+        with mock.patch.object(Docker, "find_project_container", return_value=container("c")):
             with redirect_stdout(io.StringIO()):
                 Docker.enter_project(self.project, **kwargs)
 
@@ -494,7 +581,7 @@ class ExecEnvTests(unittest.TestCase):
         for bad in ("1TOK", "A-B", "A=B", ""):
             Docker.exec("abc", ["bash"], env={bad: "x"})
         self.assertEqual(self.sub.calls, [])
-        self.assertEqual({e["cat"] for e in get_errors()}, {"docker.invalid_env"})
+        self.assertEqual({e.cat for e in get_errors()}, {"docker.invalid_env"})
 
     def _enter(self, env, logged=()):
         def fake_resolve(project):
@@ -504,7 +591,7 @@ class ExecEnvTests(unittest.TestCase):
 
         err = io.StringIO()
         with (
-            mock.patch.object(Docker, "find_project_container", return_value={"State": "running"}),
+            mock.patch.object(Docker, "find_project_container", return_value=container("c")),
             mock.patch.object(containerctl, "install_self", return_value=True),
             mock.patch.object(containerctl, "resolve_env", side_effect=fake_resolve) as resolve,
             redirect_stdout(io.StringIO()),
@@ -591,10 +678,10 @@ class MissingDockerTests(unittest.TestCase):
         reset_errors()
         missing = FileNotFoundError(2, "No such file or directory", "docker")
         with mock.patch.object(containerctl.subprocess, "run", side_effect=missing):
-            self.assertEqual(Docker.containers(), [])
+            self.assertEqual(Docker.list_containers().logged(), [])
             self.assertFalse(Docker.start("abc"))
-        self.assertEqual({e["cat"] for e in get_errors()}, {"docker.command"})
-        self.assertIn("command not found", json.dumps(get_errors()))
+        self.assertEqual({e.cat for e in get_errors()}, {"docker.command"})
+        self.assertIn("command not found", " ".join(e.msg for e in get_errors()))
 
 
 class ImageBuildTests(unittest.TestCase):
@@ -650,19 +737,23 @@ class ImageBuildTests(unittest.TestCase):
         self.assertEqual(self.rec.calls[0], ["images", "--format", "{{json .}}"])
         self.assertEqual(self.rec.last[1:5], ["-t", "hermes:cctl-local-000008", "-t", "hermes:latest"])
 
-    def test_image_versions(self):
+    def test_local_versions_over_the_live_listing(self):
         rows = self.rows
+
+        def versions():
+            return containerctl.local_versions(self.image, Docker.list_images().logged())
+
         self.rec.stdout = rows(("cctl-local-000007", "aaa"), ("latest", "aaa"), ("cctl-local-000002", "bbb"))
         self.rec.stdout += "\n" + rows(("cctl-local-x", "ddd"), ("<none>", "ccc"))
-        self.assertEqual(Docker.image_versions(self.image), ([2, 7], 7, True))
+        self.assertEqual(versions(), ([2, 7], 7, "aaa"))
         self.assertEqual(self.rec.last, ["images", "--format", "{{json .}}"])  # the listing everyone else uses
         self.rec.stdout = rows(("cctl-local-000002", "bbb"), ("latest", "zzz"))  # tag points at a non-local build
-        self.assertEqual(Docker.image_versions(self.image), ([2], None, True))
+        self.assertEqual(versions(), ([2], None, "zzz"))
         self.rec.stdout = ""
-        self.assertEqual(Docker.image_versions(self.image), ([], None, False))
+        self.assertEqual(versions(), ([], None, None))
         self.rec.returncode = 1
-        self.assertEqual(Docker.image_versions(self.image), ([], None, False))
-        self.assertEqual(get_errors()[-1]["cat"], "docker.command")
+        self.assertEqual(versions(), ([], None, None))  # a failed listing is logged there and reads as nothing built
+        self.assertEqual(get_errors()[-1].cat, "docker.command")
 
     def test_version_tag_keeps_registry_and_port(self):
         image = containerctl.ImageConfig(
@@ -671,9 +762,18 @@ class ImageBuildTests(unittest.TestCase):
         self.assertEqual((image.repository, image.version_tag(23)), ("reg:5000/h", "reg:5000/h:cctl-local-000023"))
 
     def test_build_failure_is_logged(self):
+        listing = containerctl.Listing()  # the listing answers, the build doesn't
         self.rec.returncode = 1
-        self.assertFalse(Docker.build_image(self.image))
-        self.assertEqual(get_errors()[-1]["cat"], "image.build")
+        with mock.patch.object(Docker, "list_images", return_value=listing):
+            self.assertFalse(Docker.build_image(self.image))
+        self.assertEqual(get_errors()[-1].cat, "image.build")
+
+    def test_build_does_not_number_from_a_failed_listing(self):
+        self.rec.returncode, self.rec.stderr = 1, "Cannot connect to the Docker daemon"
+        with self.assertRaises(containerctl.DockerError) as raised:
+            Docker.build_image(self.image)
+        self.assertEqual(str(raised.exception), "Docker daemon is not running")
+        self.assertEqual(self.rec.calls, [["images", "--format", "{{json .}}"]])  # no build as cctl-local-000000
 
     def test_ensure_image_skips_when_present(self):
         self.assertTrue(Docker.ensure_image("hermes:latest"))
@@ -698,4 +798,4 @@ class ImageBuildTests(unittest.TestCase):
             self.assertFalse(Docker.create_project_container(ProjectConfig(name="p", image="hermes")))
             self.assertFalse(Docker.create_service_container(ServiceConfig(name="s", image="hermes")))
         self.assertNotIn("run", [c[0] for c in self.rec.calls])
-        self.assertLessEqual({"project.create", "service.create"}, {e["cat"] for e in get_errors()})
+        self.assertLessEqual({"project.create", "service.create"}, {e.cat for e in get_errors()})

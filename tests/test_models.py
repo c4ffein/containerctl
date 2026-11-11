@@ -35,29 +35,21 @@ class ContainerModelTests(unittest.TestCase):
         c = Container.from_dict(data)
         self.assertIsNotNone(c)
 
-    def test_missing_required_returns_none_and_logs(self):
+    def test_missing_required_is_refused(self):
         data = self._valid()
         del data["Image"]
-        self.assertIsNone(Container.from_dict(data))
-        errs = get_errors()
-        self.assertEqual(len(errs), 1)
-        self.assertEqual(errs[0]["cat"], "docker.container_parse")
+        self.assertRaises(ValueError, Container.from_dict, data)
+        self.assertEqual(get_errors(), [])  # the listing decides what a skipped row becomes
 
-    def test_invalid_id_returns_none_and_logs(self):
+    def test_invalid_id_is_refused(self):
         data = self._valid()
         data["ID"] = "abc;rm -rf /"
-        self.assertIsNone(Container.from_dict(data))
-        self.assertEqual(get_errors()[0]["cat"], "docker.container_parse")
+        self.assertRaises(ValueError, Container.from_dict, data)
 
-    def test_to_dict_drops_none_platform(self):
-        c = Container.from_dict(self._valid())
-        self.assertNotIn("Platform", c.to_dict())
-
-    def test_to_dict_keeps_set_platform(self):
-        data = self._valid()
-        data["Platform"] = "linux/amd64"
-        c = Container.from_dict(data)
-        self.assertEqual(c.to_dict()["Platform"], "linux/amd64")
+    def test_project_is_read_off_the_cctl_name(self):
+        self.assertEqual(Container.from_dict({**self._valid(), "Names": "cctl-prj-demo"}).Project, "demo")
+        self.assertEqual(Container.from_dict({**self._valid(), "Names": "cctl-svc-web"}).Project, "")
+        self.assertEqual(Container.from_dict(self._valid()).Project, "")
 
 
 class OtherListModelTests(unittest.TestCase):
@@ -66,19 +58,53 @@ class OtherListModelTests(unittest.TestCase):
 
     def test_image_requires_id_repo_tag(self):
         self.assertIsNotNone(Image.from_dict({"ID": "img1", "Repository": "r", "Tag": "t", "Size": "1MB"}))
-        self.assertIsNone(Image.from_dict({"Repository": "r", "Tag": "t"}))
+        self.assertRaises(ValueError, Image.from_dict, {"Repository": "r", "Tag": "t"})
 
     def test_volume_requires_name_driver(self):
         self.assertIsNotNone(Volume.from_dict({"Name": "vol1", "Driver": "local"}))
-        self.assertIsNone(Volume.from_dict({"Name": "vol1"}))
+        self.assertRaises(ValueError, Volume.from_dict, {"Name": "vol1"})
 
     def test_volume_invalid_name_logs(self):
-        self.assertIsNone(Volume.from_dict({"Name": "bad name", "Driver": "local"}))
-        self.assertEqual(get_errors()[0]["cat"], "docker.volume_parse")
+        self.assertRaises(ValueError, Volume.from_dict, {"Name": "bad name", "Driver": "local"})
 
     def test_network_requires_id_name_driver(self):
         self.assertIsNotNone(Network.from_dict({"ID": "net1", "Name": "bridge", "Driver": "bridge"}))
-        self.assertIsNone(Network.from_dict({"ID": "net1", "Name": "bridge"}))
+        self.assertRaises(ValueError, Network.from_dict, {"ID": "net1", "Name": "bridge"})
+
+
+class DeserializeTests(unittest.TestCase):
+    """The dataclass is the schema: required = no default, types = the annotations, unknown keys dropped"""
+
+    VALID = {"ID": "abc123", "Names": "web", "Image": "nginx", "Status": "Up 2h"}
+
+    def refused(self, cls, data):
+        with self.assertRaises(ValueError) as raised:
+            cls.from_dict(data)
+        return str(raised.exception)
+
+    def test_only_a_json_object_is_a_row(self):
+        for data in (5, None, "x", [1], True):
+            self.assertEqual(self.refused(Container, data), f"Not an object: {type(data).__name__}")
+
+    def test_required_fields_are_the_ones_without_a_default(self):
+        self.assertEqual(self.refused(Container, {"Names": "x"}), "Missing fields: ['ID', 'Image', 'Status']")
+        self.assertEqual(self.refused(Image, {"ID": "a", "Repository": "r", "Tag": "t"}), "Missing fields: ['Size']")
+
+    def test_a_value_must_be_of_its_fields_type(self):
+        self.assertEqual(self.refused(Container, {**self.VALID, "Names": None}), "Wrong types: Names (NoneType)")
+        self.assertEqual(
+            self.refused(Container, {**self.VALID, "ID": 12, "State": ["up"]}), "Wrong types: ID (int), State (list)"
+        )
+
+    def test_a_union_takes_any_of_its_types(self):
+        for platform in (None, "linux/amd64", {"os": "linux"}):
+            self.assertEqual(Container.from_dict({**self.VALID, "Platform": platform}).Platform, platform)
+        self.assertEqual(self.refused(Container, {**self.VALID, "Platform": 1}), "Wrong types: Platform (int)")
+
+    def test_the_key_field_is_checked_per_class(self):
+        self.assertEqual(self.refused(Container, {**self.VALID, "ID": "a;b"}), "Invalid ID: a;b")
+        self.assertEqual(self.refused(Volume, {"Name": "bad name", "Driver": "local"}), "Invalid Name: bad name")
+        self.assertNotIn("KEY", Volume.__dataclass_fields__)
 
 
 class InspectModelTests(unittest.TestCase):

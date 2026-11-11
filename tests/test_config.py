@@ -7,6 +7,7 @@ from unittest import mock
 
 import containerctl
 from containerctl import (
+    Image,
     ImageConfig,
     ProjectConfig,
     RepoSpec,
@@ -20,7 +21,7 @@ from containerctl import (
     resolve_enter_target,
     resolve_env,
 )
-from tests.helper import reset_errors
+from tests.helper import container, listings, rejected, reset_errors
 
 
 def write_toml(directory, name, content):
@@ -59,16 +60,15 @@ class ProjectConfigTests(unittest.TestCase):
 
     def test_invalid_project_name_from_filename(self):
         path = write_toml(self.dir, "bad name", 'image = "ubuntu"\n')
-        self.assertIsNone(ProjectConfig.from_toml(path))
+        rejected(ProjectConfig.from_toml, path)
 
     def test_missing_image(self):
         path = write_toml(self.dir, "p", 'ssh_key = "~/.ssh/id"\n')
-        self.assertIsNone(ProjectConfig.from_toml(path))
-        self.assertEqual(get_errors()[0]["cat"], "project.config")
+        self.assertEqual(rejected(ProjectConfig.from_toml, path).cat, "project.config")
 
     def test_invalid_image_ref(self):
         path = write_toml(self.dir, "p", 'image = "ubuntu; rm -rf /"\n')
-        self.assertIsNone(ProjectConfig.from_toml(path))
+        rejected(ProjectConfig.from_toml, path)
 
     def test_legacy_single_repo_string(self):
         path = write_toml(self.dir, "p", 'image = "ubuntu"\nrepo = "https://github.com/u/repo.git"\n')
@@ -94,21 +94,21 @@ class ProjectConfigTests(unittest.TestCase):
     def test_repo_and_repos_both_rejected(self):
         content = 'image = "ubuntu"\nrepo = "https://x/a.git"\nrepos = ["https://x/b.git"]\n'
         path = write_toml(self.dir, "p", content)
-        self.assertIsNone(ProjectConfig.from_toml(path))
+        rejected(ProjectConfig.from_toml, path)
 
     def test_invalid_repo_url(self):
         path = write_toml(self.dir, "p", 'image = "ubuntu"\nrepo = "https://x/ bad"\n')
-        self.assertIsNone(ProjectConfig.from_toml(path))
+        rejected(ProjectConfig.from_toml, path)
 
     def test_duplicate_repo_dir_rejected(self):
         content = 'image = "ubuntu"\nrepos = ["https://x/repo.git", "https://y/repo.git"]\n'
         path = write_toml(self.dir, "p", content)
-        self.assertIsNone(ProjectConfig.from_toml(path))
+        rejected(ProjectConfig.from_toml, path)
 
     def test_invalid_branch_rejected(self):
         content = 'image = "ubuntu"\nrepos = [{url = "https://x/a.git", branch = "bad branch"}]\n'
         path = write_toml(self.dir, "p", content)
-        self.assertIsNone(ProjectConfig.from_toml(path))
+        rejected(ProjectConfig.from_toml, path)
 
     def test_env_files_parsed(self):
         content = 'image = "ubuntu"\nenv_files = [{src = "/home/dev/host.env", dest = "/home/dev/.env"}]\n'
@@ -140,7 +140,7 @@ class ProjectConfigTests(unittest.TestCase):
             "[shortcuts]\napp = 1\n",
         ):
             path = write_toml(self.dir, "p", 'image = "ubuntu"\n' + body)
-            self.assertIsNone(ProjectConfig.from_toml(path), body)
+            rejected(ProjectConfig.from_toml, path)
 
 
 class ResolveEnterTargetTests(unittest.TestCase):
@@ -236,8 +236,7 @@ class ServiceConfigTests(unittest.TestCase):
         ):
             reset_errors()
             path = write_toml(self.dir, "web", 'image = "nginx"\n' + body)
-            self.assertIsNone(ServiceConfig.from_toml(path), body)
-            self.assertEqual(get_errors()[0]["cat"], "service.config", body)
+            self.assertEqual(rejected(ServiceConfig.from_toml, path).cat, "service.config")
 
     def test_env_is_parsed_into_config(self):
         path = write_toml(self.dir, "web", 'image = "nginx"\nenv = ["FOO=bar"]\n')
@@ -246,11 +245,11 @@ class ServiceConfigTests(unittest.TestCase):
 
     def test_invalid_restart_policy(self):
         path = write_toml(self.dir, "web", 'image = "nginx"\nrestart = "sometimes"\n')
-        self.assertIsNone(ServiceConfig.from_toml(path))
+        rejected(ServiceConfig.from_toml, path)
 
     def test_invalid_port_spec(self):
         path = write_toml(self.dir, "web", 'image = "nginx"\nports = ["8080:80; echo"]\n')
-        self.assertIsNone(ServiceConfig.from_toml(path))
+        rejected(ServiceConfig.from_toml, path)
 
     def test_port_spec_with_host_ip(self):
         path = write_toml(self.dir, "web", 'image = "nginx"\nports = ["127.0.0.1:8080:80"]\n')
@@ -258,19 +257,19 @@ class ServiceConfigTests(unittest.TestCase):
 
     def test_invalid_volume_part_count(self):
         path = write_toml(self.dir, "web", 'image = "nginx"\nvolumes = ["/onlyhost"]\n')
-        self.assertIsNone(ServiceConfig.from_toml(path))
+        rejected(ServiceConfig.from_toml, path)
 
     def test_invalid_volume_mode(self):
         path = write_toml(self.dir, "web", 'image = "nginx"\nvolumes = ["/home/dev/d:/d:xx"]\n')
-        self.assertIsNone(ServiceConfig.from_toml(path))
+        rejected(ServiceConfig.from_toml, path)
 
     def test_env_without_equals_rejected(self):
         path = write_toml(self.dir, "web", 'image = "nginx"\nenv = ["NOEQUALS"]\n')
-        self.assertIsNone(ServiceConfig.from_toml(path))
+        rejected(ServiceConfig.from_toml, path)
 
     def test_empty_script_argv_rejected(self):
         path = write_toml(self.dir, "web", 'image = "nginx"\n[scripts]\nbroken = []\n')
-        self.assertIsNone(ServiceConfig.from_toml(path))
+        rejected(ServiceConfig.from_toml, path)
 
 
 if __name__ == "__main__":
@@ -300,27 +299,26 @@ class EnvTablesTests(unittest.TestCase):
         for name in ("1ABC", "A-B", "", "A B", "A=B"):
             for parse in (parse_env_table, parse_secrets_table):
                 reset_errors()
-                self.assertIsNone(parse({name: "x"}, self.path), name)
-                self.assertEqual(get_errors()[0]["cat"], "project.config")
+                self.assertEqual(rejected(parse, {name: "x"}, self.path).cat, "project.config")
 
     def test_not_a_table_rejected(self):
-        self.assertIsNone(parse_env_table(["A=B"], self.path))
-        self.assertIsNone(parse_secrets_table("TOK", self.path))
+        rejected(parse_env_table, ["A=B"], self.path)
+        rejected(parse_secrets_table, "TOK", self.path)
 
     def test_values_must_be_strings(self):
         for bad in (3, True, ["x"], {"value": "x"}):
             reset_errors()
-            self.assertIsNone(parse_env_table({"A": bad}, self.path), bad)
-            self.assertIsNone(parse_secrets_table({"A": bad}, self.path), bad)
+            rejected(parse_env_table, {"A": bad}, self.path)
+            rejected(parse_secrets_table, {"A": bad}, self.path)
 
     def test_nul_in_plain_value_rejected(self):
-        self.assertIsNone(parse_env_table({"A": "x\x00y"}, self.path))
+        rejected(parse_env_table, {"A": "x\x00y"}, self.path)
 
     def test_secret_key_must_be_a_name(self):
         """A value here is a key into secrets.toml, never the secret itself: only [A-Za-z_][A-Za-z0-9_]*."""
         for bad in ("", "sk-ant-oat01-...", "a key", "1x"):
             reset_errors()
-            self.assertIsNone(parse_secrets_table({"TOK": bad}, self.path), bad)
+            rejected(parse_secrets_table, {"TOK": bad}, self.path)
 
     def test_project_toml_tables(self):
         with tempfile.TemporaryDirectory() as d:
@@ -330,13 +328,12 @@ class EnvTablesTests(unittest.TestCase):
             bare = ProjectConfig.from_toml(write_toml(d, "q", 'image = "ubuntu"\n'))
             self.assertEqual((bare.env, bare.secrets), ({}, {}))
             bad = write_toml(d, "r", 'image = "ubuntu"\n[secrets]\nTOK = { value = "x" }\n')
-            self.assertIsNone(ProjectConfig.from_toml(bad))
+            rejected(ProjectConfig.from_toml, bad)
 
     def test_name_in_both_tables_rejected(self):
         with tempfile.TemporaryDirectory() as d:
             path = write_toml(d, "p", 'image = "ubuntu"\n[env]\nTOK = "x"\n[secrets]\nTOK = "tok"\n')
-            self.assertIsNone(ProjectConfig.from_toml(path))
-        self.assertIn("both [env] and [secrets]", get_errors()[0]["msg"])
+            self.assertIn("both [env] and [secrets]", str(rejected(ProjectConfig.from_toml, path)))
 
 
 class ResolveEnvTests(unittest.TestCase):
@@ -361,7 +358,7 @@ class ResolveEnvTests(unittest.TestCase):
         return ProjectConfig(name="p", image="i", env=env or {}, secrets=secrets or {})
 
     def cats(self):
-        return [e["cat"] for e in get_errors()]
+        return [e.cat for e in get_errors()]
 
     def test_nothing_declared_nothing_injected(self):
         self.assertEqual(resolve_env(self.project()), {})
@@ -381,7 +378,7 @@ class ResolveEnvTests(unittest.TestCase):
         self.write("")
         self.assertEqual(resolve_env(self.project({"TZ": "UTC"}, {"TOK": "tok"})), {"TZ": "UTC"})
         self.assertEqual(self.cats(), ["env.secret"])
-        self.assertIn("TOK: no 'tok' in", get_errors()[0]["msg"])
+        self.assertIn("TOK: no 'tok' in", get_errors()[0].msg)
 
     def test_missing_file_is_just_missing_secrets(self):
         self.assertEqual(resolve_env(self.project(secrets={"TOK": "tok"})), {})
@@ -403,13 +400,13 @@ class ResolveEnvTests(unittest.TestCase):
         self.write('tok = "s"\n', mode=0o644)
         self.assertEqual(resolve_env(self.project(secrets={"TOK": "tok"})), {"TOK": "s"})  # still works, but
         self.assertEqual(self.cats(), ["env.secret"])
-        self.assertIn("mode 0644, readable by others: chmod 600", get_errors()[0]["msg"])
+        self.assertIn("mode 0644, readable by others: chmod 600", get_errors()[0].msg)
 
     def test_malformed_file_is_logged(self):
         self.write("tok = \n")
         self.assertEqual(resolve_env(self.project({"TZ": "UTC"}, {"TOK": "tok"})), {"TZ": "UTC"})
         self.assertEqual(self.cats(), ["env.secret", "env.secret"])  # load failure, then missing
-        self.assertIn("Failed to load", get_errors()[0]["msg"])
+        self.assertIn("Failed to load", get_errors()[0].msg)
 
     def test_undeclared_key_is_never_injected(self):
         self.write('tok = "s"\nother = "o"\n')
@@ -466,16 +463,14 @@ class ImageConfigTests(unittest.TestCase):
             "tag = [\n",
         ):
             reset_errors()
-            self.assertIsNone(ImageConfig.from_toml(self.recipe(toml=toml)), toml)
-            self.assertEqual(get_errors()[0]["cat"], "image.config", toml)
+            self.assertEqual(rejected(ImageConfig.from_toml, self.recipe(toml=toml)).cat, "image.config")
 
     def test_missing_dockerfile_rejected(self):
         path = write_toml(self.dir, "hermes", "")
-        self.assertIsNone(ImageConfig.from_toml(path))
-        self.assertIn("Missing hermes.Dockerfile", get_errors()[0]["msg"])
+        self.assertIn("Missing hermes.Dockerfile", str(rejected(ImageConfig.from_toml, path)))
 
     def test_invalid_name_rejected(self):
-        self.assertIsNone(ImageConfig.from_toml(self.recipe(name="a.b")))
+        rejected(ImageConfig.from_toml, self.recipe(name="a.b"))
 
     def test_load_images_and_find_recipe(self):
         self.recipe("a")
@@ -528,7 +523,7 @@ class ImageConfigTests(unittest.TestCase):
         cfg = ImageConfig.from_toml(self.recipe())
         (self.dir / "hermes.Dockerfile").unlink()
         self.assertIsNone(cfg.recipe_hash())
-        self.assertEqual(get_errors()[0]["cat"], "image.recipe")
+        self.assertEqual(get_errors()[0].cat, "image.recipe")
 
 
 class NormalizeImageRefTests(unittest.TestCase):
@@ -559,12 +554,13 @@ class ServiceCommandTests(unittest.TestCase):
     def test_command_rejected(self):
         for bad in ('command = "gateway run"', 'command = ["a", ""]', "command = [1]"):
             reset_errors()
-            self.assertIsNone(ServiceConfig.from_toml(write_toml(self.dir, "h", f'image = "x"\n{bad}\n')), bad)
-            self.assertIn("command", get_errors()[0]["msg"])
+            self.assertIn(
+                "command", str(rejected(ServiceConfig.from_toml, write_toml(self.dir, "h", f'image = "x"\n{bad}\n')))
+            )
 
 
-class ConditionTests(unittest.TestCase):
-    """Conditions: evaluated from loaded config and `docker images` rows, never logged, gone once fixed."""
+class IssueTests(unittest.TestCase):
+    """Issues: detected from loaded config and the docker listings, never logged, gone once fixed."""
 
     def setUp(self):
         reset_errors()
@@ -580,7 +576,7 @@ class ConditionTests(unittest.TestCase):
         self.assertEqual(issues[0].msg, "Shortcut 'docs' is defined by several projects: a, b")
         self.assertEqual(issues[1].msg, "Shortcut 'lib' (a) is shadowed by project 'lib'")
         self.assertEqual(issues[1].hint, "rename it in a.toml")
-        self.assertEqual(get_errors(), [])  # a condition, not an event
+        self.assertEqual(get_errors(), [])  # an issue, not an error
         self.assertEqual(containerctl.shortcut_issues({"a": ProjectConfig(name="a", image="i")}), [])
 
     def test_secrets_file_mode(self):
@@ -593,18 +589,117 @@ class ConditionTests(unittest.TestCase):
                 self.assertIsNone(containerctl.secrets_mode_issue())
                 sec.chmod(0o644)
                 issue = containerctl.secrets_mode_issue()
-        self.assertEqual((issue.level, issue.cat), (containerctl.WARNING, "env.secret"))
+        self.assertEqual(issue.cat, "env.secret")
         self.assertEqual(issue.msg, f"{sec} is mode 0644, readable by others")
         self.assertEqual(issue.hint, f"chmod 600 {sec}")
         self.assertEqual(get_errors(), [])
 
+    def test_a_broken_file_is_an_error_issue_and_hides_no_other_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_toml(d, "good", 'image = "ubuntu"\n')
+            write_toml(d, "bad", "image = \n")
+            write_toml(d, "worse", 'image = "ubuntu; rm -rf /"\n')
+            with mock.patch.object(containerctl, "PROJECTS_DIR", Path(d)):
+                projects, problems = containerctl.read_projects()
+                self.assertEqual(get_errors(), [])  # handed back, not logged
+                self.assertEqual(sorted(containerctl.load_projects()), ["good"])  # the one-shot flavour logs them
+        self.assertEqual(sorted(projects), ["good"])
+        self.assertEqual(
+            [(i.level, i.cat, i.hint) for i in problems],
+            [
+                (containerctl.ERROR, "project.config", "edit bad.toml"),
+                (containerctl.ERROR, "project.config", "edit worse.toml"),
+            ],
+        )
+        self.assertIn("Failed to load", problems[0].msg)
+        self.assertEqual([(e.cat, e.msg) for e in get_errors()], [(i.cat, i.msg) for i in problems])
+
+    def test_a_missing_config_dir_is_no_config_and_no_issue(self):
+        for read in (containerctl.read_projects, containerctl.read_services, containerctl.read_images):
+            with (
+                mock.patch.object(containerctl, "PROJECTS_DIR", Path("/nonexistent/p")),
+                mock.patch.object(containerctl, "SERVICES_DIR", Path("/nonexistent/s")),
+                mock.patch.object(containerctl, "IMAGES_DIR", Path("/nonexistent/i")),
+            ):
+                self.assertEqual(read(), ({}, []))
+
+    def test_failed_listings_are_one_issue_per_reason(self):
+        down = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"
+        with mock.patch.object(containerctl, "SECRETS_FILE", Path("/nonexistent/secrets.toml")):
+            all_down = containerctl.detect_issues(
+                {}, {}, {}, listings(failed=dict.fromkeys(containerctl.LISTINGS, down))
+            )
+            partial = containerctl.detect_issues({}, {}, {}, listings(failed={"volumes": "plugin exploded"}))
+        self.assertEqual(
+            all_down,
+            [
+                containerctl.Issue(
+                    containerctl.ERROR,
+                    "docker",
+                    "Docker daemon is not running (containers, images, volumes, networks)",
+                    "start docker",
+                    "\n".join(f"docker {key}: {down}" for key in containerctl.LISTINGS),  # what docker said, raw
+                )
+            ],
+        )
+        self.assertEqual(
+            [(i.level, i.msg) for i in partial], [(containerctl.ERROR, "Unknown docker failure (volumes)")]
+        )
+        self.assertEqual(get_errors(), [])
+
+    def test_a_failed_listing_is_not_read_as_an_empty_one(self):
+        """No image rows because `docker images` failed: no verdict on versions. Same for orphans and `docker ps`."""
+        image = containerctl.ImageConfig(name="hermes", dockerfile=Path("h.Dockerfile"), context=Path("h"))
+        with mock.patch.object(containerctl, "SECRETS_FILE", Path("/nonexistent/secrets.toml")):
+            issues = containerctl.detect_issues(
+                {}, {}, {"hermes": image}, listings(failed={"images": "boom", "containers": "boom"})
+            )
+        self.assertEqual([i.cat for i in issues], ["docker"])
+
+    def test_containers_without_a_config_are_orphans(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_toml(d, "broken", "image = \n")  # there but unusable: still owns its container
+            with (
+                mock.patch.object(containerctl, "PROJECTS_DIR", Path(d)),
+                mock.patch.object(containerctl, "SERVICES_DIR", Path(d) / "none"),
+                mock.patch.object(containerctl, "SECRETS_FILE", Path("/nonexistent/secrets.toml")),
+            ):
+                names = ["cctl-prj-live", "cctl-prj-broken", "cctl-prj-gone", "cctl-svc-web", "cctl-svc-old", "redis"]
+                rows = [container(name) for name in names]
+                issues = containerctl.detect_issues(
+                    {"live": ProjectConfig(name="live", image="i")},
+                    {"web": ServiceConfig(name="web", image="i")},
+                    {},
+                    listings(containers=rows),
+                )
+        self.assertEqual(
+            [(i.level, i.cat, i.msg, i.hint) for i in issues],
+            [
+                (
+                    containerctl.WARNING,
+                    "project.orphan",
+                    "Container cctl-prj-gone has no project config",
+                    "restore gone.toml, or docker rm -f cctl-prj-gone",
+                ),
+                (
+                    containerctl.WARNING,
+                    "service.orphan",
+                    "Container cctl-svc-old has no service config",
+                    "restore old.toml, or docker rm -f cctl-svc-old",
+                ),
+            ],
+        )
+
     def test_image_versions_from_docker_images_rows(self):
         image = containerctl.ImageConfig(name="hermes", dockerfile=Path("h.Dockerfile"), context=Path("h"))
-        rows = [{"Repository": "hermes", "Tag": f"cctl-local-{n:06d}", "ID": f"id{n}"} for n in range(4)]
-        rows.append({"Repository": "hermes", "Tag": "latest", "ID": "id3"})  # the recipe tag points at version 3
-        rows.append({"Repository": "other", "Tag": "cctl-local-000009", "ID": "x"})  # another repository
-        self.assertEqual(containerctl.local_versions(image, rows), ([0, 1, 2, 3], 3, True))
-        issues = containerctl.image_version_issues({"hermes": image}, rows)
+        rows = [Image(f"id{n}", "hermes", f"cctl-local-{n:06d}", "1MB") for n in range(4)]
+        rows.append(Image("id3", "hermes", "latest", "1MB"))  # the recipe tag points at version 3
+        rows.append(Image("x", "other", "cctl-local-000009", "1MB"))  # another repository
+        self.assertEqual(containerctl.local_versions(image, rows), ([0, 1, 2, 3], 3, "id3"))
+        with mock.patch.object(containerctl, "SECRETS_FILE", Path("/nonexistent/secrets.toml")):
+            issues = containerctl.detect_issues({}, {}, {"hermes": image}, listings(images=rows))
+            fine = containerctl.detect_issues({}, {}, {"hermes": image}, listings(images=rows[:3]))  # three is fine
+        self.assertEqual(fine, [])
         self.assertEqual(
             [(i.level, i.cat, i.msg) for i in issues],
             [(containerctl.WARNING, "image.versions", "hermes has 4 local versions")],
@@ -612,4 +707,3 @@ class ConditionTests(unittest.TestCase):
         self.assertEqual(
             issues[0].hint, "docker rmi hermes:cctl-local-000000 hermes:cctl-local-000001 hermes:cctl-local-000002"
         )
-        self.assertEqual(containerctl.image_version_issues({"hermes": image}, rows[:3]), [])  # three is fine

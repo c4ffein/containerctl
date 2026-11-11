@@ -11,6 +11,31 @@ replace the two places a subprocess is launched and assert on the command that
 import subprocess
 
 import containerctl
+from containerctl import Container
+
+
+def container(name: str, state: str = "running", id_: str = "abc", image: str = "i") -> Container:
+    """A `docker ps` row as the parser would return it"""
+    return Container(ID=id_, Names=name, Image=image, Status=f"Up ({state})", State=state)
+
+
+def listings(failed=None, **rows) -> dict:
+    """The four docker listings as the fetcher gets them: `rows` by tab key (none by default), `failed` the
+    keys whose call failed mapped to docker's stderr"""
+    result = {key: containerctl.Listing(list(rows.get(key, []))) for key in containerctl.LISTINGS}
+    for key, stderr in (failed or {}).items():
+        call = subprocess.CompletedProcess(["docker", key], 1, "", stderr)
+        result[key] = containerctl.Listing(failure=containerctl.docker_failure([key], call))
+    return result
+
+
+def rejected(parse, *args) -> containerctl.ConfigError:
+    """Run a parser on input it must refuse: the ConfigError it raised"""
+    try:
+        parse(*args)
+    except containerctl.ConfigError as e:
+        return e
+    raise AssertionError(f"{parse.__qualname__} accepted {args}")
 
 
 def reset_errors():

@@ -7,6 +7,8 @@ WARNING: I don't recommand using this as-is. This a PoC, and usable by me becaus
 """
 
 import argparse
+import collections
+import dataclasses
 import difflib
 import hashlib
 import json
@@ -19,29 +21,48 @@ import subprocess
 import sys
 import tempfile
 import termios
+import textwrap
 import threading
 import time
 import tomllib
 import tty
 import urllib.request
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Callable
 
 # =============================================================================
-# Issues: events (the error log) + conditions (evaluated from current state)
+# Errors (a log) and issues (detected from current state)
 # =============================================================================
 #
-# Two shapes, one surface (the Issues tab, `containerctl issues`):
-#   - an *event* is something that happened: a docker call failed, a build failed. Logged once per occurrence
-#     through log_error, counted, cleared by the user once read.
-#   - a *condition* is something that is true right now: a config file that doesn't parse, a world-readable
-#     secrets file, too many local image versions. Evaluated from current state on each fetch, never stored,
-#     gone by itself once fixed. Nothing to clear: the action that ends it is its `hint`.
-# Both carry a level. Severity and shape are independent: a broken TOML is an error-level condition.
+# Two kinds, two tabs:
+#   - an *issue* is something that is true right now and wants an action from you: docker is unreachable, a
+#     listing failed, a config file doesn't parse (error level: something is broken), a shortcut two projects
+#     define, a world-readable secrets file, too many local image versions (warning level: works, but look at
+#     it). Detected from state already in hand on every fetch, never stored, gone by itself once fixed. Nothing
+#     to clear: its `hint` is the action. Whatever is wrong tick after tick is an issue, however briefly: a
+#     daemon that drops for ten seconds is one, for ten seconds.
+#   - an *error* is the trace of something that happened once: an action or a build that failed, what a CLI run
+#     ran into, and whatever we don't handle yet (a crash of ours), which becomes an issue the day we do. Logged
+#     through log_error into a ring of the newest EVENTS_MAX, which the Errors tab lists newest first: a log,
+#     nothing more. The fetcher doesn't write to it what it can show as an issue. A CLI run prints what it logged
+#     on stderr when it is done.
+# The same fact reaches either: the calls that can fail hand the outcome back (`read_projects`, a `Listing`), the
+# fetcher turns it into issues, a one-shot caller logs it (`load_projects`, `Listing.logged`).
 
 WARNING, ERROR = "warning", "error"
+
+
+@dataclass(frozen=True, slots=True)
+class Event:
+    ts: float
+    cat: str
+    msg: str
+    ctx: dict
+
+    @property
+    def time(self) -> str:
+        return time.strftime("%H:%M:%S", time.localtime(self.ts))
 
 
 @dataclass(frozen=True)
@@ -50,89 +71,55 @@ class Issue:
     cat: str
     msg: str
     hint: str = ""  # what makes it go away
+    detail: str = ""  # the raw material, one item per line: what docker said, the rows we couldn't read
 
 
-_collecting = threading.local()  # .issues: where log_error appends inside a collecting() block, else None
+def by_severity(issues: list[Issue]) -> list[Issue]:
+    """Errors first, then warnings, each by category"""
+    return sorted(issues, key=lambda i: (i.level != ERROR, i.cat))
 
 
-@contextmanager
-def collecting() -> Iterator[list[Issue]]:
-    """Inside the block, log_error records error-level conditions here instead of events. The config loaders
-    report through log_error; run them in here and a broken file is a condition that shows while it is broken,
-    instead of one more event per fetch. Per thread: the fetcher collects, the main thread's events stay events."""
-    issues: list[Issue] = []
-    previous = getattr(_collecting, "issues", None)
-    _collecting.issues = issues
-    try:
-        yield issues
-    finally:
-        _collecting.issues = previous
+class ConfigError(Exception):
+    """A config file that can't be used. Raised by the parsers, caught per file by read_configs: `cat` is the
+    category it is reported under, the message says what is wrong and where."""
+
+    def __init__(self, cat: str, msg: str):
+        super().__init__(msg)
+        self.cat = cat
 
 
-_errors: list[dict] = []  # every occurrence, oldest first: {"ts", "cat", "msg", "ctx"}
-# Events are what user actions log; the fetcher thread collects its own failures as conditions, but the TUI
-# reads, groups and clears this list from the main thread while actions append to it. The GIL makes a lone
-# append safe; the rebind in clear_errors racing a reader is not, and free-threaded builds have no GIL, so
-# every writer and every reader that walks the list takes this lock. Callers never do: log_error handles it.
+EVENTS_MAX = 10_000  # the oldest go, the newest stay
+_errors: collections.deque[Event] = collections.deque(maxlen=EVENTS_MAX)  # oldest first
+# The fetcher thread logs while the main thread lists. The GIL makes a lone append safe; a snapshot racing an
+# append that evicts is not, and free-threaded builds have no GIL, so every writer and every walker takes this
+# lock. Callers never do: log_error and friends handle it. (`bool(_errors)` is one len read, no lock needed.)
 _errors_lock = threading.Lock()
 
 
 def log_error(category: str, message: str, context: dict | None = None) -> None:
-    """Record a non-fatal error: an event in the registry (every occurrence; the TUI shows one row per category),
-    or an error-level condition when called inside collecting()"""
-    issues = getattr(_collecting, "issues", None)
-    if issues is not None:
-        issues.append(Issue(ERROR, category, message))
-        return
+    """Record a non-fatal error"""
     with _errors_lock:
-        _errors.append({"ts": time.time(), "cat": category, "msg": message, "ctx": context or {}})
+        _errors.append(Event(time.time(), category, message, context or {}))
 
 
-def get_errors() -> list[dict]:
-    """The live registry list (slice or copy it before walking it from another thread)"""
-    return _errors
-
-
-def get_errors_by_category() -> dict[str, list[dict]]:
-    """Get errors grouped by category (a snapshot taken under the lock)"""
+def get_errors() -> list[Event]:
+    """A snapshot of the log, oldest first"""
     with _errors_lock:
-        snapshot = list(_errors)
-    grouped: dict[str, list[dict]] = {}
-    for err in snapshot:
-        cat = err["cat"]
-        if cat not in grouped:
-            grouped[cat] = []
-        grouped[cat].append(err)
-    return grouped
+        return list(_errors)
 
 
-def clear_errors(category: str) -> int:
-    """Clear all errors in a category, returns count cleared"""
-    global _errors
+def clear_errors() -> int:
+    """Empty the log; returns how many entries went"""
     with _errors_lock:
-        before = len(_errors)
-        _errors = [e for e in _errors if e["cat"] != category]
-        return before - len(_errors)
+        count = len(_errors)
+        _errors.clear()
+        return count
 
 
-def by_severity(conditions: list[Issue]) -> list[Issue]:
-    """Errors first, then warnings, each by category"""
-    return sorted(conditions, key=lambda i: (i.level != ERROR, i.cat))
-
-
-def fetch_issues(conditions: list[Issue]) -> list[dict]:
-    """Rows for the Issues tab: conditions first (no count, nothing to clear), then one row per event category
-    with its latest message and count. `_category` is set on event rows only: it is what [c]lear acts on."""
-    rows = []
-    for issue in by_severity(conditions):
-        message = f"{issue.msg}  [{issue.hint}]" if issue.hint else issue.msg
-        rows.append({"Level": issue.level, "Category": issue.cat, "Count": "", "Message": message, "_category": ""})
-    for cat, errs in sorted(get_errors_by_category().items()):
-        message = errs[-1]["msg"]
-        rows.append({"Level": ERROR, "Category": cat, "Count": str(len(errs)), "Message": message, "_category": cat})
-    if not rows:
-        return [{"Level": "", "Category": "No issues", "Count": "", "Message": "", "_category": ""}]
-    return rows
+def log_issues(issues: list[Issue]) -> None:
+    """For a one-shot caller with no Issues tab to show them in: what was detected goes to the log"""
+    for issue in issues:
+        log_error(issue.cat, issue.msg)
 
 
 # =============================================================================
@@ -204,8 +191,44 @@ def is_valid_port_spec(spec_str: str) -> bool:
     return len(parts) in (1, 2) and all(_is_port_range(p) for p in parts)
 
 
+def deserialize(cls, data):
+    """Decoded JSON -> an instance of dataclass `cls`, checked against the class itself: its fields are the schema.
+    A field without a default is required; a value must be an instance of its field's type (isinstance takes
+    `str | None` and friends as they are); keys the class doesn't declare are dropped, docker adds columns over
+    time. ValueError saying what is wrong. Shallow on purpose: a `list` or `dict` field isn't looked into.
+    (Needs real annotations: under `from __future__ import annotations` a field's type is a string.)"""
+    if not isinstance(data, dict):
+        raise ValueError(f"Not an object: {type(data).__name__}")
+    fields = dataclasses.fields(cls)
+    unset = dataclasses.MISSING
+    missing = [f.name for f in fields if f.name not in data and f.default is unset and f.default_factory is unset]
+    if missing:
+        raise ValueError(f"Missing fields: {missing}")
+    given = {f.name: data[f.name] for f in fields if f.name in data}
+    types = {f.name: f.type for f in fields}
+    wrong = [f"{name} ({type(value).__name__})" for name, value in given.items() if not isinstance(value, types[name])]
+    if wrong:
+        raise ValueError(f"Wrong types: {', '.join(wrong)}")
+    return cls(**given)
+
+
+class Row:
+    """A row of a docker listing: a dataclass, deserialized as one, whose KEY field (what we hand back to docker
+    to name it) must be a safe identifier"""
+
+    KEY = "ID"  # not annotated: a class attribute, not a field
+
+    @classmethod
+    def from_dict(cls, data):
+        """A row of the listing; ValueError when it is not one we can use"""
+        row = deserialize(cls, data)
+        if not is_valid_id(getattr(row, cls.KEY)):
+            raise ValueError(f"Invalid {cls.KEY}: {getattr(row, cls.KEY)}")
+        return row
+
+
 @dataclass
-class Container:
+class Container(Row):
     """Docker container data model"""
 
     ID: str
@@ -222,32 +245,16 @@ class Container:
     Size: str = ""
     RunningFor: str = ""
     LocalVolumes: str = ""
-    Platform: str | None = None
+    Platform: dict | str | None = None  # an object on recent docker, unused here
 
-    @classmethod
-    def from_dict(cls, data: dict) -> "Container | None":
-        """Create Container from dict, logging errors for missing required fields"""
-        required = ["ID", "Names", "Image", "Status"]
-        missing = [f for f in required if f not in data]
-        if missing:
-            log_error("docker.container_parse", f"Missing fields: {missing}", {"data": str(data)[:200]})
-            return None
-        if not is_valid_id(data["ID"]):
-            log_error("docker.container_parse", f"Invalid ID: {data['ID']}", {"data": str(data)[:200]})
-            return None
-        try:
-            return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
-        except TypeError as e:
-            log_error("docker.container_parse", str(e), {"data": str(data)[:200]})
-            return None
-
-    def to_dict(self) -> dict:
-        """Convert to dict for UI compatibility"""
-        return {k: v for k, v in self.__dict__.items() if v is not None}
+    @property
+    def Project(self) -> str:
+        """The project this container belongs to, read off its cctl- name; empty for any other container"""
+        return self.Names.removeprefix(CONTAINER_PREFIX) if self.Names.startswith(CONTAINER_PREFIX) else ""
 
 
 @dataclass
-class Image:
+class Image(Row):
     """Docker image data model"""
 
     ID: str
@@ -262,31 +269,12 @@ class Image:
     UniqueSize: str = ""
     VirtualSize: str = ""
 
-    @classmethod
-    def from_dict(cls, data: dict) -> "Image | None":
-        """Create Image from dict, logging errors for missing required fields"""
-        required = ["ID", "Repository", "Tag"]
-        missing = [f for f in required if f not in data]
-        if missing:
-            log_error("docker.image_parse", f"Missing fields: {missing}", {"data": str(data)[:200]})
-            return None
-        if not is_valid_id(data["ID"]):
-            log_error("docker.image_parse", f"Invalid ID: {data['ID']}", {"data": str(data)[:200]})
-            return None
-        try:
-            return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
-        except TypeError as e:
-            log_error("docker.image_parse", str(e), {"data": str(data)[:200]})
-            return None
-
-    def to_dict(self) -> dict:
-        """Convert to dict for UI compatibility"""
-        return {k: v for k, v in self.__dict__.items() if v is not None}
-
 
 @dataclass
-class Volume:
+class Volume(Row):
     """Docker volume data model"""
+
+    KEY = "Name"
 
     Name: str
     Driver: str
@@ -299,30 +287,9 @@ class Volume:
     Group: str = ""
     Links: str = ""
 
-    @classmethod
-    def from_dict(cls, data: dict) -> "Volume | None":
-        """Create Volume from dict, logging errors for missing required fields"""
-        required = ["Name", "Driver"]
-        missing = [f for f in required if f not in data]
-        if missing:
-            log_error("docker.volume_parse", f"Missing fields: {missing}", {"data": str(data)[:200]})
-            return None
-        if not is_valid_id(data["Name"]):
-            log_error("docker.volume_parse", f"Invalid Name: {data['Name']}", {"data": str(data)[:200]})
-            return None
-        try:
-            return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
-        except TypeError as e:
-            log_error("docker.volume_parse", str(e), {"data": str(data)[:200]})
-            return None
-
-    def to_dict(self) -> dict:
-        """Convert to dict for UI compatibility"""
-        return {k: v for k, v in self.__dict__.items() if v is not None}
-
 
 @dataclass
-class Network:
+class Network(Row):
     """Docker network data model"""
 
     ID: str
@@ -335,26 +302,71 @@ class Network:
     IPv6: str = ""
     Labels: str = ""
 
-    @classmethod
-    def from_dict(cls, data: dict) -> "Network | None":
-        """Create Network from dict, logging errors for missing required fields"""
-        required = ["ID", "Name", "Driver"]
-        missing = [f for f in required if f not in data]
-        if missing:
-            log_error("docker.network_parse", f"Missing fields: {missing}", {"data": str(data)[:200]})
-            return None
-        if not is_valid_id(data["ID"]):
-            log_error("docker.network_parse", f"Invalid ID: {data['ID']}", {"data": str(data)[:200]})
-            return None
-        try:
-            return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
-        except TypeError as e:
-            log_error("docker.network_parse", str(e), {"data": str(data)[:200]})
-            return None
 
-    def to_dict(self) -> dict:
-        """Convert to dict for UI compatibility"""
-        return {k: v for k, v in self.__dict__.items() if v is not None}
+# What a failed docker call says on stderr (lowercased substring) -> what we say, and what to do about it. First
+# match wins: the socket's "permission denied" also mentions connecting to the daemon. Anything else shows as
+# UNKNOWN_DOCKER_FAILURE with the raw stderr in the issue's details: read it there, then add its line here.
+DOCKER_FAILURES = [
+    ("command not found", "docker is not installed", "install docker, or fix PATH"),
+    ("permission denied", "No permission on the docker socket", "add yourself to the docker group"),
+    ("cannot connect to the docker daemon", "Docker daemon is not running", "start docker"),
+]
+UNKNOWN_DOCKER_FAILURE = ("Unknown docker failure", "its details have what docker said")
+
+
+@dataclass(frozen=True)
+class Failure:
+    """Why a docker call failed: `msg` and `hint` in our words, `detail` the command and raw stderr for the log"""
+
+    msg: str
+    hint: str
+    detail: str
+
+
+def docker_failure(args: list[str], result: subprocess.CompletedProcess) -> Failure:
+    stderr = (result.stderr or "").strip()
+    detail = f"docker {' '.join(args)}" + (f": {stderr}" if stderr else f": exit code {result.returncode}")
+    text = stderr.lower()
+    msg, hint = next(((m, h) for needle, m, h in DOCKER_FAILURES if needle in text), UNKNOWN_DOCKER_FAILURE)
+    return Failure(msg, hint, detail)
+
+
+class DockerError(Exception):
+    """A docker call failed where there is no honest way to go on: reading a failed `docker ps` as "no such
+    container" would have `check` say there is nothing to check and `up` create what already exists. Raised by
+    the lookups, caught at the edges (main, the TUI's key handler), which say why and stop."""
+
+    def __init__(self, failure: Failure):
+        super().__init__(failure.msg)
+        self.failure = failure
+
+
+@dataclass
+class Listing:
+    """What a docker listing came back with: its rows, or why there are none. An empty list and a failed one are
+    not the same thing, and only the caller knows what a failure should become (an issue, a log line)."""
+
+    rows: list = field(default_factory=list)
+    failure: Failure | None = None
+    skipped: list[str] = field(default_factory=list)  # the lines that weren't a usable row, and why: the rest counts
+
+    def logged(self) -> list:
+        """The rows, for a one-shot caller: a failure is logged and reads as no rows, skipped lines are logged"""
+        if self.failure:
+            log_error("docker.command", self.failure.detail)
+        for line in self.skipped:
+            log_error("docker.row_parse", line)
+        return self.rows
+
+    def required(self) -> list:
+        """The rows, for a caller that can't honestly go on without them: DockerError on a failure (skipped lines
+        are logged)"""
+        if self.failure:
+            raise DockerError(self.failure)
+        return self.logged()
+
+
+LISTINGS = ("containers", "images", "volumes", "networks")  # the four docker listings, by tab key
 
 
 # =============================================================================
@@ -597,30 +609,27 @@ def is_valid_env_name(name: str) -> bool:
     return bool(name) and not name[0].isdigit() and all(c in VALID_ENV_NAME_CHARS for c in name)
 
 
-def _parse_name_table(raw, path: Path, table: str, value_ok: Callable[[str], bool]) -> dict[str, str] | None:
-    """A `[table]` of `ENV_NAME = "string"`. None (after logging) when anything is malformed: a half-applied
-    environment is worse than none."""
+def _parse_name_table(raw, path: Path, table: str, value_ok: Callable[[str], bool]) -> dict[str, str]:
+    """A `[table]` of `ENV_NAME = "string"`. ConfigError when anything is malformed: a half-applied environment
+    is worse than none."""
     if raw is None:
         return {}
     if not isinstance(raw, dict):
-        log_error("project.config", f"Invalid '{table}' (must be a table) in {path}")
-        return None
+        raise ConfigError("project.config", f"Invalid '{table}' (must be a table) in {path}")
     for name, value in raw.items():
         if not is_valid_env_name(name):
-            log_error("project.config", f"Invalid env name '{name}' in [{table}] of {path}")
-            return None
+            raise ConfigError("project.config", f"Invalid env name '{name}' in [{table}] of {path}")
         if not isinstance(value, str) or not value_ok(value):
-            log_error("project.config", f"Invalid value for '{name}' in [{table}] of {path}")
-            return None
+            raise ConfigError("project.config", f"Invalid value for '{name}' in [{table}] of {path}")
     return dict(raw)
 
 
-def parse_env_table(raw, path: Path) -> dict[str, str] | None:
+def parse_env_table(raw, path: Path) -> dict[str, str]:
     """`[env]`: `NAME = "value"`, plain values for the `enter` shell's environment"""
     return _parse_name_table(raw, path, "env", lambda v: "\x00" not in v)
 
 
-def parse_secrets_table(raw, path: Path) -> dict[str, str] | None:
+def parse_secrets_table(raw, path: Path) -> dict[str, str]:
     """`[secrets]`: `NAME = "key"`, the key of a secrets.toml entry whose value is looked up at `enter`.
     Only names and keys live here, so a value can never land in a versioned project file."""
     return _parse_name_table(raw, path, "secrets", is_valid_env_name)
@@ -669,34 +678,29 @@ class ProjectConfig:
         return f"{len(self.repos)} repos"
 
     @classmethod
-    def from_toml(cls, path: Path) -> "ProjectConfig | None":
-        """Load project config from a TOML file"""
+    def from_toml(cls, path: Path) -> "ProjectConfig":
+        """Parse a project config from a TOML file; ConfigError when it can't be used"""
         try:
             with open(path, "rb") as f:
                 data = tomllib.load(f)
         except (OSError, tomllib.TOMLDecodeError) as e:
-            log_error("project.config", f"Failed to load {path}: {e}")
-            return None
+            raise ConfigError("project.config", f"Failed to load {path}: {e}") from None
 
         name = path.stem
         if not is_valid_id(name):
-            log_error("project.config", f"Invalid project name '{name}': must be a-zA-Z0-9-_")
-            return None
+            raise ConfigError("project.config", f"Invalid project name '{name}': must be a-zA-Z0-9-_")
 
         image = data.get("image", "")
         if not image:
-            log_error("project.config", f"Missing 'image' in {path}")
-            return None
+            raise ConfigError("project.config", f"Missing 'image' in {path}")
         if not is_valid_image_ref(image):
-            log_error("project.config", f"Invalid image ref '{image}' in {path}")
-            return None
+            raise ConfigError("project.config", f"Invalid image ref '{image}' in {path}")
 
         # Accept legacy single `repo = "url"` OR `repos = [...]`, but not both —
         # defining both is ambiguous (which order? is it a mistake?), so reject it.
         # Entries in `repos` may be plain URL strings or tables with url/dir/branch.
         if data.get("repo") and data.get("repos"):
-            log_error("project.config", f"Define either 'repo' or 'repos', not both, in {path}")
-            return None
+            raise ConfigError("project.config", f"Define either 'repo' or 'repos', not both, in {path}")
         raw_repos: list = []
         if data.get("repo"):
             raw_repos.append(data["repo"])
@@ -712,21 +716,16 @@ class ProjectConfig:
                 rdir = entry.get("dir", "")
                 branch = entry.get("branch", "")
             else:
-                log_error("project.config", f"Invalid repo entry '{entry}' in {path}")
-                return None
+                raise ConfigError("project.config", f"Invalid repo entry '{entry}' in {path}")
             if not url or not is_valid_repo_url(url):
-                log_error("project.config", f"Invalid repo URL '{url}' in {path}")
-                return None
+                raise ConfigError("project.config", f"Invalid repo URL '{url}' in {path}")
             if rdir and (not all(c in VALID_REPO_NAME_CHARS for c in rdir) or rdir in (".", "..")):
-                log_error("project.config", f"Invalid repo dir '{rdir}' in {path}")
-                return None
+                raise ConfigError("project.config", f"Invalid repo dir '{rdir}' in {path}")
             if branch and not all(c in VALID_BRANCH_CHARS for c in branch):
-                log_error("project.config", f"Invalid repo branch '{branch}' in {path}")
-                return None
+                raise ConfigError("project.config", f"Invalid repo branch '{branch}' in {path}")
             spec = RepoSpec(url=url, dir=rdir, branch=branch)
             if spec.name in seen_dirs:
-                log_error("project.config", f"Duplicate repo dir '{spec.name}' in {path}")
-                return None
+                raise ConfigError("project.config", f"Duplicate repo dir '{spec.name}' in {path}")
             seen_dirs.add(spec.name)
             repos.append(spec)
 
@@ -734,8 +733,7 @@ class ProjectConfig:
         if data.get("ssh_key"):
             ssh_key = str(Path(data["ssh_key"]).expanduser())
             if not is_valid_path(ssh_key):
-                log_error("project.config", f"Invalid ssh_key path '{ssh_key}' in {path}")
-                return None
+                raise ConfigError("project.config", f"Invalid ssh_key path '{ssh_key}' in {path}")
 
         env_files = []
         for ef in data.get("env_files", []):
@@ -744,38 +742,28 @@ class ProjectConfig:
             if src and dest:
                 src_expanded = str(Path(src).expanduser())
                 if not is_valid_path(src_expanded):
-                    log_error("project.config", f"Invalid env_file src path '{src}' in {path}")
-                    return None
+                    raise ConfigError("project.config", f"Invalid env_file src path '{src}' in {path}")
                 if not is_valid_path(dest) or has_path_traversal(dest):
-                    log_error("project.config", f"Invalid env_file dest path '{dest}' in {path}")
-                    return None
+                    raise ConfigError("project.config", f"Invalid env_file dest path '{dest}' in {path}")
                 env_files.append(EnvFile(src=src_expanded, dest=dest))
 
         # [shortcuts]: `containerctl enter <alias>` lands in <workspace>/<dir> of this project
         shortcuts: dict[str, str] = {}
         raw_shortcuts = data.get("shortcuts", {})
         if not isinstance(raw_shortcuts, dict):
-            log_error("project.config", f"Invalid 'shortcuts' (must be a table) in {path}")
-            return None
+            raise ConfigError("project.config", f"Invalid 'shortcuts' (must be a table) in {path}")
         for alias, rel_dir in raw_shortcuts.items():
             if not alias or not is_valid_id(alias):
-                log_error("project.config", f"Invalid shortcut name '{alias}' in {path}")
-                return None
+                raise ConfigError("project.config", f"Invalid shortcut name '{alias}' in {path}")
             if not isinstance(rel_dir, str) or not is_valid_rel_dir(rel_dir):
-                log_error("project.config", f"Invalid shortcut dir '{rel_dir}' for '{alias}' in {path}")
-                return None
+                raise ConfigError("project.config", f"Invalid shortcut dir '{rel_dir}' for '{alias}' in {path}")
             shortcuts[alias] = rel_dir
 
         # [env] plain values and [secrets] env name -> secrets.toml key: both reach the `enter` shell's environment
         env = parse_env_table(data.get("env"), path)
-        if env is None:
-            return None
         secrets = parse_secrets_table(data.get("secrets"), path)
-        if secrets is None:
-            return None
         if both := sorted(set(env) & set(secrets)):
-            log_error("project.config", f"Names in both [env] and [secrets] in {path}: {', '.join(both)}")
-            return None
+            raise ConfigError("project.config", f"Names in both [env] and [secrets] in {path}: {', '.join(both)}")
 
         return cls(
             name=name,
@@ -789,16 +777,33 @@ class ProjectConfig:
         )
 
 
+def read_configs(directory: Path, parse: Callable[[Path], object]) -> tuple[dict, list[Issue]]:
+    """Every <name>.toml of a config dir, parsed: the ones that are usable by name, and an error-level issue for
+    each one that isn't. One broken file never hides the others."""
+    configs: dict = {}
+    problems: list[Issue] = []
+    if directory.is_dir():
+        for path in sorted(directory.glob("*.toml")):
+            try:
+                config = parse(path)
+            except ConfigError as e:
+                problems.append(Issue(ERROR, e.cat, str(e), f"edit {path.name}"))
+            else:
+                configs[config.name] = config
+    return configs, problems
+
+
+def read_projects() -> tuple[dict[str, ProjectConfig], list[Issue]]:
+    """~/.config/containerctl/projects/: the projects, and what is wrong with the files that aren't one.
+    (Shortcut collisions are an issue of the loaded set: see shortcut_issues.)"""
+    return read_configs(PROJECTS_DIR, ProjectConfig.from_toml)
+
+
 def load_projects() -> dict[str, ProjectConfig]:
-    """Load all project configs from ~/.config/containerctl/projects/"""
-    projects: dict[str, ProjectConfig] = {}
-    if not PROJECTS_DIR.is_dir():
-        return projects
-    for path in sorted(PROJECTS_DIR.glob("*.toml")):
-        project = ProjectConfig.from_toml(path)
-        if project:
-            projects[project.name] = project
-    return projects  # shortcut collisions are a condition of the loaded set: see shortcut_issues
+    """The projects, for a one-shot caller: broken files are logged"""
+    projects, problems = read_projects()
+    log_issues(problems)
+    return projects
 
 
 def resolve_enter_target(name: str, projects: dict[str, ProjectConfig]) -> tuple[ProjectConfig, str | None] | None:
@@ -829,7 +834,7 @@ def load_secrets() -> dict[str, str]:
     except (OSError, tomllib.TOMLDecodeError) as e:
         log_error("env.secret", f"Failed to load {SECRETS_FILE}: {e}")
         return {}
-    if issue := secrets_mode_issue():  # a standing condition too; echoed here so `enter` shows it when it matters
+    if issue := secrets_mode_issue():  # a standing issue too; echoed here so `enter` shows it when it matters
         log_error(issue.cat, f"{issue.msg}: {issue.hint}")
     secrets: dict[str, str] = {}
     for key, value in data.items():
@@ -897,57 +902,47 @@ class ServiceConfig:
         return f"{SERVICE_PREFIX}{self.name}"
 
     @classmethod
-    def from_toml(cls, path: Path) -> "ServiceConfig | None":
-        """Load service config from a TOML file"""
+    def from_toml(cls, path: Path) -> "ServiceConfig":
+        """Parse a service config from a TOML file; ConfigError when it can't be used"""
         try:
             with open(path, "rb") as f:
                 data = tomllib.load(f)
         except (OSError, tomllib.TOMLDecodeError) as e:
-            log_error("service.config", f"Failed to load {path}: {e}")
-            return None
+            raise ConfigError("service.config", f"Failed to load {path}: {e}") from None
 
         name = path.stem
         if not is_valid_id(name):
-            log_error("service.config", f"Invalid service name '{name}': must be a-zA-Z0-9-_")
-            return None
+            raise ConfigError("service.config", f"Invalid service name '{name}': must be a-zA-Z0-9-_")
 
         image = data.get("image", "")
         if not image:
-            log_error("service.config", f"Missing 'image' in {path}")
-            return None
+            raise ConfigError("service.config", f"Missing 'image' in {path}")
         if not is_valid_image_ref(image):
-            log_error("service.config", f"Invalid image ref '{image}' in {path}")
-            return None
+            raise ConfigError("service.config", f"Invalid image ref '{image}' in {path}")
 
         restart = data.get("restart", "unless-stopped")
         if restart not in VALID_RESTART_POLICIES:
-            log_error("service.config", f"Invalid restart policy '{restart}' in {path}")
-            return None
+            raise ConfigError("service.config", f"Invalid restart policy '{restart}' in {path}")
 
         ports = []
         for p in data.get("ports", []):
             if not isinstance(p, str) or not is_valid_port_spec(p):
-                log_error("service.config", f"Invalid port spec '{p}' in {path}")
-                return None
+                raise ConfigError("service.config", f"Invalid port spec '{p}' in {path}")
             ports.append(p)
 
         volumes = []
         for v in data.get("volumes", []):
             if not isinstance(v, str):
-                log_error("service.config", f"Invalid volume '{v}' in {path}")
-                return None
+                raise ConfigError("service.config", f"Invalid volume '{v}' in {path}")
             # Split volume spec: host:container or host:container:mode
             parts = v.split(":")
             if len(parts) < 2 or len(parts) > 3:
-                log_error("service.config", f"Invalid volume spec '{v}' in {path}")
-                return None
+                raise ConfigError("service.config", f"Invalid volume spec '{v}' in {path}")
             host_path = str(Path(parts[0]).expanduser())
             if not is_valid_path(host_path):
-                log_error("service.config", f"Invalid volume host path '{parts[0]}' in {path}")
-                return None
+                raise ConfigError("service.config", f"Invalid volume host path '{parts[0]}' in {path}")
             if len(parts) == 3 and parts[2] not in VALID_VOLUME_SUFFIX:
-                log_error("service.config", f"Invalid volume mode '{parts[2]}' in {path}")
-                return None
+                raise ConfigError("service.config", f"Invalid volume mode '{parts[2]}' in {path}")
             # Rebuild with expanded host path
             expanded = f"{host_path}:{':'.join(parts[1:])}"
             volumes.append(expanded)
@@ -955,62 +950,53 @@ class ServiceConfig:
         env_list = []
         for e in data.get("env", []):
             if not isinstance(e, str) or "=" not in e:
-                log_error("service.config", f"Invalid env entry '{e}' in {path}")
-                return None
+                raise ConfigError("service.config", f"Invalid env entry '{e}' in {path}")
             env_list.append(e)
 
         networks = []
         for n in data.get("networks", []):
             if not isinstance(n, str) or not n or not is_valid_id(n):
-                log_error("service.config", f"Invalid network name '{n}' in {path}")
-                return None
+                raise ConfigError("service.config", f"Invalid network name '{n}' in {path}")
             networks.append(n)
 
         read_only = data.get("read_only", False)
         if not isinstance(read_only, bool):
-            log_error("service.config", f"Invalid 'read_only' (must be true/false) in {path}")
-            return None
+            raise ConfigError("service.config", f"Invalid 'read_only' (must be true/false) in {path}")
 
         tmpfs = []
         for t in data.get("tmpfs", []):
             if not isinstance(t, str) or not is_valid_tmpfs_spec(t):
-                log_error("service.config", f"Invalid tmpfs spec '{t}' in {path}")
-                return None
+                raise ConfigError("service.config", f"Invalid tmpfs spec '{t}' in {path}")
             tmpfs.append(t)
 
         caps: dict[str, list[str]] = {"cap_drop": [], "cap_add": []}
         for key in caps:
             for c in data.get(key, []):
                 if not isinstance(c, str) or not c or not is_valid_id(c):
-                    log_error("service.config", f"Invalid capability '{c}' in '{key}' in {path}")
-                    return None
+                    raise ConfigError("service.config", f"Invalid capability '{c}' in '{key}' in {path}")
                 caps[key].append(c)
 
         pids_limit = data.get("pids_limit", 0)
         if isinstance(pids_limit, bool) or not isinstance(pids_limit, int) or pids_limit < 0:
-            log_error("service.config", f"Invalid 'pids_limit' (must be a positive integer) in {path}")
-            return None
+            raise ConfigError("service.config", f"Invalid 'pids_limit' (must be a positive integer) in {path}")
 
         command = data.get("command", [])
         if not isinstance(command, list) or not all(isinstance(a, str) and a for a in command):
-            log_error("service.config", f"Invalid 'command' (must be a list of non-empty strings) in {path}")
-            return None
+            raise ConfigError("service.config", f"Invalid 'command' (must be a list of non-empty strings) in {path}")
 
         scripts: dict[str, list[str]] = {}
         scripts_data = data.get("scripts", {})
         if not isinstance(scripts_data, dict):
-            log_error("service.config", f"Invalid 'scripts' (must be a table) in {path}")
-            return None
+            raise ConfigError("service.config", f"Invalid 'scripts' (must be a table) in {path}")
         for script_name, argv in scripts_data.items():
             if not script_name or not is_valid_id(script_name):
-                log_error("service.config", f"Invalid script name '{script_name}' in {path}")
-                return None
+                raise ConfigError("service.config", f"Invalid script name '{script_name}' in {path}")
             if not isinstance(argv, list) or not argv:
-                log_error("service.config", f"Script '{script_name}' must be a non-empty list in {path}")
-                return None
+                raise ConfigError("service.config", f"Script '{script_name}' must be a non-empty list in {path}")
             if not all(isinstance(a, str) and a for a in argv):
-                log_error("service.config", f"Script '{script_name}' must be a list of non-empty strings in {path}")
-                return None
+                raise ConfigError(
+                    "service.config", f"Script '{script_name}' must be a list of non-empty strings in {path}"
+                )
             scripts[script_name] = list(argv)
 
         return cls(
@@ -1031,15 +1017,15 @@ class ServiceConfig:
         )
 
 
+def read_services() -> tuple[dict[str, ServiceConfig], list[Issue]]:
+    """~/.config/containerctl/services/: the services, and what is wrong with the files that aren't one"""
+    return read_configs(SERVICES_DIR, ServiceConfig.from_toml)
+
+
 def load_services() -> dict[str, ServiceConfig]:
-    """Load all service configs from ~/.config/containerctl/services/"""
-    services: dict[str, ServiceConfig] = {}
-    if not SERVICES_DIR.is_dir():
-        return services
-    for path in sorted(SERVICES_DIR.glob("*.toml")):
-        service = ServiceConfig.from_toml(path)
-        if service:
-            services[service.name] = service
+    """The services, for a one-shot caller: broken files are logged"""
+    services, problems = read_services()
+    log_issues(problems)
     return services
 
 
@@ -1109,42 +1095,37 @@ class ImageConfig:
         return digest.hexdigest()
 
     @classmethod
-    def from_toml(cls, path: Path) -> "ImageConfig | None":
-        """Load an image recipe from a TOML file; the Dockerfile must exist beside it"""
+    def from_toml(cls, path: Path) -> "ImageConfig":
+        """Parse an image recipe from a TOML file; the Dockerfile must exist beside it. ConfigError otherwise."""
         try:
             with open(path, "rb") as f:
                 data = tomllib.load(f)
         except (OSError, tomllib.TOMLDecodeError) as e:
-            log_error("image.config", f"Failed to load {path}: {e}")
-            return None
+            raise ConfigError("image.config", f"Failed to load {path}: {e}") from None
         name = path.stem
         if not is_valid_id(name):
-            log_error("image.config", f"Invalid image name '{name}': must be a-zA-Z0-9-_")
-            return None
+            raise ConfigError("image.config", f"Invalid image name '{name}': must be a-zA-Z0-9-_")
         tag = data.get("tag", "")
         if not isinstance(tag, str) or (tag and (not is_valid_image_ref(tag) or "@" in tag)):
-            log_error("image.config", f"Invalid tag '{tag}' in {path}: name[:tag], no digest")
-            return None
+            raise ConfigError("image.config", f"Invalid tag '{tag}' in {path}: name[:tag], no digest")
         upstream = data.get("upstream", "")
         if not isinstance(upstream, str) or (upstream and not is_valid_https_url(upstream)):
-            log_error("image.config", f"Invalid upstream '{upstream}' in {path}: must be an https URL")
-            return None
+            raise ConfigError("image.config", f"Invalid upstream '{upstream}' in {path}: must be an https URL")
         dockerfile = path.with_suffix(".Dockerfile")
         if not dockerfile.is_file():
-            log_error("image.config", f"Missing {dockerfile.name} beside {path}")
-            return None
+            raise ConfigError("image.config", f"Missing {dockerfile.name} beside {path}")
         return cls(name=name, dockerfile=dockerfile, context=path.with_suffix(""), tag=tag, upstream=upstream)
 
 
+def read_images() -> tuple[dict[str, ImageConfig], list[Issue]]:
+    """~/.config/containerctl/images/: the recipes, and what is wrong with the files that aren't one"""
+    return read_configs(IMAGES_DIR, ImageConfig.from_toml)
+
+
 def load_images() -> dict[str, ImageConfig]:
-    """Load all image recipes from ~/.config/containerctl/images/"""
-    images: dict[str, ImageConfig] = {}
-    if not IMAGES_DIR.is_dir():
-        return images
-    for path in sorted(IMAGES_DIR.glob("*.toml")):
-        image = ImageConfig.from_toml(path)
-        if image:
-            images[image.name] = image
+    """The recipes, for a one-shot caller: broken files are logged"""
+    images, problems = read_images()
+    log_issues(problems)
     return images
 
 
@@ -1173,7 +1154,7 @@ def fetch_upstream(url: str, limit: int = 1 << 20) -> str | None:
 
 
 # =============================================================================
-# Conditions: what is wrong right now, from state already in hand (no docker calls)
+# Detected issues: what wants an action right now, from state already in hand (no docker calls)
 # =============================================================================
 
 
@@ -1188,9 +1169,8 @@ def shortcut_issues(projects: dict[str, ProjectConfig]) -> list[Issue]:
         who = ", ".join(names)
         if alias in projects:
             msg = f"Shortcut '{alias}' ({who}) is shadowed by project '{alias}'"
-            issues.append(
-                Issue(WARNING, "project.shortcut", msg, f"rename it in {', '.join(f'{n}.toml' for n in names)}")
-            )
+            hint = f"rename it in {', '.join(f'{n}.toml' for n in names)}"
+            issues.append(Issue(WARNING, "project.shortcut", msg, hint))
         elif len(names) > 1:
             msg = f"Shortcut '{alias}' is defined by several projects: {who}"
             issues.append(Issue(WARNING, "project.shortcut", msg, "`enter` needs it in exactly one"))
@@ -1209,21 +1189,22 @@ def secrets_mode_issue() -> Issue | None:
     return None
 
 
-def local_versions(image: ImageConfig, rows: list[dict]) -> tuple[list[int], int | None, bool]:
-    """(versions, current, tagged) from `docker images` rows: the repository's cctl-local-N builds, sorted; the one
-    the recipe tag points at (None when it points elsewhere or nowhere); whether the recipe tag exists at all"""
-    ids = {r.get("Tag", ""): r.get("ID", "") for r in rows if r.get("Repository") == image.repository}
+def local_versions(image: ImageConfig, rows: list[Image]) -> tuple[list[int], int | None, str | None]:
+    """(versions, current, tag_id) from `docker images` rows: the repository's cctl-local-N builds, sorted; the one
+    the recipe tag points at (None when it points elsewhere or nowhere); the image ID the recipe tag points at
+    (None when the tag doesn't exist)"""
+    ids = {r.Tag: r.ID for r in rows if r.Repository == image.repository}
     versions: dict[int, str] = {}
     for tag, id_ in ids.items():
         n = tag.removeprefix(LOCAL_VERSION_PREFIX)
         if n != tag and n.isdigit():
             versions[int(n)] = id_
-    current_id = ids.get(image.tag.rsplit(":", 1)[1])
-    current = max((n for n, id_ in versions.items() if id_ == current_id), default=None)
-    return sorted(versions), current, current_id is not None
+    tag_id = ids.get(image.tag.rsplit(":", 1)[1])
+    current = max((n for n, id_ in versions.items() if id_ == tag_id), default=None)
+    return sorted(versions), current, tag_id
 
 
-def version_issue(name: str, image: ImageConfig, versions: list[int], current: int | None) -> Issue | None:
+def image_version_issue(name: str, image: ImageConfig, versions: list[int], current: int | None) -> Issue | None:
     """Builds pile up: past IMAGE_VERSIONS_WARN local versions, name the ones that are safe to try removing"""
     if len(versions) <= IMAGE_VERSIONS_WARN:
         return None
@@ -1231,24 +1212,60 @@ def version_issue(name: str, image: ImageConfig, versions: list[int], current: i
     return Issue(WARNING, "image.versions", f"{name} has {len(versions)} local versions", f"docker rmi {old}")
 
 
-def image_version_issues(images: dict[str, ImageConfig], rows: list[dict]) -> list[Issue]:
-    """version_issue over every recipe, from one set of `docker images` rows"""
+def failure_issues(failures: dict[str, Failure]) -> list[Issue]:
+    """Failed listings, one issue per distinct reason naming the listings it took down: a daemon that is down is
+    one line, not four, and a lone `volume ls` that fails is exactly that"""
+    by_reason: dict[tuple[str, str], list[str]] = {}
+    for key, failure in failures.items():
+        by_reason.setdefault((failure.msg, failure.hint), []).append(key)
+    return [
+        Issue(ERROR, "docker", f"{msg} ({', '.join(keys)})", hint, "\n".join(failures[key].detail for key in keys))
+        for (msg, hint), keys in by_reason.items()
+    ]
+
+
+def orphan_issues(names: list[str], projects: set[str], services: set[str]) -> list[Issue]:
+    """cctl- containers nothing in the config dirs accounts for anymore. A TOML that is there but broken still
+    owns its container (it is not in the loaded set, hence the look at the files): that one is a config issue.
+    The hint leads with the file: a project container holds a workspace, `rm -f` takes it along."""
     issues = []
-    for name, image in images.items():
-        versions, current, _ = local_versions(image, rows)
-        if issue := version_issue(name, image, versions, current):
-            issues.append(issue)
+    for prefix, directory, known, kind in (
+        (CONTAINER_PREFIX, PROJECTS_DIR, projects, "project"),
+        (SERVICE_PREFIX, SERVICES_DIR, services, "service"),
+    ):
+        for container in names:
+            name = container.removeprefix(prefix)
+            if name == container or name in known or (directory / f"{name}.toml").is_file():
+                continue
+            msg = f"Container {container} has no {kind} config"
+            issues.append(Issue(WARNING, f"{kind}.orphan", msg, f"restore {name}.toml, or docker rm -f {container}"))
     return issues
 
 
-def check_conditions(
-    projects: dict[str, ProjectConfig], images: dict[str, ImageConfig], rows: list[dict]
+def detect_issues(
+    projects: dict[str, ProjectConfig],
+    services: dict[str, "ServiceConfig"],
+    images: dict[str, ImageConfig],
+    listings: dict[str, Listing],
 ) -> list[Issue]:
-    """Every condition computable from loaded config and the `docker images` rows the fetcher already holds"""
-    issues = shortcut_issues(projects)
+    """Every issue detectable from loaded config and the docker listings the fetcher already holds. What a failed
+    listing would have told is skipped, not guessed: the failure is the issue."""
+    issues = failure_issues({key: listing.failure for key, listing in listings.items() if listing.failure})
+    issues += shortcut_issues(projects)
     if secrets := secrets_mode_issue():
         issues.append(secrets)
-    return issues + image_version_issues(images, rows)
+    for key, listing in listings.items():
+        if count := len(listing.skipped):
+            msg = f"{count} unreadable row{'s' if count > 1 else ''} left out of the {key} listing"
+            issues.append(Issue(WARNING, "docker.rows", msg, "its details have them", "\n".join(listing.skipped)))
+    if not listings["images"].failure:
+        for name, image in images.items():
+            versions, current, _ = local_versions(image, listings["images"].rows)
+            if issue := image_version_issue(name, image, versions, current):
+                issues.append(issue)
+    if not listings["containers"].failure:
+        issues += orphan_issues([c.Names for c in listings["containers"].rows], set(projects), set(services))
+    return issues
 
 
 # =============================================================================
@@ -1694,27 +1711,29 @@ class Docker:
             return subprocess.CompletedProcess(cmd, 127, "", "docker: command not found on PATH")
 
     @staticmethod
-    def _run_json(args: list[str]) -> list[dict]:
-        """Run docker command and parse JSON output"""
+    def _list(args: list[str], parse: Callable[[dict], object]) -> Listing:
+        """Run a listing whose output is one JSON object per line (JSON Lines: `--format '{{json .}}'`), so each
+        line stands alone: one that isn't JSON, or isn't a row we can use, is skipped and the others still count.
+        Nothing is logged here: the failure or the skipped lines are handed back."""
         result = Docker._run(args)
         if result.returncode != 0:
-            stderr = result.stderr.strip() if result.stderr else ""
-            message = f"docker {' '.join(args)}" + (f": {stderr}" if stderr else "")
-            log_error("docker.command", message, {"returncode": result.returncode})
-            return []
-
-        items = []
+            return Listing(failure=docker_failure(args, result))
+        listing = Listing()
         for line in result.stdout.strip().split("\n"):
-            if line:
-                try:
-                    items.append(json.loads(line))
-                except json.JSONDecodeError as e:
-                    log_error("docker.json_parse", str(e), {"line": line[:100]})
-        return items
+            if not line:
+                continue
+            try:
+                listing.rows.append(parse(json.loads(line)))
+            except ValueError as e:  # not JSON (JSONDecodeError is one), or not a row
+                listing.skipped.append(f"docker {' '.join(args)}: {e} in {line[:200]}")
+        return listing
+
+    # A listing hands back its outcome, and the caller says what a failure is to it: the fetcher reads `.failure`
+    # (an issue), a one-shot caller takes `.logged()` (a log line, no rows) or `.required()` (DockerError).
 
     @staticmethod
-    def containers(all_containers: bool = True, include_size: bool = False) -> list[dict]:
-        """List containers.
+    def list_containers(all_containers: bool = True, include_size: bool = False) -> Listing:
+        """`docker ps`.
 
         `--size=false` matters: with the `{{json .}}` template the docker CLI otherwise computes every
         container's disk usage, which walks their filesystems and turns a 75ms `ps` into seconds."""
@@ -1723,30 +1742,30 @@ class Docker:
             args.insert(1, "-a")
         if not include_size:
             args.insert(1, "--size=false")
-        raw = Docker._run_json(args)
-        # Claude did this, not me - we should directly use these objects in the long-term, but since it works...
-        return [c.to_dict() for c in (Container.from_dict(r) for r in raw) if c is not None]
+        return Docker._list(args, Container.from_dict)
 
     @staticmethod
-    def images() -> list[dict]:
-        """List images"""
-        raw = Docker._run_json(["images", "--format", "{{json .}}"])
-        # Claude did this, not me - we should directly use these objects in the long-term, but since it works...
-        return [i.to_dict() for i in (Image.from_dict(r) for r in raw) if i is not None]
+    def list_images() -> Listing:
+        return Docker._list(["images", "--format", "{{json .}}"], Image.from_dict)
 
     @staticmethod
-    def volumes() -> list[dict]:
-        """List volumes"""
-        raw = Docker._run_json(["volume", "ls", "--format", "{{json .}}"])
-        # Claude did this, not me - we should directly use these objects in the long-term, but since it works...
-        return [v.to_dict() for v in (Volume.from_dict(r) for r in raw) if v is not None]
+    def list_volumes() -> Listing:
+        return Docker._list(["volume", "ls", "--format", "{{json .}}"], Volume.from_dict)
 
     @staticmethod
-    def networks() -> list[dict]:
-        """List networks"""
-        raw = Docker._run_json(["network", "ls", "--format", "{{json .}}"])
-        # Claude did this, not me - we should directly use these objects in the long-term, but since it works...
-        return [n.to_dict() for n in (Network.from_dict(r) for r in raw) if n is not None]
+    def list_networks() -> Listing:
+        return Docker._list(["network", "ls", "--format", "{{json .}}"], Network.from_dict)
+
+    @staticmethod
+    def listings() -> dict[str, Listing]:
+        """The four listings, by tab key (see LISTINGS). Each is its own call with its own outcome: one failing
+        says nothing about the next, so all four always run."""
+        return {
+            "containers": Docker.list_containers(),
+            "images": Docker.list_images(),
+            "volumes": Docker.list_volumes(),
+            "networks": Docker.list_networks(),
+        }
 
     @staticmethod
     def start(container_id: str) -> bool:
@@ -1808,11 +1827,6 @@ class Docker:
         return Docker._run(["image", "inspect", ref]).returncode == 0
 
     @staticmethod
-    def image_versions(image: "ImageConfig") -> tuple[list[int], int | None, bool]:
-        """local_versions over a fresh `docker images`; a failed call is logged there and reads as nothing built"""
-        return local_versions(image, Docker.images())
-
-    @staticmethod
     def build_image(image: "ImageConfig") -> bool:
         """`docker build` a recipe as the next <repo>:cctl-local-NNNNNN and re-point the recipe tag at it, streaming
         the output. The context dir is sent when it exists; otherwise the Dockerfile goes in on stdin, so a recipe
@@ -1820,7 +1834,9 @@ class Docker:
         recipe = image.recipe_hash()
         if recipe is None:
             return False
-        versions, _, _ = Docker.image_versions(image)
+        # Fresh: another terminal may just have built one. DockerError when the listing failed: numbering from "no
+        # versions" would re-point cctl-local-000000 at this build.
+        versions, _, _ = local_versions(image, Docker.list_images().required())
         version = image.version_tag(max(versions, default=-1) + 1)
         labels = ["--label", f"{LABEL_IMAGE}={image.name}", "--label", f"{LABEL_RECIPE}={recipe}"]
         args = ["build", "-t", version, "-t", image.tag, *labels]
@@ -2102,19 +2118,16 @@ class Docker:
         return result
 
     @staticmethod
-    def containers_by_name() -> dict[str, dict]:
-        """One `docker ps -a`, keyed by container name: for listings that look up many containers"""
-        return {c.get("Names", ""): c for c in Docker.containers(all_containers=True)}
+    def containers_by_name() -> dict[str, Container]:
+        """One `docker ps -a`, keyed by container name. DockerError when it failed: a caller asking whether a
+        container exists must not be told "no" by a call that never got an answer."""
+        return {c.Names: c for c in Docker.list_containers().required()}
 
     @staticmethod
-    def find_project_container(project_name: str) -> dict | None:
-        """Find a container belonging to a project by its cctl- name"""
-        container_name = f"{CONTAINER_PREFIX}{project_name}"
-        containers = Docker.containers(all_containers=True)
-        for c in containers:
-            if c.get("Names") == container_name:
-                return c
-        return None
+    def find_project_container(project_name: str) -> Container | None:
+        """Find a container belonging to a project by its cctl- name; None when there is none, DockerError
+        when docker couldn't say"""
+        return Docker.containers_by_name().get(f"{CONTAINER_PREFIX}{project_name}")
 
     @staticmethod
     def create_project_container(project: "ProjectConfig") -> bool:
@@ -2260,7 +2273,7 @@ class Docker:
                 print(f"Failed to spawn project {project.name}", file=sys.stderr)
                 sys.exit(1)
         else:
-            state = container.get("State", "").lower()
+            state = container.State.lower()
             if state != "running":
                 print(f"Starting {project.container_name}...")
                 Docker.start(project.container_name)
@@ -2281,15 +2294,12 @@ class Docker:
             elif len(project.repos) > 1:
                 workdir = "/home/dev/workspace"
         # [env] values and [secrets] looked up in secrets.toml ride into this shell's process environment
-        # only. Their problems are echoed right before the prompt, where they matter; anything else that was
-        # logged meanwhile goes back to the run's report.
-        with collecting() as problems:
-            env = resolve_env(project)
-        for problem in problems:
+        # only. Their problems are echoed right before the prompt, where they matter (they stay in the log too).
+        seen = len(get_errors())
+        env = resolve_env(project)
+        for problem in get_errors()[seen:]:  # what resolve_env just logged: this run's only logger is this thread
             if problem.cat.startswith("env."):
                 print(f"env: {problem.msg}", file=sys.stderr)
-            else:
-                log_error(problem.cat, problem.msg)
         # cd into the landing dir if it exists, else fall back home - done atomically inside the
         # container (no TOCTOU, unlike a separate `test -d` probe then `-w`). workdir rides in as
         # $1 (data, never interpolated as code); `--` stops cd option-parsing a leading dash.
@@ -2316,14 +2326,10 @@ class Docker:
         return True
 
     @staticmethod
-    def find_service_container(service_name: str) -> dict | None:
-        """Find a container belonging to a service by its cctl-svc- name"""
-        container_name = f"{SERVICE_PREFIX}{service_name}"
-        containers = Docker.containers(all_containers=True)
-        for c in containers:
-            if c.get("Names") == container_name:
-                return c
-        return None
+    def find_service_container(service_name: str) -> Container | None:
+        """Find a container belonging to a service by its cctl-svc- name; None when there is none, DockerError
+        when docker couldn't say"""
+        return Docker.containers_by_name().get(f"{SERVICE_PREFIX}{service_name}")
 
     @staticmethod
     def create_service_container(service: "ServiceConfig") -> bool:
@@ -2402,7 +2408,7 @@ class Docker:
         if container is None:
             print(f"Creating service {service.container_name}...")
             return Docker.create_service_container(service)
-        state = container.get("State", "").lower()
+        state = container.State.lower()
         if state != "running":
             print(f"Starting {service.container_name}...")
             if not Docker.start(service.container_name):
@@ -2440,6 +2446,39 @@ class Docker:
 # =============================================================================
 
 
+@dataclass
+class ProjectRow:
+    """A line of the Projects tab"""
+
+    Name: str
+    Status: str
+    Image: str
+    Repo: str
+
+
+@dataclass
+class ServiceRow:
+    """A line of the Services tab"""
+
+    Name: str
+    Status: str
+    Image: str
+    Ports: str
+
+
+def container_status(container: Container | None) -> str:
+    return (container.State or container.Status) if container else "not created"
+
+
+def status_lookup(ps: Listing) -> Callable[[str], str]:
+    """Container name -> what a STATUS column says, from one `docker ps` outcome. When it failed nobody knows:
+    "unknown" for every name, never "not created"."""
+    if ps.failure:
+        return lambda name: "unknown"
+    by_name = {c.Names: c for c in ps.rows}
+    return lambda name: container_status(by_name.get(name))
+
+
 class DataFetcher:
     """Background thread that fetches Docker data every N seconds"""
 
@@ -2453,8 +2492,10 @@ class DataFetcher:
             "networks": [],
             "projects": [],
             "services": [],
-            "issues": [],  # list[Issue]: the conditions as of the last fetch
+            "issues": [],  # list[Issue]: what the last fetch detected, errors first
         }
+        self.failures: dict[str, str] = {}  # tab key -> why the last fetch has nothing to show there (our words)
+        self.notes: dict[str, str] = {}  # tab key -> why the rows listed there may not be all of them
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -2472,79 +2513,69 @@ class DataFetcher:
         if self._thread:
             self._thread.join(timeout=1.0)
 
-    def get(self, key: str) -> list[dict]:
+    def get(self, key: str) -> list:
         """Get cached data for a key (thread-safe)"""
         with self.lock:
             return self.data.get(key, []).copy()
 
+    def get_failures(self) -> dict[str, str]:
+        """Tab key -> why its listing failed, as of the last fetch (thread-safe)"""
+        with self.lock:
+            return dict(self.failures)
+
+    def get_notes(self) -> dict[str, str]:
+        """Tab key -> what is missing from the rows it lists, as of the last fetch (thread-safe)"""
+        with self.lock:
+            return dict(self.notes)
+
     def _fetch_all(self) -> None:
-        """Fetch all data from Docker. Everything logged meanwhile (a docker call failing, a config file that doesn't
-        parse) is a condition of this fetch, not an event: shown while true, gone on the next fetch that is fine."""
-        with collecting() as conditions:
-            containers = Docker.containers()
-            images = Docker.images()
-            volumes = Docker.volumes()
-            networks = Docker.networks()
-            projects_config = load_projects()
-            services_config = load_services()
-            images_config = load_images()
-        conditions += check_conditions(projects_config, images_config, images)
+        """One fetch, as a unit: rows, failures and issues are swapped in together. What it finds wrong (docker
+        down, a failed listing, unreadable rows, a broken config) is state: issues and panels show it while it
+        lasts, and none of it goes to the error log. A crash is the one thing it logs, every tick it happens: that
+        is not a backend being unreliable, it is a bug of ours, and a bug should be loud until it is fixed. Every
+        panel says so too, until a fetch succeeds."""
+        notes: dict[str, str] = {}
+        try:
+            data, listings = self._fetch()
+            shown = {key: listing.failure.msg for key, listing in listings.items() if listing.failure}
+            for key, listing in listings.items():
+                if count := len(listing.skipped):
+                    notes[key] = f"{count} unreadable row{'s' if count > 1 else ''} left out: see Issues"
+        except Exception as e:  # a crashed fetch must not kill the thread, nor hide behind a view that looks fine
+            crash = f"{type(e).__name__}: {e}"
+            log_error("fetcher", crash)
+            data = {key: [] for key in self.data}
+            data["issues"] = [Issue(ERROR, "fetcher", f"Fetch crashed: {crash}", "a bug of ours: please report it")]
+            shown = {key: f"Fetch crashed: {crash}" for key in self.data if key != "issues"}
+        with self.lock:
+            self.data.update(data)
+            self.failures = shown
+            self.notes = notes
 
-        # Enrich containers with project labels
-        for c in containers:
-            name = c.get("Names", "")
-            if name.startswith(CONTAINER_PREFIX):
-                c["Project"] = name[len(CONTAINER_PREFIX) :]
-            else:
-                c["Project"] = ""
+    def _fetch(self) -> tuple[dict[str, list], dict[str, Listing]]:
+        """Fetch all data from Docker and the config files, and detect the issues in them"""
+        listings = Docker.listings()
+        projects_config, broken_projects = read_projects()
+        services_config, broken_services = read_services()
+        images_config, broken_images = read_images()
+        issues = broken_projects + broken_services + broken_images
+        issues += detect_issues(projects_config, services_config, images_config, listings)
 
-        # Build projects list
-        projects_data = []
-        for name, project in projects_config.items():
-            container = None
-            for c in containers:
-                if c.get("Names") == project.container_name:
-                    container = c
-                    break
-            status = container.get("State", container.get("Status", "unknown")) if container else "not created"
-            projects_data.append(
-                {
-                    "Name": name,
-                    "Status": status,
-                    "Image": project.image,
-                    "Repo": project.repos_display,
-                }
-            )
-
-        # Build services list
+        # Projects and services come from config, so they list whatever docker does; only their status needs `ps`
+        status = status_lookup(listings["containers"])
+        projects_data = [
+            ProjectRow(name, status(p.container_name), p.image, p.repos_display) for name, p in projects_config.items()
+        ]
         services_data = []
         for name, service in services_config.items():
-            container = None
-            for c in containers:
-                if c.get("Names") == service.container_name:
-                    container = c
-                    break
-            status = container.get("State", container.get("Status", "unknown")) if container else "not created"
-            ports_str = ", ".join(service.ports[:3])
+            ports = ", ".join(service.ports[:3])
             if len(service.ports) > 3:
-                ports_str += f" +{len(service.ports) - 3}"
-            services_data.append(
-                {
-                    "Name": name,
-                    "Status": status,
-                    "Image": service.image,
-                    "Ports": ports_str,
-                }
-            )
+                ports += f" +{len(service.ports) - 3}"
+            services_data.append(ServiceRow(name, status(service.container_name), service.image, ports))
 
-        with self.lock:
-            self.data["containers"] = containers
-            self.data["images"] = images
-            self.data["volumes"] = volumes
-            self.data["networks"] = networks
-            self.data["projects"] = projects_data
-            self.data["services"] = services_data
-            self.data["issues"] = conditions
+        data = {key: listing.rows for key, listing in listings.items()}
+        data.update(projects=projects_data, services=services_data, issues=by_severity(issues))
+        return data, listings
 
     def _run(self) -> None:
         """Background thread loop"""
@@ -2565,25 +2596,26 @@ class Tab:
 
     name: str
     key: str
-    fetch: Callable[[], list[dict]]
     columns: list[tuple[str, str, int]]  # (key, header, width)
     id_key: str
     actions: dict[str, Callable[[str], bool]]
+    empty: str = ""  # what the list area says when there are no rows; "No <name> found" when unset
 
 
 class UI:
     """UI rendering components - all methods write to a Screen buffer"""
 
     @staticmethod
-    def tab_bar(scr: Screen, tabs: list[Tab], selected: int, width: int, row: int, alert: str | None = None) -> None:
-        """Render tab bar; `alert` (WARNING or ERROR) colors the Issues tab yellow or red"""
+    def tab_bar(
+        scr: Screen, tabs: list[Tab], selected: int, width: int, row: int, alerts: dict[str, str] | None = None
+    ) -> None:
+        """Render tab bar; `alerts` colors the tabs it names (by key) with the given Term color"""
         scr.move(row, 1)
         scr.clear_line()
 
         x = 1
         for i, tab in enumerate(tabs):
-            if tab.key == "issues" and alert:
-                color = Term.RED if alert == ERROR else Term.YELLOW
+            if color := (alerts or {}).get(tab.key):
                 if i == selected:
                     text = Term.style(f" {tab.name} ", Term.BOLD, Term.INVERT, color)
                 else:
@@ -2610,8 +2642,8 @@ class UI:
         line = ""
         remaining_width = width - 2
         for key, header, col_width in tab.columns:
-            if col_width == 0:  # Flex column
-                col_width = remaining_width
+            if col_width == 0:  # Flex column: whatever is left, none on a terminal too narrow for the fixed ones
+                col_width = max(remaining_width, 0)
             text = header[:col_width].ljust(col_width)
             line += text + " "
             remaining_width -= col_width + 1
@@ -2623,7 +2655,7 @@ class UI:
     def list_row(
         scr: Screen,
         tab: Tab,
-        item: dict,
+        item: object,
         row: int,
         width: int,
         selected: bool,
@@ -2637,15 +2669,15 @@ class UI:
         remaining_width = width - 2
 
         for key, header, col_width in tab.columns:
-            if col_width == 0:  # Flex column
-                col_width = remaining_width
+            if col_width == 0:  # Flex column: whatever is left, none on a terminal too narrow for the fixed ones
+                col_width = max(remaining_width, 0)
 
-            value = str(item.get(key, ""))
+            value = str(getattr(item, key))
             text = value[:col_width].ljust(col_width)
 
             # Apply status colors (the map is keyed by status substring; it applies to the Status column)
             if status_colors and key == "Status":
-                status = str(item.get(key, "")).lower()
+                status = value.lower()
                 for status_key, color in status_colors.items():
                     if status_key in status:
                         text = color + text + Term.RESET
@@ -2775,7 +2807,6 @@ class App:
             Tab(
                 name="Containers",
                 key="containers",
-                fetch=Docker.containers,
                 columns=[
                     ("Names", "NAME", 20),
                     ("Project", "PROJECT", 15),
@@ -2793,7 +2824,6 @@ class App:
             Tab(
                 name="Images",
                 key="images",
-                fetch=Docker.images,
                 columns=[
                     ("Repository", "REPOSITORY", 35),
                     ("Tag", "TAG", 20),
@@ -2806,7 +2836,6 @@ class App:
             Tab(
                 name="Volumes",
                 key="volumes",
-                fetch=Docker.volumes,
                 columns=[
                     ("Name", "NAME", 50),
                     ("Driver", "DRIVER", 15),
@@ -2818,7 +2847,6 @@ class App:
             Tab(
                 name="Networks",
                 key="networks",
-                fetch=Docker.networks,
                 columns=[
                     ("Name", "NAME", 30),
                     ("Driver", "DRIVER", 15),
@@ -2831,7 +2859,6 @@ class App:
             Tab(
                 name="Projects",
                 key="projects",
-                fetch=lambda: [],  # Fetched by DataFetcher
                 columns=[
                     ("Name", "PROJECT", 20),
                     ("Status", "STATUS", 15),
@@ -2840,11 +2867,11 @@ class App:
                 ],
                 id_key="Name",
                 actions={},
+                empty=f"No projects configured: add TOML to {PROJECTS_DIR}/",
             ),
             Tab(
                 name="Services",
                 key="services",
-                fetch=lambda: [],  # Fetched by DataFetcher
                 columns=[
                     ("Name", "SERVICE", 20),
                     ("Status", "STATUS", 15),
@@ -2853,19 +2880,32 @@ class App:
                 ],
                 id_key="Name",
                 actions={},
+                empty=f"No services configured: add TOML to {SERVICES_DIR}/",
             ),
             Tab(
                 name="Issues",
                 key="issues",
-                fetch=lambda: [],  # conditions come from the fetcher, events from the registry: see items()
                 columns=[
-                    ("Level", "LEVEL", 8),
-                    ("Category", "CATEGORY", 20),
-                    ("Count", "COUNT", 6),
-                    ("Message", "MESSAGE", 0),
+                    ("level", "LEVEL", 8),
+                    ("cat", "CATEGORY", 18),
+                    ("msg", "MESSAGE", 56),
+                    ("hint", "HINT", 0),
                 ],
-                id_key="_category",
+                id_key="cat",
                 actions={},
+                empty="No issues",
+            ),
+            Tab(
+                name="Errors",
+                key="errors",
+                columns=[
+                    ("time", "TIME", 8),
+                    ("cat", "CATEGORY", 24),
+                    ("msg", "MESSAGE", 0),
+                ],
+                id_key="cat",
+                actions={},
+                empty="No errors",
             ),
         ]
 
@@ -2873,32 +2913,15 @@ class App:
         """Get current tab"""
         return self.tabs[self.current_tab]
 
-    def items(self) -> list[dict]:
-        """Get items for current tab from cache"""
-        if self.current().key == "issues":
-            return fetch_issues(self.fetcher.get("issues"))
-        data = self.fetcher.get(self.current().key)
-        if self.current().key == "projects" and not data:
-            return [
-                {
-                    "Name": "No projects configured",
-                    "Status": "",
-                    "Image": "",
-                    "Repo": f"Add TOML to {PROJECTS_DIR}/",
-                }
-            ]
-        if self.current().key == "services" and not data:
-            return [
-                {
-                    "Name": "No services configured",
-                    "Status": "",
-                    "Image": "",
-                    "Ports": f"Add TOML to {SERVICES_DIR}/",
-                }
-            ]
-        return data
+    def items(self) -> list:
+        """Get items for current tab from cache. Only real rows: what an empty list says is render's business."""
+        if self.current().key == "errors":
+            errors = get_errors()
+            errors.reverse()  # newest first
+            return errors
+        return self.fetcher.get(self.current().key)
 
-    def selected_item(self) -> dict | None:
+    def selected_item(self) -> object | None:
         """Get currently selected item"""
         items = self.items()
         if 0 <= self.selected_index < len(items):
@@ -2909,15 +2932,25 @@ class App:
         """Get ID of selected item"""
         item = self.selected_item()
         if item:
-            return item.get(self.current().id_key)
+            return getattr(item, self.current().id_key)
         return None
 
-    def alert_level(self) -> str | None:
-        """What the Issues tab signals: ERROR on any event or error-level condition, WARNING on warnings only"""
-        conditions = self.fetcher.get("issues")
-        if _errors or any(i.level == ERROR for i in conditions):
-            return ERROR
-        return WARNING if conditions else None
+    def tab_alerts(self) -> dict[str, str]:
+        """Issues is red while anything detected is error-level, yellow on warnings only; Errors is red while the
+        log holds anything"""
+        alerts = {}
+        if issues := self.fetcher.get("issues"):
+            alerts["issues"] = Term.RED if any(i.level == ERROR for i in issues) else Term.YELLOW
+        if _errors:  # a len read, not a walk: see the lock's comment
+            alerts["errors"] = Term.RED
+        return alerts
+
+    def banner(self) -> str:
+        """The one thing worth saying on every tab: why docker is unreachable, when all four listings failed for
+        the same reason. A partial failure is its panel's and the Issues tab's business."""
+        failures = self.fetcher.get_failures()
+        reasons = {failures.get(key, "") for key in LISTINGS}
+        return reasons.pop() if len(reasons) == 1 else ""
 
     def set_message(self, text: str, style: str = "") -> None:
         """Set status message"""
@@ -2946,10 +2979,15 @@ class App:
         scr.move(1, 1)
 
         # Tab bar
-        UI.tab_bar(scr, self.tabs, self.current_tab, cols, tab_row, alert=self.alert_level())
+        UI.tab_bar(scr, self.tabs, self.current_tab, cols, tab_row, alerts=self.tab_alerts())
 
-        # Divider
-        UI.divider(scr, 2, cols)
+        # Divider; in its place, what took docker down (on every tab), or what this tab's rows are missing
+        if banner := self.banner():
+            scr.writeln(2, 1, Term.style(f"── {banner} ".ljust(cols, "─")[:cols], Term.BOLD, Term.RED))
+        elif note := self.fetcher.get_notes().get(self.current().key):
+            scr.writeln(2, 1, Term.style(f"── {note} ".ljust(cols, "─")[:cols], Term.YELLOW))
+        else:
+            UI.divider(scr, 2, cols)
 
         # List header
         UI.list_header(scr, self.current(), header_row, cols)
@@ -2984,15 +3022,11 @@ class App:
             scr.move(list_start + i, 1)
             scr.clear_line()
 
-        # Empty state
+        # Nothing to list: because the listing failed (say why), or because there is nothing
         if not items:
-            UI.message(
-                scr,
-                f"  No {self.current().name.lower()} found",
-                list_start,
-                cols,
-                Term.DIM,
-            )
+            failure = self.fetcher.get_failures().get(self.current().key)
+            text = failure or self.current().empty or f"No {self.current().name.lower()} found"
+            UI.message(scr, f"  {text}", list_start, cols, Term.RED if failure else Term.DIM)
 
         # Clear message line if no message
         if self.message_text:
@@ -3011,7 +3045,9 @@ class App:
         elif self.current().key == "networks":
             keys = "[e]dit [d]elete [q]uit"
         elif self.current().key == "issues":
-            keys = "[c]lear [q]uit"
+            keys = "[enter] details [q]uit"
+        elif self.current().key == "errors":
+            keys = "[enter] details [c]lear [q]uit"
         else:
             keys = "[d]elete [q]uit"
         keys += f"  │  {len(items)} items"
@@ -3021,7 +3057,15 @@ class App:
         scr.flush()
 
     def handle_key(self, key: str) -> None:
-        """Handle keypress"""
+        """Handle keypress. An action that needed an answer docker didn't give stops there and says why."""
+        try:
+            self._handle_key(key)
+        except DockerError as e:
+            log_error("docker.command", e.failure.detail)
+            self.enter_tui()  # the action may have left for the main screen before it failed
+            self.set_message(f"{e}: {e.failure.hint}", Term.RED)
+
+    def _handle_key(self, key: str) -> None:
         rows, cols = Term.size()
         list_height = rows - 6
 
@@ -3033,8 +3077,14 @@ class App:
             self.running = False
             return
 
-        # Navigation (jikl: j=left, i=up, k=down, l=right)
+        # One snapshot for the whole keypress: the fetcher swaps the lists under us, and a row looked up twice may
+        # be two different rows (the prompt naming one image, the delete taking another), or gone the second time.
+        # The branches below are one elif chain: the ones that move the selection never reach the ones that use it.
         items = self.items()
+        selected = items[self.selected_index] if 0 <= self.selected_index < len(items) else None
+        selected_id = getattr(selected, self.current().id_key) if selected else None
+
+        # Navigation (jikl: j=left, i=up, k=down, l=right)
 
         if key in ("k", Term.KEY_DOWN):
             if self.selected_index < len(items) - 1:
@@ -3070,7 +3120,7 @@ class App:
             self.scroll_offset = 0
 
         # Number keys for tabs
-        elif key in "1234567":
+        elif key and key in "123456789":
             idx = int(key) - 1
             if idx < len(self.tabs):
                 self.current_tab = idx
@@ -3078,8 +3128,8 @@ class App:
                 self.scroll_offset = 0
 
         # Container-specific actions
-        elif self.current().key == "containers" and self.selected_id():
-            container_id = self.selected_id()
+        elif self.current().key == "containers" and selected_id:
+            container_id = selected_id
 
             if key == "s":  # Start
                 if Docker.start(container_id):
@@ -3111,7 +3161,7 @@ class App:
                 self.enter_tui()
 
             elif key == "d":  # Delete
-                name = self.selected_item().get("Names", container_id[:12])
+                name = selected.Names
                 if UI.confirm(f"Delete container '{name}'?", rows - 1):
                     if Docker.remove_container(container_id, force=True):
                         self.set_message(f"Deleted {name}", Term.GREEN)
@@ -3119,17 +3169,17 @@ class App:
                         self.set_message(f"Failed to delete {name}", Term.RED)
 
             elif key == "o":  # Origin/source
-                name = self.selected_item().get("Names", container_id[:12])
+                name = selected.Names
                 result = Docker.investigate_source(container_id)
                 title = f"Source: {result['source']}"
                 lines = [f"Container: {name}"] + result["details"]
                 UI.info_box(title, lines, rows, cols)
 
         # Image deletion
-        elif self.current().key == "images" and key == "d" and self.selected_id():
-            image_id = self.selected_id()
-            repo = self.selected_item().get("Repository", image_id[:12])
-            tag = self.selected_item().get("Tag", "")
+        elif self.current().key == "images" and key == "d" and selected_id:
+            image_id = selected_id
+            repo = selected.Repository
+            tag = selected.Tag
             name = f"{repo}:{tag}" if tag else repo
 
             if UI.confirm(f"Delete image '{name}'?", rows - 1):
@@ -3139,8 +3189,8 @@ class App:
                     self.set_message(f"Failed to delete {name}", Term.RED)
 
         # Volume deletion
-        elif self.current().key == "volumes" and key == "d" and self.selected_id():
-            volume_name = self.selected_id()
+        elif self.current().key == "volumes" and key == "d" and selected_id:
+            volume_name = selected_id
 
             if UI.confirm(f"Delete volume '{volume_name}'?", rows - 1):
                 if Docker.remove_volume(volume_name):
@@ -3149,9 +3199,9 @@ class App:
                     self.set_message(f"Failed to delete {volume_name}", Term.RED)
 
         # Network actions
-        elif self.current().key == "networks" and self.selected_id():
-            network_id = self.selected_id()
-            name = self.selected_item().get("Name", network_id[:12])
+        elif self.current().key == "networks" and selected_id:
+            network_id = selected_id
+            name = selected.Name
 
             if key == "d":  # Delete
                 if UI.confirm(f"Delete network '{name}'?", rows - 1):
@@ -3173,9 +3223,9 @@ class App:
                     self.set_message(f"Failed to inspect {name}", Term.RED)
 
         # Project actions
-        elif self.current().key == "projects" and self.selected_id():
-            project_name = self.selected_id()
-            projects = load_projects()
+        elif self.current().key == "projects" and selected_id:
+            project_name = selected_id
+            projects, _ = read_projects()  # a broken file is already on the Issues tab
             project = projects.get(project_name)
 
             if project and key == "e":  # Enter
@@ -3197,9 +3247,9 @@ class App:
                     self.set_message(f"No container for {project_name}", Term.YELLOW)
 
         # Service actions
-        elif self.current().key == "services" and self.selected_id():
-            service_name = self.selected_id()
-            services = load_services()
+        elif self.current().key == "services" and selected_id:
+            service_name = selected_id
+            services, _ = read_services()  # a broken file is already on the Issues tab
             service = services.get(service_name)
 
             if service and key == "u":  # Up
@@ -3228,13 +3278,26 @@ class App:
                     input("\nPress Enter to return...")
                     self.enter_tui()
 
-        # Event clearing (condition rows and the placeholder carry no _category: nothing to clear)
-        elif self.current().key == "issues" and key == "c" and self.selected_id():
-            category = self.selected_id()
-            if category:
-                if UI.confirm(f"Clear all '{category}' errors?", rows - 1):
-                    count = clear_errors(category)
-                    self.set_message(f"Cleared {count} errors from {category}", Term.GREEN)
+        # What a row clips, in full: an issue's message and hint, a log entry's message and context
+        elif self.current().key == "issues" and key == Term.KEY_ENTER and selected:
+            issue = selected
+            lines = textwrap.wrap(issue.msg, max(cols - 8, 20)) or [""]
+            if issue.hint:
+                lines += [""] + textwrap.wrap(issue.hint, max(cols - 8, 20))
+            for raw in issue.detail.splitlines():
+                lines += [""] + textwrap.wrap(raw, max(cols - 8, 20))
+            UI.info_box(f"{issue.level}  {issue.cat}", lines, rows, cols)
+
+        elif self.current().key == "errors" and key == Term.KEY_ENTER and selected:
+            event = selected
+            lines = textwrap.wrap(event.msg, max(cols - 8, 20)) or [""]
+            if event.ctx:
+                lines += [""] + textwrap.wrap(str(event.ctx), max(cols - 8, 20))
+            UI.info_box(f"{event.time}  {event.cat}", lines, rows, cols)
+
+        elif self.current().key == "errors" and key == "c" and items:
+            if UI.confirm("Clear the error log?", rows - 1):
+                self.set_message(f"Cleared {clear_errors()} errors", Term.GREEN)
 
     def enter_tui(self) -> None:
         """Enter TUI mode"""
@@ -3318,22 +3381,22 @@ def _table_width(wide: bool) -> int | None:
 
 def cli_ps(args: argparse.Namespace) -> None:
     """List containers"""
-    containers = Docker.containers(all_containers=not args.running)
+    containers = Docker.list_containers(all_containers=not args.running).logged()
 
     if args.quiet:
         for c in containers:
-            print(c.get("ID", ""))
+            print(c.ID)
         return
 
     headers = ["ID", "NAME", "STATUS", "IMAGE", "PORTS", "NETWORKS"]
     rows = [
         [
-            c.get("ID", "")[:12],
-            c.get("Names", ""),
-            c.get("Status", ""),
-            c.get("Image", ""),
-            c.get("Ports", ""),
-            c.get("Networks", ""),
+            c.ID[:12],
+            c.Names,
+            c.Status,
+            c.Image,
+            c.Ports,
+            c.Networks,
         ]
         for c in containers
     ]
@@ -3343,56 +3406,56 @@ def cli_ps(args: argparse.Namespace) -> None:
 
 def cli_images(args: argparse.Namespace) -> None:
     """List images"""
-    images = Docker.images()
+    images = Docker.list_images().logged()
 
     if args.quiet:
         for img in images:
-            print(img.get("ID", ""))
+            print(img.ID)
         return
 
     print(f"{'REPOSITORY':<35} {'TAG':<20} {'SIZE':<15} {'ID'}")
     print("-" * 80)
     for img in images:
-        repo = img.get("Repository", "")[:34]
-        tag = img.get("Tag", "")[:19]
-        size = img.get("Size", "")[:14]
-        id_ = img.get("ID", "")[:12]
+        repo = img.Repository[:34]
+        tag = img.Tag[:19]
+        size = img.Size[:14]
+        id_ = img.ID[:12]
         print(f"{repo:<35} {tag:<20} {size:<15} {id_}")
 
 
 def cli_volumes(args: argparse.Namespace) -> None:
     """List volumes"""
-    volumes = Docker.volumes()
+    volumes = Docker.list_volumes().logged()
 
     if args.quiet:
         for v in volumes:
-            print(v.get("Name", ""))
+            print(v.Name)
         return
 
     print(f"{'NAME':<50} {'DRIVER':<15}")
     print("-" * 65)
     for v in volumes:
-        name = v.get("Name", "")[:49]
-        driver = v.get("Driver", "")[:14]
+        name = v.Name[:49]
+        driver = v.Driver[:14]
         print(f"{name:<50} {driver:<15}")
 
 
 def cli_networks(args: argparse.Namespace) -> None:
     """List networks"""
-    networks = Docker.networks()
+    networks = Docker.list_networks().logged()
 
     if args.quiet:
         for n in networks:
-            print(n.get("ID", ""))
+            print(n.ID)
         return
 
     print(f"{'NAME':<30} {'DRIVER':<15} {'SCOPE':<10} {'ID'}")
     print("-" * 70)
     for n in networks:
-        name = n.get("Name", "")[:29]
-        driver = n.get("Driver", "")[:14]
-        scope = n.get("Scope", "")[:9]
-        id_ = n.get("ID", "")[:12]
+        name = n.Name[:29]
+        driver = n.Driver[:14]
+        scope = n.Scope[:9]
+        id_ = n.ID[:12]
         print(f"{name:<30} {driver:<15} {scope:<10} {id_}")
 
 
@@ -3502,15 +3565,13 @@ def cli_projects(args: argparse.Namespace) -> None:
         return
 
     headers = ["PROJECT", "STATUS", "IMAGE", "REPO", "SHORTCUTS"]
-    containers = Docker.containers_by_name()  # once, not one `docker ps` per project
+    ps = Docker.list_containers()  # once, not one `docker ps` per project
+    ps.logged()
+    status = status_lookup(ps)
     rows = []
     for name, project in projects.items():
-        container = containers.get(project.container_name)
-        if container:
-            status = container.get("State", container.get("Status", "unknown"))
-        else:
-            status = "not created"
-        rows.append([name, status, project.image, project.repos_display, ", ".join(project.shortcuts) or "-"])
+        shortcuts = ", ".join(project.shortcuts) or "-"
+        rows.append([name, status(project.container_name), project.image, project.repos_display, shortcuts])
     width = _table_width(args.wide)
     shrink = [3, 2, 0, 1]  # REPO, IMAGE, PROJECT, STATUS
     if width is not None:
@@ -3566,28 +3627,40 @@ def cli_check(args: argparse.Namespace) -> None:
 
 
 def current_issues() -> list[Issue]:
-    """The conditions as the TUI computes them, for one CLI run: its loads and docker calls collected too"""
-    with collecting() as conditions:
-        projects, images = load_projects(), load_images()
-        load_services()
-        rows = Docker.images()
-    return conditions + check_conditions(projects, images, rows)
+    """The issues as the TUI detects them, for one CLI run: nothing is logged, what is broken is in the list"""
+    projects, broken_projects = read_projects()
+    services, broken_services = read_services()
+    images, broken_images = read_images()
+    issues = broken_projects + broken_services + broken_images
+    return by_severity(issues + detect_issues(projects, services, images, Docker.listings()))
 
 
-def print_issues(issues: list[Issue], file=None) -> bool:
-    """One table, errors first. True when nothing is error-level."""
+def print_issues(issues: list[Issue], file=None) -> None:
     file = file or sys.stdout
     if not issues:
         print("No issues", file=file)
-        return True
-    rows = [[i.level, i.cat, i.msg, i.hint] for i in by_severity(issues)]
+        return
+    rows = [[i.level, i.cat, i.msg, i.hint] for i in issues]
     print("\n".join(format_table(["LEVEL", "CATEGORY", "MESSAGE", "HINT"], rows, None, [])), file=file)
-    return all(i.level != ERROR for i in issues)
+    for issue in issues:  # the raw material the TUI shows on Enter
+        if issue.detail:
+            print(f"\n{issue.cat}: {issue.msg}", file=file)
+            for raw in issue.detail.splitlines():
+                print(f"  {raw}", file=file)
+
+
+def print_errors(errors: list[Event], file=None) -> None:
+    file = file or sys.stderr
+    rows = [[e.cat, e.msg] for e in errors]
+    print("\n".join(format_table(["ERROR", "MESSAGE"], rows, None, [])), file=file)
 
 
 def cli_issues(args: argparse.Namespace) -> None:
-    """What needs attention: the Issues tab for one run; exit 1 when anything is error-level"""
-    if not print_issues(current_issues()):
+    """What wants an action: the Issues tab for one run. Exit 1 when anything is error-level (docker unreachable,
+    a config file that doesn't parse) or the run logged errors (printed by main); warnings alone exit 0."""
+    issues = current_issues()
+    print_issues(issues)
+    if any(i.level == ERROR for i in issues) or get_errors():
         sys.exit(1)
 
 
@@ -3680,18 +3753,15 @@ def cli_services(args: argparse.Namespace) -> None:
         return
 
     headers = ["SERVICE", "STATUS", "IMAGE", "PORTS", "NETWORKS"]
-    containers = Docker.containers_by_name()  # once, not one `docker ps` per service
+    ps = Docker.list_containers()  # once, not one `docker ps` per service
+    ps.logged()
+    status = status_lookup(ps)
     rows = []
     for name, service in services.items():
-        container = containers.get(service.container_name)
-        if container:
-            status = container.get("State", container.get("Status", "unknown"))
-        else:
-            status = "not created"
         ports = ", ".join(service.ports[:3])
         if len(service.ports) > 3:
             ports += f" +{len(service.ports) - 3}"
-        rows.append([name, status, service.image, ports, ", ".join(service.networks) or "-"])
+        rows.append([name, status(service.container_name), service.image, ports, ", ".join(service.networks) or "-"])
     print("\n".join(format_table(headers, rows, _table_width(args.wide), shrink=[4, 3, 2, 0, 1])))
 
 
@@ -3725,12 +3795,13 @@ class ImageState:
         return "-" if self.current is None else f"{LOCAL_VERSION_PREFIX}{self.current:06d}"
 
 
-def image_state(image: "ImageConfig") -> ImageState:
+def image_state(image: "ImageConfig", rows: list[Image]) -> ImageState:
+    """From the recipe files and the `docker images` rows (one listing serves every recipe)"""
     recipe = image.recipe_hash()
-    versions, current, tagged = Docker.image_versions(image)
+    versions, current, tag_id = local_versions(image, rows)
     if recipe is None:
         built = "unreadable"
-    elif not tagged:
+    elif tag_id is None:
         built = "not built"
     else:
         info = Docker.inspect_image(image.tag)
@@ -3765,8 +3836,10 @@ def print_images(images: dict[str, "ImageConfig"], upstream: bool) -> bool:
         return True
     headers = ["IMAGE", "TAG", "CURRENT", "VERSIONS", "BUILT"] + (["UPSTREAM"] if upstream else [])
     rows, notes, ok = [], [], True
+    # Once, not one `docker images` per recipe. DockerError when it failed: "not built" would be a guess.
+    listing = Docker.list_images().required()
     for name, image in images.items():
-        state = image_state(image)
+        state = image_state(image, listing)
         row = [name, image.tag, state.current_display, str(len(state.versions)), state.built]
         ok = ok and state.built == "up to date"
         if upstream:
@@ -3776,7 +3849,7 @@ def print_images(images: dict[str, "ImageConfig"], upstream: bool) -> bool:
             if diff:
                 notes.append(diff)
         rows.append(row)
-        if issue := version_issue(name, image, state.versions, state.current):
+        if issue := image_version_issue(name, image, state.versions, state.current):
             notes.append(
                 f"warning: {issue.msg}; docker refuses to remove an image a container still uses,\n"
                 f"so this is safe to try:  {issue.hint}\n"
@@ -3845,7 +3918,7 @@ def usage() -> int:
         "- containerctl check <project>          ==> is the workspace safe to destroy? (uncommitted/unpushed/extra)",
         "- containerctl check --all              ==> check every configured project",
         "- containerctl check-local              ==> run the same check from inside a container",
-        "- containerctl issues                   ==> what needs attention: warnings (config, secrets, images) + errors",
+        "- containerctl issues                   ==> what wants an action: docker down, broken config, shortcuts, ...",
         "──────────────────────────────────────────────",
         "- containerctl service up <name>               ==> create/start a service",
         "- containerctl service down <name>             ==> stop and remove a service",
@@ -4016,7 +4089,7 @@ def main() -> None:
     check_local_parser.set_defaults(func=cli_check_local)
 
     # issues
-    issues_parser = subparsers.add_parser("issues", help="What needs attention: conditions, then recorded errors")
+    issues_parser = subparsers.add_parser("issues", help="What wants an action, as the TUI's Issues tab detects it")
     issues_parser.set_defaults(func=cli_issues)
 
     # projects
@@ -4080,14 +4153,17 @@ def main() -> None:
     elif args.command == "image" and not hasattr(args, "func"):
         image_parser.print_help()
     else:
-        # One run, one report: whatever the command's loaders and docker calls complained about, as the Issues
-        # table on stderr once it is done (a sys.exit inside the command still gets the report).
-        with collecting() as issues:
-            try:
-                args.func(args)
-            finally:
-                if issues:
-                    print_issues(issues, file=sys.stderr)
+        # One run, one report: whatever the command's loaders and docker calls logged, as a table on stderr once
+        # it is done (a sys.exit inside the command still gets the report).
+        try:
+            args.func(args)
+        except DockerError as e:  # the command needed an answer docker didn't give: it stopped, say why
+            log_error("docker.command", e.failure.detail)
+            print(f"error: {e} ({e.failure.hint})", file=sys.stderr)
+            sys.exit(1)
+        finally:
+            if errors := get_errors():
+                print_errors(errors, file=sys.stderr)
 
 
 if __name__ == "__main__":
