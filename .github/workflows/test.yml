@@ -5,6 +5,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: '17 5 * * 1'  # weekly: the runner's docker moves on without a push of ours (see real-docker)
 
 jobs:
   lint:
@@ -29,3 +31,15 @@ jobs:
       - uses: astral-sh/setup-uv@v4
       - name: Run tests on Python ${{ matrix.python-version }}
         run: uv run --python ${{ matrix.python-version }} python -m unittest discover -s tests
+
+  # What docker says, from docker: tests/test_real_docker.py against the runner's own docker. Everything else fakes it.
+  real-docker:
+    runs-on: ubuntu-latest
+    env:
+      CCTL_REAL_DOCKER: '1'  # no docker is then a failure, not a skip
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker version
+        run: docker version
+      - name: Run the real-docker tests
+        run: python3 -m unittest -v tests.test_real_docker
