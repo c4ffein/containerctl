@@ -6,8 +6,11 @@ Rendered text is compared after stripping ANSI escapes.
 """
 
 import io
+import os
+import pty
 import re
 import subprocess
+import sys
 import time
 import unittest
 from contextlib import redirect_stdout
@@ -18,20 +21,22 @@ import containerctl
 from containerctl import (
     UI,
     App,
-    Container,
     DataFetcher,
     Docker,
+    DockerContainerRow,
+    DockerImageRow,
+    DockerNetworkRow,
+    DockerVolumeRow,
     Event,
-    Image,
     Issue,
-    Network,
     ProjectConfig,
+    Projects,
     RepoStatus,
     Screen,
     ServiceConfig,
+    Services,
     Tab,
     Term,
-    Volume,
     WorkspaceReport,
     log_error,
 )
@@ -136,7 +141,7 @@ class UIWidgetTests(unittest.TestCase):
 
     def test_list_row_clips_values_and_inverts_selection(self):
         t = tab([("Names", "NAME", 4), ("Status", "STATUS", 0)])
-        item = Container("a", "longname", "i", "Up 3 hours")
+        item = DockerContainerRow("a", "longname", "i", "Up 3 hours")
         UI.list_row(self.scr, t, item, 4, 30, selected=False)
         self.assertEqual(buffered(self.scr), "long Up 3 hours")
         self.assertNotIn(Term.INVERT, "".join(self.scr.buf))
@@ -147,7 +152,7 @@ class UIWidgetTests(unittest.TestCase):
     def test_list_row_colors_matching_status(self):
         t = tab([("Names", "NAME", 10), ("Status", "STATUS", 10)])
         colors = {"exited": Term.RED, "up": Term.GREEN}
-        UI.list_row(self.scr, t, Container("a", "up-ish", "i", "Exited (0)"), 4, 30, False, colors)
+        UI.list_row(self.scr, t, DockerContainerRow("a", "up-ish", "i", "Exited (0)"), 4, 30, False, colors)
         raw = "".join(self.scr.buf)
         self.assertIn(Term.RED + "Exited (0)" + Term.RESET, raw)
         self.assertNotIn(Term.GREEN, raw)  # only the Status column is coloured, even if NAME matches a key
@@ -167,14 +172,14 @@ class UIWidgetTests(unittest.TestCase):
 
     def test_list_row_no_color_when_status_matches_nothing(self):
         t = tab([("Status", "STATUS", 10)])
-        UI.list_row(self.scr, t, Container("a", "n", "i", "Weird"), 4, 30, False, {"up": Term.GREEN})
+        UI.list_row(self.scr, t, DockerContainerRow("a", "n", "i", "Weird"), 4, 30, False, {"up": Term.GREEN})
         self.assertNotIn(Term.GREEN, "".join(self.scr.buf))
 
     def test_render_colors_container_status(self):
         # end-to-end through App.render: the colour map wired for the containers tab must reach the row
         with mock.patch.object(Term, "size", return_value=(24, 80)):
             app = App()
-            app.fetcher.data["containers"] = [Container("a", "c", "i", "Exited (1)")]
+            app.fetcher.data["containers"] = [DockerContainerRow("a", "c", "i", "Exited (1)")]
             with redirect_stdout(io.StringIO()) as out:
                 app.render()
         self.assertIn(Term.RED + "Exited (1)", out.getvalue())
@@ -313,6 +318,13 @@ class ConfirmAndInfoBoxTests(unittest.TestCase):
         getch.assert_called_once()
         self.assertNotIn("scroll", plain(out.getvalue()))
 
+    def test_info_box_title_too_long_ends_with_an_ellipsis(self):
+        with mock.patch("containerctl.Term.getch", return_value="q"):
+            with redirect_stdout(io.StringIO()) as out:
+                UI.info_box("Source: devcontainer, docker-compose, portainer", ["line"], 24, 30)
+        self.assertIn("Source: devcontainer,…", out.getvalue())  # 30 columns: a box of 26, 22 for the title
+        self.assertNotIn("docker-compose", out.getvalue())
+
     def test_info_box_clips_lines_to_terminal_width(self):
         with mock.patch.object(Term, "getch", keys("x")):
             with redirect_stdout(io.StringIO()) as out:
@@ -351,7 +363,9 @@ class AppBase(unittest.TestCase):
         return plain(out.getvalue())
 
     def containers(self, n):
-        self.app.fetcher.data["containers"] = [Container(f"id{i:010d}", f"c{i}", "img", "Up") for i in range(n)]
+        self.app.fetcher.data["containers"] = [
+            DockerContainerRow(f"id{i:010d}", f"c{i}", "img", "Up") for i in range(n)
+        ]
 
 
 class AppItemsTests(AppBase):
@@ -415,7 +429,7 @@ class AppItemsTests(AppBase):
         self.containers(1)
         self.assertEqual(self.app.selected_id(), "id0000000000")
         self.goto("volumes")
-        self.app.fetcher.data["volumes"] = [Volume("vol", "local")]
+        self.app.fetcher.data["volumes"] = [DockerVolumeRow("vol", "local")]
         self.assertEqual(self.app.selected_id(), "vol")
 
     def test_selected_item_none_when_out_of_range(self):
@@ -653,7 +667,9 @@ class AppSwitchGraceTests(AppBase):
 
     def test_a_key_that_finds_its_row_gone_gets_the_same_box_and_one_ok_is_enough(self):
         self.now += 10
-        self.app.fetcher.data["containers"] = [Container("id0000000009", "c9", "img", "Up")]  # c1 gone, no redraw
+        self.app.fetcher.data["containers"] = [
+            DockerContainerRow("id0000000009", "c9", "img", "Up")
+        ]  # c1 gone, no redraw
         box = self.press("s")  # for c1
         self.assertEqual(box.call_args.args[0], "Selection changed")
         self.assertIn("the row that key was for is gone", box.call_args.args[1][0])
@@ -709,8 +725,8 @@ class AppContainerActionTests(AppBase):
         self.assertEqual(self.app.message_text, "Deleted c1")
 
     def test_origin_opens_info_box_with_investigation(self):
-        result = {"source": "compose", "details": ["project: x"]}
-        with mock.patch.object(Docker, "investigate_source", return_value=result) as inv:
+        source = containerctl.Source("compose", ["project: x"])
+        with mock.patch.object(containerctl, "container_source", return_value=source) as inv:
             with mock.patch.object(UI, "info_box") as box:
                 self.feed("o")
         inv.assert_called_once_with("id0000000001")
@@ -746,7 +762,7 @@ class AppContainerActionTests(AppBase):
     def test_a_non_zero_exit_in_a_running_container_is_the_shells_own(self):
         text, style, errors = self._shell(1, {"Running": True, "Status": "running"})
         self.assertEqual((text, style, errors), ("Shell in c1 exited with code 1", Term.YELLOW, []))
-        self.inspect.assert_called_once_with(containerctl.ContainerInspect, "id0000000001")
+        self.inspect.assert_called_once_with(containerctl.DockerContainerInspect, "id0000000001")
 
     def test_a_non_zero_exit_from_a_container_that_does_not_run_is_logged_whatever_the_code(self):
         # `docker exec` on a stopped container: exit 1, and its message gone with the main screen
@@ -807,7 +823,7 @@ class AppOtherTabActionTests(AppBase):
 
     def test_image_delete_names_repo_and_tag_in_prompt(self):
         self.goto("images")
-        self.app.fetcher.data["images"] = [Image("sha", "nginx", "1.27", "1MB")]
+        self.app.fetcher.data["images"] = [DockerImageRow("sha", "nginx", "1.27", "1MB")]
         with mock.patch.object(UI, "confirm", return_value=True) as confirm:
             self.feed("d")
         confirm.assert_called_once_with("Delete image 'nginx:1.27'?", self.ROWS - 1, self.COLS)
@@ -816,7 +832,11 @@ class AppOtherTabActionTests(AppBase):
     def test_a_keypress_acts_on_one_snapshot_of_the_list(self):
         """The fetcher swaps the lists between two reads: the row named in the prompt is the row deleted"""
         self.goto("images")
-        snapshots = [[Image("sha1", "nginx", "1.27", "1MB")], [Image("sha2", "redis", "7", "1MB")], []]
+        snapshots = [
+            [DockerImageRow("sha1", "nginx", "1.27", "1MB")],
+            [DockerImageRow("sha2", "redis", "7", "1MB")],
+            [],
+        ]
 
         def swapping(key):
             return snapshots.pop(0) if len(snapshots) > 1 else snapshots[0]
@@ -832,10 +852,10 @@ class AppOtherTabActionTests(AppBase):
     def test_a_key_acts_on_the_row_that_was_drawn_wherever_it_is_now(self):
         """The screen is only redrawn on a keypress: by then a fetch may have moved the rows under the cursor"""
         self.goto("images")
-        nginx, redis = Image("sha1", "nginx", "1.27", "1MB"), Image("sha2", "redis", "7", "1MB")
+        nginx, redis = DockerImageRow("sha1", "nginx", "1.27", "1MB"), DockerImageRow("sha2", "redis", "7", "1MB")
         self.app.fetcher.data["images"] = [nginx, redis]
         self.rendered()  # nginx is under the cursor
-        self.app.fetcher.data["images"] = [Image("sha0", "alpine", "3", "1MB"), nginx, redis]
+        self.app.fetcher.data["images"] = [DockerImageRow("sha0", "alpine", "3", "1MB"), nginx, redis]
         with mock.patch.object(UI, "confirm", return_value=True) as confirm:
             self.feed("d")
         confirm.assert_called_once_with("Delete image 'nginx:1.27'?", self.ROWS - 1, self.COLS)
@@ -844,7 +864,7 @@ class AppOtherTabActionTests(AppBase):
 
     def test_tags_of_one_image_are_rows_of_their_own(self):
         self.goto("images")
-        old, new = Image("sha1", "nginx", "1.26", "1MB"), Image("sha1", "nginx", "1.27", "1MB")
+        old, new = DockerImageRow("sha1", "nginx", "1.26", "1MB"), DockerImageRow("sha1", "nginx", "1.27", "1MB")
         self.app.fetcher.data["images"] = [old, new]
         self.feed("k")
         self.rendered()  # 1.27 is under the cursor
@@ -855,9 +875,9 @@ class AppOtherTabActionTests(AppBase):
 
     def test_a_key_for_a_row_that_is_gone_acts_on_nothing_and_says_so(self):
         self.goto("images")
-        self.app.fetcher.data["images"] = [Image("sha1", "nginx", "1.27", "1MB")]
+        self.app.fetcher.data["images"] = [DockerImageRow("sha1", "nginx", "1.27", "1MB")]
         self.rendered()
-        self.app.fetcher.data["images"] = [Image("sha2", "redis", "7", "1MB")]  # same index, another image
+        self.app.fetcher.data["images"] = [DockerImageRow("sha2", "redis", "7", "1MB")]  # same index, another image
         with mock.patch.object(UI, "confirm", return_value=True) as confirm, mock.patch.object(UI, "info_box") as box:
             self.feed("d")
         confirm.assert_not_called()
@@ -871,7 +891,7 @@ class AppOtherTabActionTests(AppBase):
     def test_a_row_that_appeared_in_an_empty_list_is_not_acted_on_unseen(self):
         self.goto("images")
         self.rendered()  # "No images found"
-        self.app.fetcher.data["images"] = [Image("sha1", "nginx", "1.27", "1MB")]
+        self.app.fetcher.data["images"] = [DockerImageRow("sha1", "nginx", "1.27", "1MB")]
         with mock.patch.object(UI, "confirm", return_value=True) as confirm, mock.patch.object(UI, "info_box") as box:
             self.feed("d")
         confirm.assert_not_called()
@@ -880,14 +900,14 @@ class AppOtherTabActionTests(AppBase):
 
     def test_a_redraw_keeps_the_row_selected_not_the_position(self):
         self.goto("volumes")
-        a, b, c = (Volume(name, "local") for name in "abc")
+        a, b, c = (DockerVolumeRow(name, "local") for name in "abc")
         self.app.fetcher.data["volumes"] = [a, b, c]
         self.feed("k")
         self.rendered()  # b is under the cursor
-        self.app.fetcher.data["volumes"] = [Volume("0", "local"), a, b, c]
+        self.app.fetcher.data["volumes"] = [DockerVolumeRow("0", "local"), a, b, c]
         self.rendered()  # a resize: no key in between
         self.assertEqual(self.app.selected_item().Name, "b")
-        self.app.fetcher.data["volumes"] = [Volume("0", "local"), a, c]  # b is gone: c took its place
+        self.app.fetcher.data["volumes"] = [DockerVolumeRow("0", "local"), a, c]  # b is gone: c took its place
         self.rendered()
         self.assertEqual(self.app.selected_item().Name, "c")
         self.app.fetcher.data["volumes"] = [a]  # nothing at that position anymore: the last line
@@ -902,23 +922,23 @@ class AppOtherTabActionTests(AppBase):
 
     def test_moving_starts_from_the_row_that_was_drawn(self):
         self.goto("volumes")
-        a, b, c = (Volume(name, "local") for name in "abc")
+        a, b, c = (DockerVolumeRow(name, "local") for name in "abc")
         self.app.fetcher.data["volumes"] = [a, b, c]
         self.rendered()  # a is under the cursor
-        self.app.fetcher.data["volumes"] = [Volume("0", "local"), a, b, c]
+        self.app.fetcher.data["volumes"] = [DockerVolumeRow("0", "local"), a, b, c]
         self.feed("k")
         self.assertEqual(self.app.selected_item().Name, "b")
 
     def test_volume_delete(self):
         self.goto("volumes")
-        self.app.fetcher.data["volumes"] = [Volume("vol", "local", Mountpoint="/v")]
+        self.app.fetcher.data["volumes"] = [DockerVolumeRow("vol", "local", Mountpoint="/v")]
         with mock.patch.object(UI, "confirm", return_value=True):
             self.feed("d")
         self.assertEqual(self.rec.last, ["volume", "rm", "vol"])
 
     def test_network_edit_lists_connected_containers(self):
         self.goto("networks")
-        self.app.fetcher.data["networks"] = [Network("net1", "cctl-net-x", "bridge", "local")]
+        self.app.fetcher.data["networks"] = [DockerNetworkRow("net1", "cctl-net-x", "bridge", "local")]
         info = mock.Mock(Name="cctl-net-x", Containers={"abc": {"Name": "cctl-prj-x"}})
         with mock.patch.object(Docker, "inspect", return_value=info):
             with mock.patch.object(UI, "info_box") as box:
@@ -927,7 +947,7 @@ class AppOtherTabActionTests(AppBase):
 
     def test_network_edit_failure_sets_red_message(self):
         self.goto("networks")
-        self.app.fetcher.data["networks"] = [Network("net1", "n", "bridge", "local")]
+        self.app.fetcher.data["networks"] = [DockerNetworkRow("net1", "n", "bridge", "local")]
         with mock.patch.object(Docker, "inspect", return_value=None):
             self.feed("e")
         self.assertEqual(self.app.message_style, Term.RED)
@@ -939,7 +959,7 @@ class AppOtherTabActionTests(AppBase):
         with (
             mock.patch.object(containerctl, "read_projects", return_value=({"demo": project}, [])),
             mock.patch.object(self.app, "exit_tui_temporarily"),
-            mock.patch.object(Docker, "enter_project") as enter,
+            mock.patch.object(Projects, "enter", return_value=0) as enter,  # a shell that ended well: no more asked
             mock.patch.object(self.app, "enter_tui"),
         ):
             self.feed("e")
@@ -951,7 +971,7 @@ class AppOtherTabActionTests(AppBase):
         project = ProjectConfig(name="demo", image="i")
         with (
             mock.patch.object(containerctl, "read_projects", return_value=({"demo": project}, [])),
-            mock.patch.object(Docker, "project_containers", return_value=(None, None)),
+            mock.patch.object(Projects, "containers", return_value=(None, None)),
             mock.patch.object(UI, "confirm") as confirm,
         ):
             self.feed("d")
@@ -965,7 +985,7 @@ class AppOtherTabActionTests(AppBase):
         with (
             mock.patch.object(containerctl, "read_projects", return_value=({"demo": project}, [])),
             mock.patch.object(self.app, "exit_tui_temporarily"),
-            mock.patch.object(Docker, "enter_project", return_value=None),  # spawn failed, or was declined
+            mock.patch.object(Projects, "enter", return_value=None),  # spawn failed, or was declined
             mock.patch("builtins.input") as pause,
             mock.patch.object(self.app, "enter_tui") as back,
         ):
@@ -984,7 +1004,7 @@ class AppOtherTabActionTests(AppBase):
         with (
             mock.patch.object(containerctl, "read_projects", return_value=({"demo": project}, [])),
             mock.patch.object(self.app, "exit_tui_temporarily"),
-            mock.patch.object(Docker, "enter_project", **enter_project),
+            mock.patch.object(Projects, "enter", **enter_project),
             mock.patch.object(Docker, "inspect", return_value=mock.Mock(State={"Running": True})),
             mock.patch("builtins.input", side_effect=EOFError),  # Ctrl-D at "Press Enter to return..."
             mock.patch.object(self.app, "enter_tui") as self.back,
@@ -1026,10 +1046,10 @@ class AppOtherTabActionTests(AppBase):
         ):
             with (
                 mock.patch.object(containerctl, "read_projects", return_value=({"demo": project}, [])),
-                mock.patch.object(Docker, "project_containers", return_value=(main, leftover)),
+                mock.patch.object(Projects, "containers", return_value=(main, leftover)),
                 mock.patch.object(containerctl, "project_report", return_value=WorkspaceReport()) as check,
                 mock.patch.object(UI, "confirm", return_value=True) as confirm,
-                mock.patch.object(Docker, "destroy_project", return_value=True) as destroy,
+                mock.patch.object(Projects, "destroy", return_value=True) as destroy,
             ):
                 self.feed("d")
             self.assertEqual(check.call_count, 1 if main else 0)  # a leftover was never entered: nothing to check
@@ -1042,10 +1062,10 @@ class AppOtherTabActionTests(AppBase):
         project = ProjectConfig(name="demo", image="i")
         with (
             mock.patch.object(containerctl, "read_projects", return_value=({"demo": project}, [])),
-            mock.patch.object(Docker, "project_containers", return_value=(container("cctl-prj-demo"), None)),
+            mock.patch.object(Projects, "containers", return_value=(container("cctl-prj-demo"), None)),
             mock.patch.object(containerctl, "project_report", return_value=report) as check,
             mock.patch.object(UI, "confirm", return_value=answer) as confirm,
-            mock.patch.object(Docker, "destroy_project", return_value=True) as destroy,
+            mock.patch.object(Projects, "destroy", return_value=True) as destroy,
         ):
             self.feed("d")
         check.assert_called_once_with(project)
@@ -1074,10 +1094,10 @@ class AppOtherTabActionTests(AppBase):
         project = ProjectConfig(name="demo", image="i")
         with (
             mock.patch.object(containerctl, "read_projects", return_value=({"demo": project}, [])),
-            mock.patch.object(Docker, "project_containers", return_value=(container("cctl-prj-demo", "exited"), None)),
+            mock.patch.object(Projects, "containers", return_value=(container("cctl-prj-demo", "exited"), None)),
             mock.patch.object(containerctl, "project_report", side_effect=failed),
             mock.patch.object(UI, "confirm", return_value=True) as confirm,
-            mock.patch.object(Docker, "destroy_project", return_value=True) as destroy,
+            mock.patch.object(Projects, "destroy", return_value=True) as destroy,
         ):
             self.feed("d")
         prompt = "Destroy cctl-prj-demo, though its workspace could NOT be checked (Container is not running)?"
@@ -1097,9 +1117,9 @@ class AppOtherTabActionTests(AppBase):
         service = ServiceConfig(name="web", image="i")
         with (
             mock.patch.object(containerctl, "read_services", return_value=({"web": service}, [])),
-            mock.patch.object(Docker, "find_service_container", return_value=container("cctl-svc-web")),
+            mock.patch.object(Services, "find_container", return_value=container("cctl-svc-web")),
             mock.patch.object(UI, "confirm", return_value=True) as confirm,
-            mock.patch.object(Docker, "service_down", return_value=True) as down,
+            mock.patch.object(Services, "down", return_value=True) as down,
         ):
             self.feed("d")
         confirm.assert_called_once_with("Stop service 'web'?", self.ROWS - 1, self.COLS)
@@ -1113,7 +1133,7 @@ class AppOtherTabActionTests(AppBase):
                 containerctl, "read_services", return_value=({"web": ServiceConfig(name="web", image="i")}, [])
             ),
             mock.patch.object(UI, "confirm", return_value=False),
-            mock.patch.object(Docker, "service_recreate") as recreate,
+            mock.patch.object(Services, "recreate") as recreate,
         ):
             self.feed("r")
         recreate.assert_not_called()
@@ -1377,7 +1397,7 @@ class DataFetcherTests(unittest.TestCase):
             ),
             mock.patch.object(containerctl, "read_projects", return_value=(projects, list(broken))),
             mock.patch.object(containerctl, "read_services", return_value=(services, [])),
-            mock.patch.object(containerctl, "read_images", return_value=({}, [])),
+            mock.patch.object(containerctl, "read_image_recipes", return_value=({}, [])),
             mock.patch.object(containerctl, "PROJECTS_DIR", Path("/nonexistent/projects")),
             mock.patch.object(containerctl, "SERVICES_DIR", Path("/nonexistent/services")),
             mock.patch.object(containerctl, "SECRETS_FILE", Path("/nonexistent/secrets.toml")),  # never the real one
@@ -1591,6 +1611,91 @@ class DataFetcherTests(unittest.TestCase):
             self.fetcher.stop()
         self.assertGreaterEqual(len(calls), 2)
         self.assertFalse(self.fetcher._thread.is_alive())
+
+
+class GetchOnATerminalTests(unittest.TestCase):
+    """Term.getch on a real pseudo-terminal: one key is one string, whatever the terminal sends for it"""
+
+    def keys_for(self, data: bytes) -> list[str]:
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        with open(slave, "r") as stdin, mock.patch.object(sys, "stdin", stdin):
+            Term.raw_on()
+            try:
+                os.write(master, data)
+                keys = []
+                while key := Term.getch(timeout=0.2):
+                    keys.append(key)
+                return keys
+            finally:
+                Term.raw_off()
+
+    def test_the_keys_we_handle_come_as_before(self):
+        self.assertEqual(self.keys_for(b"\x1b[A"), [Term.KEY_UP])
+        self.assertEqual(self.keys_for(b"\x1b"), [Term.KEY_ESC])
+        self.assertEqual(self.keys_for(b"k\r\t"), ["k", Term.KEY_ENTER, Term.KEY_TAB])
+
+    def test_a_long_escape_sequence_is_one_key_and_its_tail_is_nobodys(self):
+        # Each used to leak its tail as keys of its own: the `5` of Ctrl-Up and F5 switched to the fifth tab
+        for sent in (b"\x1b[1;5A", b"\x1b[15~", b"\x1b[3~", b"\x1bOH"):
+            self.assertEqual(self.keys_for(sent), [sent.decode()], sent)
+
+    def test_a_function_key_of_the_linux_console_is_one_key(self):
+        # F1-F5 there are `ESC [ [ A`..`E`: the second `[` is in the range of a final byte, and is not one
+        for sent in (b"\x1b[[A", b"\x1b[[E"):
+            self.assertEqual(self.keys_for(sent), [sent.decode()], sent)
+        self.assertEqual(self.keys_for(b"\x1b[[Bq"), ["\x1b[[B", "q"])
+
+    def test_keys_typed_in_a_burst_stay_apart(self):
+        self.assertEqual(self.keys_for(b"\x1b[15~5\x1b[Bq"), ["\x1b[15~", "5", Term.KEY_DOWN, "q"])
+
+    def test_a_non_ascii_character_is_one_key(self):
+        self.assertEqual(self.keys_for("é€🙂x".encode()), ["é", "€", "🙂", "x"])
+
+    def test_a_byte_that_only_looks_like_the_start_of_a_character_does_not_take_the_next_keys_with_it(self):
+        # Latin-1's é is UTF-8's "three more bytes follow": what follows is the next key
+        self.assertEqual(self.keys_for(b"\xe9q"), ["\ufffd", "q"])
+        self.assertEqual(self.keys_for(b"\xffabc\x1b[B"), ["\ufffd", "a", "b", "c", Term.KEY_DOWN])
+        self.assertEqual(self.keys_for("é".encode()[:1] + "€".encode()), ["\ufffd", "€"])
+
+    def test_a_lone_start_of_a_character_is_waited_for_once(self):
+        # Nothing follows it: one wait says so, not one for each byte it announced
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        with open(slave, "r") as stdin, mock.patch.object(sys, "stdin", stdin):
+            Term.raw_on()
+            try:
+                os.write(master, b"\xf0")
+                started = time.monotonic()
+                self.assertEqual(Term.getch(timeout=1), "\ufffd")
+                self.assertLess(time.monotonic() - started, 0.25)
+            finally:
+                Term.raw_off()
+
+    def test_alt_sent_as_an_esc_before_the_key_is_one_key(self):
+        # rxvt and others: Alt-Up is `ESC ESC [ A`. Its `[` and `A` were keys of their own
+        for sent in (b"\x1b\x1b[A", b"\x1b\x1b[1;5A", b"\x1b\x1bOH", b"\x1b\x1b[[A"):
+            self.assertEqual(self.keys_for(sent), [sent.decode()], sent)
+        self.assertEqual(self.keys_for(b"\x1b\x1b[Bq"), ["\x1b\x1b[B", "q"])
+
+    def test_esc_twice_is_two_escs(self):
+        # Typed fast, or held: `ESC ESC` with no sequence behind it is no Alt. As one key it was nobody's, and
+        # the Esc that should have closed a box was lost
+        self.assertEqual(self.keys_for(b"\x1b\x1b"), [Term.KEY_ESC, Term.KEY_ESC])
+        self.assertEqual(self.keys_for(b"\x1b\x1b\x1b"), [Term.KEY_ESC] * 3)
+        self.assertEqual(self.keys_for(b"\x1b\x1b\x1b[B"), [Term.KEY_ESC, "\x1b\x1b[B"])
+        self.assertEqual(self.keys_for(b"\x1b\x1bq"), [Term.KEY_ESC, "\x1bq"])  # Esc, then Alt-q
+
+    def test_alt_and_a_non_ascii_character_is_one_key(self):
+        # `ESC` then the character's bytes: the bytes after the first were a key of their own
+        self.assertEqual(self.keys_for(b"\x1b" + "é".encode() + b"q"), ["\x1bé", "q"])
+        self.assertEqual(self.keys_for(b"\x1b" + "🙂".encode()), ["\x1b🙂"])
+        self.assertEqual(self.keys_for(b"\x1b\xe9q"), ["\x1b\ufffd", "q"])  # no character after all
+        self.assertEqual(self.keys_for(b"\x1b\x1b" + "é".encode()), [Term.KEY_ESC, "\x1bé"])
+
+    def test_a_sequence_that_never_ends_stops_somewhere(self):
+        keys = self.keys_for(b"\x1b[" + b"1" * 100)
+        self.assertEqual(len(keys[0]), Term.KEY_MAX_BYTES)
 
 
 if __name__ == "__main__":

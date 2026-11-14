@@ -13,8 +13,10 @@ what exists is what `docker ps` says, what should exist is a few TOML files. Not
 Concepts
 - project  ==> a throwaway dev container (cctl-prj-<name>, own network cctl-net-prj-<name>) from a TOML:
                image, ssh key, repos cloned in ~/workspace, env files. `enter` spawns it when
-               missing, then drops you in a shell. Nothing is mounted from the host: what is not pushed
-               dies with the container. That is the point, and why `check` exists. It is made as
+               missing, then drops you in a shell. Nothing is mounted from the host unless its
+               `volumes` say so (a dropzone shared with other projects, a cache): what is neither
+               pushed nor in a volume dies with the container. That is the point, and why `check`
+               exists (it looks at the workspace: keep volumes out of it). It is made as
                cctl-spawning-<name> and renamed once all of that is in: a spawn that died halfway is
                not a project container: the next `enter` says how old it is, asks, and starts over.
 - check    ==> is it safe to destroy? Everything in the workspace must be a configured repo, and every

@@ -48,6 +48,55 @@ class IsValidImageRefTests(unittest.TestCase):
         self.assertTrue(is_valid_image_ref("ubuntu@sha256:" + "a" * 64))
         self.assertTrue(is_valid_image_ref("ghcr.io/owner/img:1.2@sha256:" + "0" * 64))
 
+    def test_allows_what_docker_itself_names_images(self):
+        good = [
+            "ubuntu",
+            "library/ubuntu",
+            "localhost:5000/team/img:dev",
+            "registry.example.com/a/b/c:v1.2-rc_3",
+            "my-img__x.y:cctl-local-000001",
+            "a--b",
+            "sha256:" + "a" * 64,  # an image ID, as the listings and inspect give it
+            "0123456789ab",  # a short one
+        ]
+        for ref in good:
+            self.assertTrue(is_valid_image_ref(ref), ref)
+
+    def test_rejects_what_docker_has_no_image_under(self):
+        # docker's own grammar (distribution/reference): path components are never empty and begin and end with
+        # a letter or digit, so none of these is a ref, and none reaches an argv or the path of an API URL
+        bad = [
+            "",
+            ".",
+            "..",
+            "../x",
+            "foo/../bar",
+            "foo/./bar",
+            "foo//bar",
+            "/foo",
+            "foo/",
+            "-foo",
+            ".foo",
+            "foo/.bar",
+            "foo/-bar",
+            "foo/bar-",
+            "foo..bar",
+            "foo:",
+            "foo:-tag",
+            "foo:.tag",
+            "foo:a:b:c",
+            "foo:" + "t" * 129,
+            "foo@",
+            "foo@sha256",
+            "foo@sha256:xyz",
+            "foo@sha256:" + "a" * 64 + "@sha256:" + "a" * 64,
+            "@sha256:" + "a" * 64,
+            "foo/Bar",  # a repository is lowercase; only a registry host or a tag has capitals
+            "foo\n",
+        ]
+        for ref in bad:
+            self.assertFalse(is_valid_image_ref(ref), ref)
+
 
 class IsValidPortSpecTests(unittest.TestCase):
     def test_accepts_docker_publish_forms(self):

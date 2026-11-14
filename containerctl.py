@@ -4,6 +4,70 @@ containerctl - KISS containers CLI/TUI manager
 MIT License - Copyright (c) 2026 c4ffein
 WARNING: I don't recommend using this as-is. This is a PoC, and usable by me because I know what I want to do with it.
 - You can use it if you feel that you can edit the code yourself and you can live with my future breaking changes.
+
+The classes, by what they are for (tests/test_map.py keeps these tables honest: every class, once, aligned)
+
+Errors and issues
+┌────────────────────────┬───────────────────────────────────────────────────────────────────────────────────┐
+│ Event                  │ one line of the error log: something that failed once                             │
+│ Issue                  │ something true right now that wants an action; detected, never stored             │
+│ ConfigError            │ a config file that can't be used; raised by the parsers, becomes an Issue         │
+└────────────────────────┴───────────────────────────────────────────────────────────────────────────────────┘
+
+What docker says
+┌────────────────────────┬───────────────────────────────────────────────────────────────────────────────────┐
+│ DockerRow              │ base of a listing row: a dataclass whose KEY field is safe to hand back to docker │
+│ DockerContainerRow     │ a row of `docker ps`                                                              │
+│ DockerImageRow         │ a row of `docker images`                                                          │
+│ DockerVolumeRow        │ a row of `docker volume ls`                                                       │
+│ DockerNetworkRow       │ a row of `docker network ls`                                                      │
+│ Listing                │ what a listing came back with: its rows, its failure, the lines it skipped        │
+│ DockerInspected        │ base of one inspected object, and where the engine API has it                     │
+│ DockerContainerInspect │ one container, as inspect shows it                                                │
+│ DockerImageInspect     │ one image, as inspect shows it                                                    │
+│ DockerVolumeInspect    │ one volume, as inspect shows it                                                   │
+│ DockerNetworkInspect   │ one network, as inspect shows it                                                  │
+│ Failure                │ why a docker call failed: message and hint in our words, raw detail for the log   │
+│ DockerError            │ raised when docker could not say: not knowing is neither yes nor no               │
+└────────────────────────┴───────────────────────────────────────────────────────────────────────────────────┘
+
+Config: what should exist (TOML)
+┌────────────────────────┬───────────────────────────────────────────────────────────────────────────────────┐
+│ ProjectConfig          │ a project file: image, user, ssh key, repos, env, shortcuts                       │
+│ RepoSpec               │ one git repo to clone into a project's workspace                                  │
+│ EnvFile                │ one host file to copy into a project's container                                  │
+│ ServiceConfig          │ a service file: `docker run` written down, plus its scripts                       │
+│ ImageRecipeConfig      │ a Dockerfile beside a TOML; hashes itself, builds itself                          │
+└────────────────────────┴───────────────────────────────────────────────────────────────────────────────────┘
+
+Check: is it safe to destroy?
+┌────────────────────────┬───────────────────────────────────────────────────────────────────────────────────┐
+│ RepoStatus             │ how clean one directory of a workspace is                                         │
+│ WorkspaceReport        │ a whole workspace against the repos its project expects                           │
+│ DestroyQuestion        │ what `destroy` would remove and what to know first, for CLI and TUI alike         │
+└────────────────────────┴───────────────────────────────────────────────────────────────────────────────────┘
+
+Docker: asking and doing
+┌────────────────────────┬───────────────────────────────────────────────────────────────────────────────────┐
+│ UnixHTTPConnection     │ HTTP over a unix socket: how the daemon is asked its questions                    │
+│ Docker                 │ the CLI for actions, the socket for questions; knows no project or service        │
+│ Projects               │ a project's container: found, spawned, entered, destroyed                         │
+│ Services               │ a service's container: found, created, brought up and down                        │
+│ Source                 │ who made a container, as far as we can tell (compose, systemd, ...)               │
+│ ImageRecipeState       │ what docker alone knows of a recipe: its versions, built or stale                 │
+└────────────────────────┴───────────────────────────────────────────────────────────────────────────────────┘
+
+TUI
+┌────────────────────────┬───────────────────────────────────────────────────────────────────────────────────┐
+│ Term                   │ the terminal: ANSI codes, raw mode, one key per read                              │
+│ Screen                 │ a frame built in memory and flushed once                                          │
+│ DataFetcher            │ the background thread that refreshes everything every 2s                          │
+│ ProjectRow             │ a line of the Projects tab                                                        │
+│ ServiceRow             │ a line of the Services tab                                                        │
+│ Tab                    │ a tab: its columns, and what identifies a row                                     │
+│ UI                     │ what is drawn: tabs, table, status bar, boxes, prompts                            │
+│ App                    │ the TUI itself: selection, keys, actions, main loop                               │
+└────────────────────────┴───────────────────────────────────────────────────────────────────────────────────┘
 """
 
 import argparse
@@ -13,11 +77,13 @@ import dataclasses
 import datetime
 import difflib
 import hashlib
+import http.client
 import json
 import os
 import select
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -28,10 +94,11 @@ import threading
 import time
 import tomllib
 import tty
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 # Heuristics: guesses, kept here where they are easy to find and change.
 # Seconds a container may stay under its spawning name (see SPAWNING_PREFIX) before the Issues tab warns about it.
@@ -139,7 +206,6 @@ def log_issues(issues: list[Issue]) -> None:
 # =============================================================================
 
 VALID_ID_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
-VALID_IMAGE_REF_CHARS = VALID_ID_CHARS + "/:.@"  # repo/name:tag, registry.domain, name@sha256:<digest>
 VALID_PATH_CHARS = VALID_ID_CHARS + "/:.~+ "  # Paths can have slashes, dots, tildes, etc.
 VALID_REPO_URL_CHARS = VALID_ID_CHARS + "/:@."  # Git URLs: git@github.com:user/repo.git or https://...
 VALID_PORT_PROTOCOLS = {"tcp", "udp"}
@@ -151,10 +217,56 @@ def is_valid_id(id_str: str) -> bool:
     return bool(id_str) and id_str[0] not in "-." and all(c in VALID_ID_CHARS or c == "." for c in id_str)
 
 
+LOWER_ALNUM = "abcdefghijklmnopqrstuvwxyz0123456789"
+ALNUM = LOWER_ALNUM + "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+HEX = "0123456789abcdefABCDEF"
+
+
+def _edged(text: str, edges: str, inside: str) -> bool:
+    """Not empty, begins and ends with one of `edges`, and has nothing but those and `inside` in between"""
+    return bool(text) and text[0] in edges and text[-1] in edges and all(c in edges + inside for c in text)
+
+
+def _is_ref_path_part(part: str) -> bool:
+    """One component of an image's path: lowercase letters and digits, in runs joined by `.`, `_`, `__` or dashes"""
+    if not _edged(part, LOWER_ALNUM, "._-"):
+        return False
+    joints = "".join(c if c in "._-" else " " for c in part).split()
+    return all(joint in (".", "_", "__") or set(joint) == {"-"} for joint in joints)
+
+
+def _is_ref_host(part: str) -> bool:
+    """A registry, as the first component of a ref: host[:port] (no IPv6 one: add it the day one is used)"""
+    host, colon, port = part.partition(":")
+    return _edged(host, ALNUM, ".-") and (not colon or (port != "" and all(c in "0123456789" for c in port)))
+
+
+def _is_ref_digest(digest: str) -> bool:
+    """algorithm:hex, as in sha256:<64 of them>; the algorithm is words (a letter first) joined by one of `-_+.`"""
+    algorithm, _, value = digest.partition(":")
+    for joint in "-_+":
+        algorithm = algorithm.replace(joint, ".")
+    words = algorithm.split(".")
+    return all(_edged(word, ALNUM, "") and word[0] not in "0123456789" for word in words) and (
+        len(value) >= 32 and all(c in HEX for c in value)
+    )
+
+
 def is_valid_image_ref(ref_str: str) -> bool:
-    """Check if image reference contains only valid characters (allows /, :, . for repo:tag); like is_valid_id,
-    never empty and never starting with `-` or `.`"""
-    return bool(ref_str) and ref_str[0] not in "-." and all(c in VALID_IMAGE_REF_CHARS for c in ref_str)
+    """Whether docker could have an image under that, by docker's own grammar (distribution/reference):
+    [host[:port]/]path[:tag][@digest]. A path is lowercase components, each beginning and ending with a letter or
+    digit, so never empty, `.` or `..`. An image ID is one too, as far as this goes (`sha256:<hex>`, a short hex
+    one). What is not a ref never reaches an argv, where a leading `-` would be read as an option, nor a URL path
+    (see Docker._object), where an empty, `.` or `..` component is a different path."""
+    named, at, digest = ref_str.partition("@")
+    if at and not _is_ref_digest(digest):
+        return False
+    *parents, last = named.split("/")
+    last, colon, tag = last.partition(":")  # a `:` before the last `/` is a port's
+    if colon and not (len(tag) <= 128 and _edged(tag[:1], ALNUM + "_", "") and all(c in ALNUM + "_.-" for c in tag)):
+        return False
+    first_is_host = bool(parents) and _is_ref_host(parents[0])
+    return all(_is_ref_path_part(part) for part in [*parents[first_is_host:], last])
 
 
 def has_path_traversal(path_str: str) -> bool:
@@ -231,7 +343,7 @@ def deserialize(cls, data):
     return cls(**given)
 
 
-class Row:
+class DockerRow:
     """A row of a docker listing: a dataclass, deserialized as one, whose KEY field (what we hand back to docker
     to name it) must be a safe identifier"""
 
@@ -248,7 +360,7 @@ class Row:
 
 
 @dataclass
-class Container(Row):
+class DockerContainerRow(DockerRow):
     """Docker container data model"""
 
     ID: str
@@ -274,7 +386,7 @@ class Container(Row):
 
 
 @dataclass
-class Image(Row):
+class DockerImageRow(DockerRow):
     """Docker image data model"""
 
     ID: str
@@ -291,7 +403,7 @@ class Image(Row):
 
 
 @dataclass
-class Volume(Row):
+class DockerVolumeRow(DockerRow):
     """Docker volume data model"""
 
     KEY = "Name"
@@ -309,7 +421,7 @@ class Volume(Row):
 
 
 @dataclass
-class Network(Row):
+class DockerNetworkRow(DockerRow):
     """Docker network data model"""
 
     ID: str
@@ -343,22 +455,33 @@ NO_ANSWER = "containerctl: no answer after"  # what _run puts on stderr for a ca
 # What a failed docker call says on stderr (lowercased substring) -> what we say, and what to do about it. First
 # match wins: the socket's "permission denied" also mentions connecting to the daemon. Anything else shows as
 # UNKNOWN_DOCKER_FAILURE with the raw stderr in the issue's details: read it there, then add its line here.
+DENIED = ("No permission on the docker socket", "add yourself to the docker group")
+DAEMON_DOWN = ("Docker daemon is not running", "start docker")
+DAEMON_SILENT = ("Docker did not answer in time", "is the daemon hung? look at `systemctl status docker`")
 DOCKER_FAILURES = [
     ("command not found", "docker is not installed", "install docker, or fix PATH"),
-    ("permission denied", "No permission on the docker socket", "add yourself to the docker group"),
-    ("cannot connect to the docker daemon", "Docker daemon is not running", "start docker"),
+    ("permission denied", *DENIED),
+    ("cannot connect to the docker daemon", *DAEMON_DOWN),
+    ("failed to connect to the docker api", *DAEMON_DOWN),  # the same, as newer clients say it
+    ("error during connect", "Docker daemon is not reachable", "start docker (or is DOCKER_HOST right?)"),
     ("is not running", "Container is not running", "start it, then try again"),
-    (NO_ANSWER, "Docker did not answer in time", "is the daemon hung? look at `systemctl status docker`"),
+    (NO_ANSWER, *DAEMON_SILENT),
 ]
 UNKNOWN_DOCKER_FAILURE = ("Unknown docker failure", "its details have what docker said")
+UNREADABLE_ANSWER = ("Docker answered something we could not read", "the Issues tab has what it was")
 # `docker exec` also hands over the stderr of what it ran, and an `ls: Permission denied` in there is not the
 # socket's. What docker itself says (client or daemon; lowercased substrings), when the call is an exec: anything
 # else is the command's own, and docker_failure says it as that (see `inside`).
-DOCKER_VOICE = ("error response from daemon", "docker daemon", "docker: command not found", NO_ANSWER)
-# How docker says "there is no such thing" (lowercased substrings: "No such image: x", "network x not found"), the
-# one failure of a "does it exist?" call that is an answer: see Docker._absent. A wording missing here is not read
-# as "absent" but as an unknown failure, raw stderr in its details: add it then.
-NO_SUCH = ("no such", "not found")
+DOCKER_VOICE = (
+    "error response from daemon",
+    "docker daemon",
+    "docker api",
+    "error during connect",
+    "docker: command not found",
+    NO_ANSWER,
+)
+# None of this is how "does it exist?" is answered: a sentence on stderr can't tell "no such image" from a socket
+# that isn't there ("...: no such file or directory"). Those questions go to the daemon itself: see Docker._api.
 
 
 @dataclass(frozen=True)
@@ -426,13 +549,14 @@ LISTINGS = ("containers", "images", "volumes", "networks")  # the four docker li
 # =============================================================================
 
 
-class Inspected(Row):
-    """What `docker inspect` says of one object: a Row (a dataclass whose KEY field must pass VALID), of which
+class DockerInspected(DockerRow):
+    """What `docker inspect` says of one object: a DockerRow (a dataclass whose KEY field must pass VALID), of which
     there is one, not a listing. So one we can't use is not skipped but None, after logging under CAT.
-    Docker.inspect fetches one: `Docker.inspect(NetworkInspect, name)`."""
+    Docker.inspect fetches one: `Docker.inspect(DockerNetworkInspect, name)`."""
 
     KEY = "Id"
-    TYPE = ""  # what `docker inspect --type` calls it
+    TYPE = ""  # what docker calls it
+    API = ""  # where the engine API has one: its path, `{}` the name or ID
     CAT = ""
 
     @classmethod
@@ -445,10 +569,11 @@ class Inspected(Row):
 
 
 @dataclass
-class ContainerInspect(Inspected):
+class DockerContainerInspect(DockerInspected):
     """Docker container inspect data model (from docker inspect)"""
 
     TYPE = "container"
+    API = "/containers/{}/json"
     CAT = "docker.container_inspect_parse"
 
     Id: str
@@ -487,10 +612,11 @@ class ContainerInspect(Inspected):
 
 
 @dataclass
-class ImageInspect(Inspected):
+class DockerImageInspect(DockerInspected):
     """Docker image inspect data model (from docker image inspect)"""
 
     TYPE = "image"
+    API = "/images/{}/json"
     CAT = "docker.image_inspect_parse"
     VALID = staticmethod(is_valid_image_ref)  # sha256:<digest>
 
@@ -512,11 +638,12 @@ class ImageInspect(Inspected):
 
 
 @dataclass
-class VolumeInspect(Inspected):
+class DockerVolumeInspect(DockerInspected):
     """Docker volume inspect data model (from docker volume inspect)"""
 
     KEY = "Name"
     TYPE = "volume"
+    API = "/volumes/{}"
     CAT = "docker.volume_inspect_parse"
 
     Name: str
@@ -529,10 +656,11 @@ class VolumeInspect(Inspected):
 
 
 @dataclass
-class NetworkInspect(Inspected):
+class DockerNetworkInspect(DockerInspected):
     """Docker network inspect data model (from docker network inspect)"""
 
     TYPE = "network"
+    API = "/networks/{}"
     CAT = "docker.network_inspect_parse"
 
     Id: str
@@ -658,6 +786,33 @@ def parse_secrets_table(raw, path: Path) -> dict[str, str]:
     return _parse_name_table(raw, path, "secrets", is_valid_env_name)
 
 
+VALID_VOLUME_SUFFIX = {"ro", "rw"}
+
+
+def parse_volumes(raw, path: Path, cat: str) -> list[str]:
+    """`volumes = ["host:container[:ro|rw]", ...]` of a project or a service, as `docker run -v` takes them, the
+    host side expanded (`~`). Host side: a path, or a name (a docker volume). Container side: an absolute path."""
+    if not isinstance(raw, list):
+        raise ConfigError(cat, f"Invalid 'volumes' (must be a list) in {path}")
+    volumes = []
+    for v in raw:
+        if not isinstance(v, str):
+            raise ConfigError(cat, f"Invalid volume '{v}' in {path}")
+        # Split volume spec: host:container or host:container:mode
+        parts = v.split(":")
+        if len(parts) < 2 or len(parts) > 3:
+            raise ConfigError(cat, f"Invalid volume spec '{v}' in {path}")
+        host_path = str(Path(parts[0]).expanduser()) if parts[0] else ""
+        if not host_path or host_path.startswith("-") or not is_valid_path(host_path):
+            raise ConfigError(cat, f"Invalid volume host path '{parts[0]}' in {path}")
+        if not parts[1].startswith("/") or not is_valid_path(parts[1]):
+            raise ConfigError(cat, f"Invalid volume container path '{parts[1]}' (an absolute path) in {path}")
+        if len(parts) == 3 and parts[2] not in VALID_VOLUME_SUFFIX:
+            raise ConfigError(cat, f"Invalid volume mode '{parts[2]}' in {path}")
+        volumes.append(":".join([host_path, *parts[1:]]))  # rebuilt with the expanded host path
+    return volumes
+
+
 @dataclass
 class RepoSpec:
     """A single git repo to clone into a project's workspace"""
@@ -686,6 +841,7 @@ class ProjectConfig:
     shortcuts: dict[str, str] = field(default_factory=dict)  # alias -> dir relative to the workspace
     env: dict[str, str] = field(default_factory=dict)  # [env]: plain values for the `enter` shell's environment
     secrets: dict[str, str] = field(default_factory=dict)  # [secrets]: env name -> key in secrets.toml
+    volumes: list[str] = field(default_factory=list)  # host:container[:ro|rw], mounted at spawn: outlive the container
     user: str = CONTAINER_USER  # the image's user: owns what spawn puts in, runs the clones, checks and shell
     home: str = CONTAINER_HOME  # that user's home in the image: /home/<user> (/root for root) unless said
 
@@ -802,6 +958,9 @@ class ProjectConfig:
         if both := sorted(set(env) & set(secrets)):
             raise ConfigError("project.config", f"Names in both [env] and [secrets] in {path}: {', '.join(both)}")
 
+        # What outlives the container, or is shared with others: mounted at spawn, so an edit needs a respawn
+        volumes = parse_volumes(data.get("volumes", []), path, "project.config")
+
         # Who the image is built for, whatever its default USER: all we do in it is done as this user (see
         # CONTAINER_USER). To enter as someone else once: `enter <project> user=<user>`. Spawn fails on an image
         # that doesn't have this user and this home.
@@ -821,6 +980,7 @@ class ProjectConfig:
             shortcuts=shortcuts,
             env=env,
             secrets=secrets,
+            volumes=volumes,
             user=user,
             home=home.rstrip("/"),
         )
@@ -914,7 +1074,6 @@ def resolve_env(project: "ProjectConfig") -> dict[str, str]:
 
 
 VALID_RESTART_POLICIES = {"no", "always", "unless-stopped", "on-failure"}
-VALID_VOLUME_SUFFIX = {"ro", "rw"}
 VALID_TMPFS_OPTION_CHARS = VALID_ID_CHARS + ",="  # e.g. "rw,noexec,nosuid,size=64m,mode=1777,uid=1000"
 
 
@@ -989,22 +1148,7 @@ class ServiceConfig:
                 raise ConfigError("service.config", f"Invalid port spec '{p}' in {path}")
             ports.append(p)
 
-        volumes = []
-        for v in data.get("volumes", []):
-            if not isinstance(v, str):
-                raise ConfigError("service.config", f"Invalid volume '{v}' in {path}")
-            # Split volume spec: host:container or host:container:mode
-            parts = v.split(":")
-            if len(parts) < 2 or len(parts) > 3:
-                raise ConfigError("service.config", f"Invalid volume spec '{v}' in {path}")
-            host_path = str(Path(parts[0]).expanduser())
-            if not is_valid_path(host_path):
-                raise ConfigError("service.config", f"Invalid volume host path '{parts[0]}' in {path}")
-            if len(parts) == 3 and parts[2] not in VALID_VOLUME_SUFFIX:
-                raise ConfigError("service.config", f"Invalid volume mode '{parts[2]}' in {path}")
-            # Rebuild with expanded host path
-            expanded = f"{host_path}:{':'.join(parts[1:])}"
-            volumes.append(expanded)
+        volumes = parse_volumes(data.get("volumes", []), path, "service.config")
 
         env_list = []
         for e in data.get("env", []):
@@ -1108,7 +1252,7 @@ def normalize_image_ref(ref: str) -> str:
 
 
 @dataclass
-class ImageConfig:
+class ImageRecipeConfig:
     """An image recipe: `<name>.toml` + `<name>.Dockerfile`, with `<name>/` as the build context when it exists"""
 
     name: str
@@ -1132,6 +1276,23 @@ class ImageConfig:
     def has_context(self) -> bool:
         return self.context.is_dir()
 
+    def build(self) -> bool:
+        """Build the recipe as the next <repo>:cctl-local-NNNNNN and re-point the recipe tag at it (see
+        Docker.build_image). The context dir is sent when it exists."""
+        recipe = self.recipe_hash()
+        if recipe is None:
+            return False
+        # Fresh: another terminal may just have built one. DockerError when the listing failed: numbering from "no
+        # versions" would re-point cctl-local-000000 at this build.
+        versions, _, _ = local_versions(self, Docker.list_images().required())
+        version = self.version_tag(max(versions, default=-1) + 1)
+        labels = {LABEL_IMAGE: self.name, LABEL_RECIPE: recipe}
+        context = self.context if self.has_context else None
+        if not Docker.build_image([version, self.tag], labels, self.dockerfile, context):
+            return False
+        print(f"Built {version}, {self.tag} now points at it")
+        return True
+
     def recipe_hash(self) -> str | None:
         """sha256 over the Dockerfile and every context file, by sorted relative path. Stored as a label on the
         built image so `check` can tell a stale build from a current one. None (after logging) when unreadable."""
@@ -1154,7 +1315,7 @@ class ImageConfig:
         return digest.hexdigest()
 
     @classmethod
-    def from_toml(cls, path: Path) -> "ImageConfig":
+    def from_toml(cls, path: Path) -> "ImageRecipeConfig":
         """Parse an image recipe from a TOML file; the Dockerfile must exist beside it. ConfigError otherwise."""
         try:
             with open(path, "rb") as f:
@@ -1178,19 +1339,19 @@ class ImageConfig:
         return cls(name=name, dockerfile=dockerfile, context=path.with_suffix(""), tag=tag, upstream=upstream)
 
 
-def read_images() -> tuple[dict[str, ImageConfig], list[Issue]]:
+def read_image_recipes() -> tuple[dict[str, ImageRecipeConfig], list[Issue]]:
     """~/.config/containerctl/images/: the recipes, and what is wrong with the files that aren't one"""
-    return read_configs(IMAGES_DIR, ImageConfig.from_toml)
+    return read_configs(IMAGES_DIR, ImageRecipeConfig.from_toml)
 
 
-def load_images() -> dict[str, ImageConfig]:
+def load_image_recipes() -> dict[str, ImageRecipeConfig]:
     """The recipes, for a one-shot caller: broken files are logged"""
-    images, problems = read_images()
+    images, problems = read_image_recipes()
     log_issues(problems)
     return images
 
 
-def find_image_recipe(ref: str, images: dict[str, ImageConfig]) -> ImageConfig | None:
+def find_image_recipe(ref: str, images: dict[str, ImageRecipeConfig]) -> ImageRecipeConfig | None:
     """The recipe whose tag is a project's or service's `image`, if any"""
     want = normalize_image_ref(ref)
     return next((image for image in images.values() if image.tag == want), None)
@@ -1250,7 +1411,7 @@ def secrets_mode_issue() -> Issue | None:
     return None
 
 
-def local_versions(image: ImageConfig, rows: list[Image]) -> tuple[list[int], int | None, str | None]:
+def local_versions(image: ImageRecipeConfig, rows: list[DockerImageRow]) -> tuple[list[int], int | None, str | None]:
     """(versions, current, tag_id) from `docker images` rows: the repository's cctl-local-N builds, sorted; the one
     the recipe tag points at (None when it points elsewhere or nowhere); the image ID the recipe tag points at
     (None when the tag doesn't exist)"""
@@ -1265,7 +1426,9 @@ def local_versions(image: ImageConfig, rows: list[Image]) -> tuple[list[int], in
     return sorted(versions), current, tag_id
 
 
-def image_version_issue(name: str, image: ImageConfig, versions: list[int], current: int | None) -> Issue | None:
+def image_recipe_version_issue(
+    name: str, image: ImageRecipeConfig, versions: list[int], current: int | None
+) -> Issue | None:
     """Builds pile up: past IMAGE_VERSIONS_WARN local versions, name the ones that are safe to try removing"""
     if len(versions) <= IMAGE_VERSIONS_WARN:
         return None
@@ -1303,17 +1466,17 @@ def orphan_issues(names: list[str], projects: set[str], services: set[str]) -> l
     return issues
 
 
-def leftover_note(container: Container) -> str:
+def leftover_note(container: DockerContainerRow) -> str:
     """What a question says of a container still under its spawning name, before removing it"""
     return f"{container.Names} ({created_ago(container)}: a spawn still running, or one that died)"
 
 
-def created_ago(container: Container) -> str:
+def created_ago(container: DockerContainerRow) -> str:
     """ "created 3 minutes ago", in docker's own words (`RunningFor` is the time since creation, running or not)"""
     return f"created {container.RunningFor}" if container.RunningFor else "created at an unknown time"
 
 
-def container_age(container: Container) -> float | None:
+def container_age(container: DockerContainerRow) -> float | None:
     """Seconds since the container was created, from `docker ps`'s CreatedAt ("2026-11-11 12:27:03 +0100 CET");
     None when that is not a date we can read"""
     try:
@@ -1323,7 +1486,7 @@ def container_age(container: Container) -> float | None:
     return (datetime.datetime.now(datetime.timezone.utc) - created).total_seconds()
 
 
-def spawning_issues(containers: list[Container]) -> list[Issue]:
+def spawning_issues(containers: list[DockerContainerRow]) -> list[Issue]:
     """Containers still under their spawning name after SPAWN_WARN_AFTER seconds: a spawn that takes its time in
     another terminal (a big clone), one that is stuck, or one that died. Nothing here can tell which, and the
     message says so. Younger ones are a spawn doing its job: no warning. An age we can't read counts as old."""
@@ -1344,7 +1507,7 @@ def spawning_issues(containers: list[Container]) -> list[Issue]:
 def detect_issues(
     projects: dict[str, ProjectConfig],
     services: dict[str, "ServiceConfig"],
-    images: dict[str, ImageConfig],
+    images: dict[str, ImageRecipeConfig],
     listings: dict[str, Listing],
 ) -> list[Issue]:
     """Every issue detectable from loaded config and the docker listings the fetcher already holds. What a failed
@@ -1360,7 +1523,7 @@ def detect_issues(
     if not listings["images"].failure:
         for name, image in images.items():
             versions, current, _ = local_versions(image, listings["images"].rows)
-            if issue := image_version_issue(name, image, versions, current):
+            if issue := image_recipe_version_issue(name, image, versions, current):
                 issues.append(issue)
     if not listings["containers"].failure:
         rows = listings["containers"].rows
@@ -1720,7 +1883,7 @@ def destroy_question(project: "ProjectConfig") -> DestroyQuestion:
     """Look at what a project has (one `ps`), `check` the workspace of its container, and word the question: the
     verdict (DIRTY, or a check that could not run) is in it, and so is what an unfinished spawn left (never
     entered, so nothing to check, but it may be a spawn still running elsewhere)."""
-    container, leftover = Docker.project_containers(project)
+    container, leftover = Projects.containers(project)
     question = DestroyQuestion(names=[c.Names for c in (container, leftover) if c])
     what = []
     if container:
@@ -1811,14 +1974,14 @@ def install_self(
     host to ask.
 
     Makes ``containerctl check-local`` available on that user's PATH. False
-    when a copy failed (logged): that fails a spawn, `enter` goes on without.
+    when a copy, or a command around one (mkdir, chmod, chown), failed (logged):
+    that fails a spawn, `enter` goes on without.
 
     Runs on every `enter`, so it must only touch what it owns: directories are
     created as the user, and the three files `docker cp` writes (as root, always) are
     chowned by name, as root. Nothing recursive, nothing else in the home is affected.
     """
     self_path = Path(__file__).resolve()
-    ok = True
     bin_dir, config_dir = f"{home}/.local/bin", f"{home}/.config/containerctl"
     self_dest, manifest, injected_dest = (
         f"{bin_dir}/containerctl",
@@ -1826,10 +1989,19 @@ def install_self(
         f"{config_dir}/injected.json",
     )
 
-    Docker.exec_noninteractive(container, ["mkdir", "-p", bin_dir, config_dir], user=user)
+    def step(command: list[str], as_user: str) -> bool:
+        """One command in the container; a failed one is logged with what it said, and makes the install a failed one"""
+        result = Docker.exec_noninteractive(container, command, user=as_user)
+        if result.returncode != 0:
+            said = (result.stderr or "").strip() or f"exit code {result.returncode}"
+            log_error("install_self.step", f"`{' '.join(command)}` as {as_user} in {container}: {said}")
+        return result.returncode == 0
+
+    if not step(["mkdir", "-p", bin_dir, config_dir], user):  # nowhere to copy to
+        return False
     if not Docker.cp(str(self_path), container, self_dest):
         return False
-    Docker.exec_noninteractive(container, ["chmod", "+x", self_dest], user=ROOT)
+    ok = step(["chmod", "+x", self_dest], ROOT)
 
     # Write each to a temp file, whole, then copy it in.
     for content, dest in ((expected, manifest), (injected or {}, injected_dest)):
@@ -1844,7 +2016,7 @@ def install_self(
             os.unlink(tmp.name)
 
     # "user:" = its own group
-    Docker.exec_noninteractive(container, ["chown", f"{user}:", self_dest, manifest, injected_dest], user=ROOT)
+    ok = step(["chown", f"{user}:", self_dest, manifest, injected_dest], ROOT) and ok
     # Ensure ~/.local/bin is on PATH for future interactive shells (idempotent, as the user so a
     # missing .bashrc is created with the right owner).
     # Shell required here: the conditional append (`grep -qs ... || echo ... >>`) has
@@ -1873,7 +2045,6 @@ class Term:
     """ANSI escape code utilities for terminal manipulation"""
 
     # Screen control
-    CLEAR = "\033[2J\033[H"
     RESET = "\033[0m"
     BOLD = "\033[1m"
     DIM = "\033[2m"
@@ -1885,38 +2056,10 @@ class Term:
     CLEAR_LINE = "\033[2K"
 
     # Colors
-    BLACK = "\033[30m"
     RED = "\033[31m"
     GREEN = "\033[32m"
     YELLOW = "\033[33m"
-    BLUE = "\033[34m"
-    MAGENTA = "\033[35m"
     CYAN = "\033[36m"
-    WHITE = "\033[37m"
-    GRAY = "\033[90m"
-
-    # Background colors
-    BG_BLACK = "\033[40m"
-    BG_RED = "\033[41m"
-    BG_GREEN = "\033[42m"
-    BG_YELLOW = "\033[43m"
-    BG_BLUE = "\033[44m"
-    BG_MAGENTA = "\033[45m"
-    BG_CYAN = "\033[46m"
-    BG_WHITE = "\033[47m"
-
-    # Box drawing characters
-    BOX_H = "─"
-    BOX_V = "│"
-    BOX_TL = "┌"
-    BOX_TR = "┐"
-    BOX_BL = "└"
-    BOX_BR = "┘"
-    BOX_T = "┬"
-    BOX_B = "┴"
-    BOX_L = "├"
-    BOX_R = "┤"
-    BOX_X = "┼"
 
     # Key codes
     KEY_UP = "\x1b[A"
@@ -1924,37 +2067,18 @@ class Term:
     KEY_RIGHT = "\x1b[C"
     KEY_LEFT = "\x1b[D"
     KEY_ENTER = "\r"
-    _cooked: list | None = None  # the terminal's own settings while we hold it raw: see raw_on
     KEY_ESC = "\x1b"
     KEY_TAB = "\t"
-    KEY_BACKSPACE = "\x7f"
+    KEY_MAX_BYTES = 32  # where getch stops waiting for the end of an escape sequence that has none
+
+    _cooked: list | None = None  # the terminal's own settings while we hold it raw: see raw_on
+    _ahead: bytes = b""  # bytes read past the end of a key, the start of the next one: see getch
 
     @staticmethod
     def size() -> tuple[int, int]:
         """Get terminal size (rows, cols)"""
         cols, rows = os.get_terminal_size()
         return rows, cols
-
-    @staticmethod
-    def move(row: int, col: int) -> None:
-        """Move cursor to position (1-indexed)"""
-        print(f"\033[{row};{col}H", end="", flush=True)
-
-    @staticmethod
-    def clear() -> None:
-        """Clear screen and move cursor to top-left"""
-        print("\033[2J\033[H", end="", flush=True)
-
-    @staticmethod
-    def write(text: str) -> None:
-        """Write text at current cursor position"""
-        print(text, end="", flush=True)
-
-    @staticmethod
-    def writeln(row: int, col: int, text: str) -> None:
-        """Write text at specific position"""
-        Term.move(row, col)
-        Term.write(text)
 
     @staticmethod
     def raw_on() -> None:
@@ -1990,6 +2114,10 @@ class Term:
         """Read single keypress; with a `timeout` (seconds), "" when none came in time. Inside a raw_on session
         the mode is left alone; outside one, it is raw for this read only.
 
+        One key is one string, however many bytes the terminal sends for it: a whole escape sequence (Ctrl-Up is
+        `ESC [ 1 ; 5 A`, F5 `ESC [ 1 5 ~`), a whole UTF-8 character. A key nobody handles is then ignored as one
+        thing; cut short, its tail would be read as keys of its own, and that `5` is a tab.
+
         Bytes are read off the fd itself, never through sys.stdin: its buffer takes every byte that is there on
         the first read, and select, which only sees the fd, then reports nothing left while the rest of an arrow
         key or of a burst sits in Python."""
@@ -1999,21 +2127,61 @@ class Term:
             Term.raw_on()
 
         def ready(seconds: float) -> bool:
-            return bool(select.select([fd], [], [], seconds)[0])
+            return bool(Term._ahead) or bool(select.select([fd], [], [], seconds)[0])
 
-        def read() -> str:
-            return os.read(fd, 1).decode(errors="replace")
+        def read() -> bytes:
+            byte, Term._ahead = Term._ahead[:1], Term._ahead[1:]
+            return byte or os.read(fd, 1)
+
+        def more(key: bytes) -> bytes:
+            """`key` and the next byte of it, when one follows at once: the rest of a key is sent with its start"""
+            return key + read() if ready(0.1) else key
+
+        def character(key: bytes) -> bytes:
+            """`key`, whose last byte is a UTF-8 lead byte, and the rest of that character: 1 to 3 more bytes,
+            by its high bits"""
+            lead = key[-1]
+            for _ in range(1 + (lead >= 0xE0) + (lead >= 0xF0)):
+                longer = more(key)
+                if longer == key:  # nothing follows: no later byte is the rest of this one
+                    break
+                if not 0x80 <= longer[-1] < 0xC0:
+                    # Not a continuation byte: the lead was no UTF-8 (a Latin-1 terminal, noise), and this
+                    # is the next key, not to be swallowed with it
+                    Term._ahead = longer[-1:] + Term._ahead
+                    break
+                key = longer
+            return key
 
         try:
             if timeout is not None and not ready(timeout):
                 return ""
-            ch = read()
-            # Handle escape sequences: the rest follows at once, a lone Esc is followed by nothing
-            if ch == "\x1b" and ready(0.1):
-                ch += read()
-                if ch[-1] == "[" and ready(0.1):
-                    ch += read()
-            return ch
+            key = read()
+            if key == b"\x1b":  # a lone Esc is followed by nothing
+                key = more(key)
+                if key == b"\x1b\x1b":  # Alt, as some terminals send it (rxvt): an Esc, then the key's own sequence
+                    key = more(key)
+                start = max(0, len(key) - 2)  # of the sequence itself: 1 after that Esc of Alt
+                if key[start:] == b"\x1b[":  # CSI: parameters, then one final byte in @..~
+                    # `ESC [ [` is not an end: the Linux console's F1-F5 are `ESC [ [ A`..`E`
+                    while len(key) < Term.KEY_MAX_BYTES and (
+                        len(key) == start + 2 or key[start:] == b"\x1b[[" or not 0x40 <= key[-1] <= 0x7E
+                    ):
+                        longer = more(key)
+                        if longer == key:
+                            break
+                        key = longer
+                elif key[start:] == b"\x1bO":  # SS3: one byte follows (Home, End, F1-F4 on some terminals)
+                    key = more(key)
+                elif key[-1] >= 0xC0:  # Alt and a non-ASCII character
+                    key = character(key)
+                if key[:2] == b"\x1b\x1b" and key[2:3] not in (b"[", b"O"):
+                    # No sequence behind them: that was no Alt but Esc twice (typed fast, held), and the second
+                    # one starts the next key
+                    key, Term._ahead = key[:1], key[1:] + Term._ahead
+            elif key and key[0] >= 0xC0:
+                key = character(key)
+            return key.decode(errors="replace")
         finally:
             if ours:
                 Term.raw_off()
@@ -2063,11 +2231,41 @@ class Screen:
 # =============================================================================
 
 
+class UnixHTTPConnection(http.client.HTTPConnection):
+    """HTTP over a unix socket: the docker daemon's own door (see Docker._api)"""
+
+    def __init__(self, path: str, timeout: float):
+        super().__init__("localhost", timeout=timeout)
+        self.path = path
+        self.opened: socket.socket | None = None  # `sock`, kept: http.client lets go of its own (see Docker._api)
+
+    def connect(self) -> None:
+        self.sock = self.opened = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.path)
+
+
+def api_failure(path: str, where: str, error: Exception) -> Failure:
+    """Our words for an engine API call that got no answer, from the kind of error it was"""
+    if isinstance(error, PermissionError):
+        verdict = DENIED
+    elif isinstance(error, (FileNotFoundError, ConnectionRefusedError)):  # no socket there, or nobody behind it
+        verdict = DAEMON_DOWN
+    elif isinstance(error, TimeoutError):
+        verdict = DAEMON_SILENT
+    else:
+        verdict = UNKNOWN_DOCKER_FAILURE
+    return Failure(*verdict, f"GET {path} on {where}: {error!r}")
+
+
 REFUSED = 2  # exit code of a call we never made: an argument failed validation (what, is in the log)
 
 
 class Docker:
-    """Docker CLI wrapper using subprocess"""
+    """Docker itself: its CLI through subprocess, its socket for the questions (see _api). Names and refs in,
+    answers out: it knows no project, service or recipe. What a project or a service needs of it is Projects and
+    Services; a recipe builds itself (ImageRecipeConfig.build), and ensure_image gets what a `docker run` is about to
+    need."""
 
     @staticmethod
     def _run(
@@ -2139,18 +2337,102 @@ class Docker:
             except OSError:  # already gone
                 pass
 
+    # Questions ("is there such a thing?", "what is it?") go to the daemon on its socket, not through the CLI: the
+    # engine API answers 200 or 404, where the CLI has one exit code for everything and a sentence on stderr to
+    # guess from. Everything else stays with the CLI (run, exec, build, logs: what it is good at).
+    DEFAULT_SOCKET = "unix:///var/run/docker.sock"
+    # What the CLI said its context's endpoint is: asked once, kept for the life of the process (see _socket)
+    _endpoint: str | None = None
+
     @staticmethod
-    def _absent(args: list[str], result: subprocess.CompletedProcess) -> bool:
-        """For a call asking "does it exist?": False when it does, True when docker said there is no such thing,
-        DockerError for any other failure (no answer in time, daemon down, ...). Not knowing is neither yes nor
-        no, and a caller that read it as "no" would create, pull or report over something that is there."""
-        if result.returncode == 0:
-            return False
-        failure, text = docker_failure(args, result), (result.stderr or "").lower()
-        # A failure we know first: "docker: command not found" is not docker saying the image was not found
-        if failure.msg == UNKNOWN_DOCKER_FAILURE[0] and any(words in text for words in NO_SUCH):
-            return True
-        raise DockerError(failure)
+    def _socket() -> str:
+        """The path of the unix socket the docker CLI itself would talk to: both must ask the same daemon, or an
+        image "not there" on one is run on the other. DOCKER_HOST when set, as for the CLI; otherwise the CLI
+        says where its current context points (rootless, Docker Desktop: not /var/run/docker.sock). DockerError
+        when that is not a unix socket (tcp://, ssh://): we then have no way to ask.
+
+        The CLI's answer is kept for the life of the process, and every docker command we run reads the context
+        anew. So a `docker context use` (or `update`) in another terminal is not followed by a containerctl that
+        is already up: its commands and listings go to the new daemon, its questions to the one it started on
+        (an `o` saying "gone", an image or network wrongly found there or not). Nothing is removed by it; start
+        containerctl again. Not watched for on purpose: add it the day it bites."""
+        # DOCKER_HOST first, DOCKER_CONTEXT set or not: docker's CLI reference says the context overrides it, the
+        # CLI does the opposite (resolveContextName in docker/cli; seen on a real client, both set: it dialed
+        # DOCKER_HOST's socket and `context inspect` said "default")
+        endpoint = os.environ.get("DOCKER_HOST") or Docker._endpoint
+        if not endpoint:
+            args = ["context", "inspect", "--format", "{{.Endpoints.docker.Host}}"]
+            result = Docker._run(args, timeout=QUERY_TIMEOUT)
+            if result.returncode != 0:
+                raise DockerError(docker_failure(args, result))
+            endpoint = Docker._endpoint = result.stdout.strip() or Docker.DEFAULT_SOCKET
+        if not endpoint.startswith("unix://"):
+            hint = "containerctl asks docker its questions on a unix socket: point DOCKER_HOST or the context at one"
+            raise DockerError(Failure("Docker is not on a unix socket", hint, f"docker endpoint: {endpoint}"))
+        return endpoint.removeprefix("unix://")
+
+    @staticmethod
+    def _api(path: str, timeout: float = QUERY_TIMEOUT) -> tuple[int, str]:
+        """GET `path` on the engine API: the HTTP status and the body, whatever they are. DockerError when there
+        was no answer to read (no socket, nobody behind it, no permission, not in time): by what the OS said of
+        the connection, not by anybody's wording.
+
+        `timeout` is for the whole answer, as _run's is for the whole command. A socket's own is not: it is for
+        each read, and starts over at every byte that comes, so an answer that trickles in is waited for without
+        end. Hence the timer, which hangs up when the time is over: the read under way then ends at once.
+
+        No version in the path: the daemon then answers as its own current version, so there is none of ours to
+        fall out of the range a newer daemon still serves."""
+        where = Docker._socket()
+        connection = UnixHTTPConnection(where, timeout)
+        late = threading.Event()
+
+        def hang_up() -> None:
+            late.set()
+            # Not `connection.sock`: that is None as soon as an answer saying "Connection: close" has its headers
+            # read, and the body is still to come
+            try:
+                connection.opened.shutdown(socket.SHUT_RDWR)
+            except (OSError, AttributeError):  # not connected yet (its own timeout has that), or closed already
+                pass
+
+        timer = threading.Timer(timeout, hang_up)
+        timer.daemon = True
+        timer.start()
+        try:
+            connection.request("GET", path)
+            response = connection.getresponse()
+            body = response.read()
+            if late.is_set():  # a body with no length said ends where we hung up, and no error says it was cut
+                raise TimeoutError
+            return response.status, body.decode(errors="replace")
+        except (OSError, http.client.HTTPException) as e:
+            # Whatever the read we cut short raised, the time being over is why
+            error = TimeoutError(f"no whole answer after {timeout}s") if late.is_set() else e
+            raise DockerError(api_failure(path, where, error)) from None
+        finally:
+            timer.cancel()
+            connection.close()
+
+    @staticmethod
+    def _object(kind: type[DockerInspected], ref: str) -> dict | None:
+        """What the daemon has under `ref` for this kind (see DockerInspected.API); None when it says there is no such
+        thing (404). DockerError for anything else: not knowing is neither yes nor no, and a caller that read it
+        as "no" would create, pull or report over something that is there."""
+        if not kind.VALID(ref):  # here too, whoever calls: the ref is about to be part of a path
+            raise DockerError(Failure("Not a name docker has anything under", "", f"refused {kind.TYPE}: {ref!r}"))
+        path = kind.API.format(urllib.parse.quote(ref, safe="/:@"))
+        status, body = Docker._api(path)
+        if status == 404:
+            return None
+        try:
+            data = json.loads(body) if status == 200 else None
+        except ValueError:
+            data = None
+        if not isinstance(data, dict):
+            detail = f"GET {path}: HTTP {status}: {body.strip()[:200]}"
+            raise DockerError(Failure(*UNKNOWN_DOCKER_FAILURE, detail))
+        return data
 
     @staticmethod
     def _stream(args: list[str], env: dict[str, str] | None = None) -> int:
@@ -2198,19 +2480,19 @@ class Docker:
             args.insert(1, "-a")
         if not include_size:
             args.insert(1, "--size=false")
-        return Docker._list(args, Container.from_dict, SIZE_TIMEOUT if include_size else timeout)
+        return Docker._list(args, DockerContainerRow.from_dict, SIZE_TIMEOUT if include_size else timeout)
 
     @staticmethod
     def list_images(timeout: float = QUERY_TIMEOUT) -> Listing:
-        return Docker._list(["images", "--format", "{{json .}}"], Image.from_dict, timeout)
+        return Docker._list(["images", "--format", "{{json .}}"], DockerImageRow.from_dict, timeout)
 
     @staticmethod
     def list_volumes(timeout: float = QUERY_TIMEOUT) -> Listing:
-        return Docker._list(["volume", "ls", "--format", "{{json .}}"], Volume.from_dict, timeout)
+        return Docker._list(["volume", "ls", "--format", "{{json .}}"], DockerVolumeRow.from_dict, timeout)
 
     @staticmethod
     def list_networks(timeout: float = QUERY_TIMEOUT) -> Listing:
-        return Docker._list(["network", "ls", "--format", "{{json .}}"], Network.from_dict, timeout)
+        return Docker._list(["network", "ls", "--format", "{{json .}}"], DockerNetworkRow.from_dict, timeout)
 
     @staticmethod
     def listings(timeout: float = QUERY_TIMEOUT) -> dict[str, Listing]:
@@ -2224,55 +2506,40 @@ class Docker:
         }
 
     @staticmethod
-    def start(container_id: str) -> bool:
-        """Start a container"""
-        if not is_valid_id(container_id):
-            log_error("docker.invalid_id", f"Invalid container ID: {container_id}")
+    def _act(verb: list[str], ref: str, what: str = "container ID", valid: Callable[[str], bool] = is_valid_id) -> bool:
+        """One docker command on one named thing; refused, and logged, when the name isn't one"""
+        if not valid(ref):
+            log_error("docker.invalid_id", f"Invalid {what}: {ref}")
             return False
-        result = Docker._run(["start", container_id])
-        return result.returncode == 0
+        return Docker._run([*verb, ref]).returncode == 0
+
+    @staticmethod
+    def start(container_id: str) -> bool:
+        return Docker._act(["start"], container_id)
 
     @staticmethod
     def stop(container_id: str) -> bool:
-        """Stop a container"""
-        if not is_valid_id(container_id):
-            log_error("docker.invalid_id", f"Invalid container ID: {container_id}")
-            return False
-        result = Docker._run(["stop", container_id])
-        return result.returncode == 0
+        return Docker._act(["stop"], container_id)
 
     @staticmethod
     def restart(container_id: str) -> bool:
-        """Restart a container"""
-        if not is_valid_id(container_id):
-            log_error("docker.invalid_id", f"Invalid container ID: {container_id}")
-            return False
-        result = Docker._run(["restart", container_id])
-        return result.returncode == 0
+        return Docker._act(["restart"], container_id)
 
     @staticmethod
     def remove_container(container_id: str, force: bool = False) -> bool:
-        """Remove a container"""
-        if not is_valid_id(container_id):
-            log_error("docker.invalid_id", f"Invalid container ID: {container_id}")
-            return False
-        args = ["rm", container_id]
-        if force:
-            args.insert(1, "-f")
-        result = Docker._run(args)
-        return result.returncode == 0
+        return Docker._act(["rm", "-f"] if force else ["rm"], container_id)
 
     @staticmethod
     def remove_image(image_id: str, force: bool = False) -> bool:
-        """Remove an image"""
-        if not is_valid_image_ref(image_id):
-            log_error("docker.invalid_id", f"Invalid image ID: {image_id}")
-            return False
-        args = ["rmi", image_id]
-        if force:
-            args.insert(1, "-f")
-        result = Docker._run(args)
-        return result.returncode == 0
+        return Docker._act(["rmi", "-f"] if force else ["rmi"], image_id, "image ID", is_valid_image_ref)
+
+    @staticmethod
+    def remove_volume(volume_name: str) -> bool:
+        return Docker._act(["volume", "rm"], volume_name, "volume name")
+
+    @staticmethod
+    def remove_network(network_id: str) -> bool:
+        return Docker._act(["network", "rm"], network_id, "network ID")
 
     @staticmethod
     def image_exists(ref: str) -> bool:
@@ -2280,34 +2547,31 @@ class Docker:
         if not is_valid_image_ref(ref):
             log_error("docker.invalid_id", f"Invalid image ref: {ref}")
             return False
-        args = ["image", "inspect", ref]
         # DockerError when docker could not say: ensure_image would build or pull over an image that is there
-        return not Docker._absent(args, Docker._run(args, timeout=QUERY_TIMEOUT))
+        return Docker._object(DockerImageInspect, ref) is not None
 
     @staticmethod
-    def build_image(image: "ImageConfig") -> bool:
-        """`docker build` a recipe as the next <repo>:cctl-local-NNNNNN and re-point the recipe tag at it, streaming
-        the output. The context dir is sent when it exists; otherwise the Dockerfile goes in on stdin, so a recipe
-        that copies nothing sends nothing."""
-        recipe = image.recipe_hash()
-        if recipe is None:
-            return False
-        # Fresh: another terminal may just have built one. DockerError when the listing failed: numbering from "no
-        # versions" would re-point cctl-local-000000 at this build.
-        versions, _, _ = local_versions(image, Docker.list_images().required())
-        version = image.version_tag(max(versions, default=-1) + 1)
-        labels = ["--label", f"{LABEL_IMAGE}={image.name}", "--label", f"{LABEL_RECIPE}={recipe}"]
-        args = ["build", "-t", version, "-t", image.tag, *labels]
-        if image.has_context:
-            result = Docker._run(args + ["-f", str(image.dockerfile), str(image.context)], capture=False)
+    def build_image(tags: list[str], labels: dict[str, str], dockerfile: Path, context: Path | None = None) -> bool:
+        """`docker build` a Dockerfile as every one of `tags` (the first names it in the log), streaming the
+        output. With a `context` dir, that is sent; without, the Dockerfile goes in on stdin, so a build that
+        copies nothing sends nothing."""
+        for tag in tags:
+            if not is_valid_image_ref(tag):
+                log_error("docker.invalid_id", f"Invalid image ref: {tag}")
+                return False
+        args = ["build"]
+        for tag in tags:
+            args += ["-t", tag]
+        for name, value in labels.items():
+            args += ["--label", f"{name}={value}"]
+        if context is not None:
+            result = Docker._run(args + ["-f", str(dockerfile), str(context)], capture=False)
         else:
-            with open(image.dockerfile, "rb") as f:
+            with open(dockerfile, "rb") as f:
                 result = Docker._run(args + ["-"], capture=False, stdin=f)
         if result.returncode != 0:
-            log_error("image.build", f"docker build failed for {version} (exit {result.returncode})")
-            return False
-        print(f"Built {version}, {image.tag} now points at it")
-        return True
+            log_error("image.build", f"docker build failed for {tags[0]} (exit {result.returncode})")
+        return result.returncode == 0
 
     @staticmethod
     def pull_image(ref: str) -> bool:
@@ -2318,39 +2582,33 @@ class Docker:
         return Docker._run(["pull", ref], capture=False).returncode == 0
 
     @staticmethod
-    def ensure_image(ref: str) -> bool:
-        """Before `docker run`: get the image when it is absent. Built from its recipe when one claims the tag,
-        pulled otherwise: here rather than left to `docker run`, whose output we capture, so the progress shows.
-        Never rebuilds or re-pulls an existing image: `image build` is the explicit way."""
-        if not is_valid_image_ref(ref):  # image_exists says False to that too, and False here means "get it"
-            log_error("docker.invalid_id", f"Invalid image ref: {ref}")
-            return False
-        if Docker.image_exists(ref):
-            return True
-        image = find_image_recipe(ref, load_images())
-        if image is None:
-            print(f"Pulling {ref}...")
-            return Docker.pull_image(ref)
-        print(f"Building {image.tag} from {image.dockerfile}...")
-        return Docker.build_image(image)
+    def run_container(
+        name: str, image: str, command: Sequence[str] = (), options: Sequence[str] = ()
+    ) -> subprocess.CompletedProcess:
+        """`docker run -d`: a container of `image`, named `name`, running `command` (the image's own when none).
+        `options` are `docker run`'s own, whole (`["--network", "x", "--init"]`), and the caller's to have checked:
+        they come from its config. The result, for the caller to say what failed in its own words (the ID is on
+        stdout); a refused call (a name or an image that is not one) is a result with the REFUSED exit code, and
+        the reason in the log."""
+        refused = None
+        if not is_valid_id(name):
+            refused = f"Invalid container name: {name}"
+        elif not is_valid_image_ref(image):
+            refused = f"Invalid image ref: {image}"
+        if refused:
+            log_error("docker.invalid_id", refused)
+            return subprocess.CompletedProcess(["docker", "run"], REFUSED, "", refused)
+        return Docker._run(["run", "-d", *options, "--name", name, image, *command])
 
     @staticmethod
-    def remove_volume(volume_name: str) -> bool:
-        """Remove a volume"""
-        if not is_valid_id(volume_name):
-            log_error("docker.invalid_id", f"Invalid volume name: {volume_name}")
-            return False
-        result = Docker._run(["volume", "rm", volume_name])
-        return result.returncode == 0
-
-    @staticmethod
-    def remove_network(network_id: str) -> bool:
-        """Remove a network"""
-        if not is_valid_id(network_id):
-            log_error("docker.invalid_id", f"Invalid network ID: {network_id}")
-            return False
-        result = Docker._run(["network", "rm", network_id])
-        return result.returncode == 0
+    def rename_container(container_id: str, name: str) -> subprocess.CompletedProcess:
+        """Give a container another name. The result, for the caller to say what failed (a name already taken is
+        on stderr); a refused call is a result with the REFUSED exit code, and the reason in the log."""
+        if not is_valid_id(container_id) or not is_valid_id(name):
+            refused = f"Invalid container ID or name: {container_id} -> {name}"
+            log_error("docker.invalid_id", refused)
+            return subprocess.CompletedProcess(["docker", "rename"], REFUSED, "", refused)
+        return Docker._run(["rename", container_id, name])
 
     @staticmethod
     def ensure_network(name: str) -> bool:
@@ -2358,9 +2616,8 @@ class Docker:
         if not is_valid_id(name):
             log_error("docker.invalid_id", f"Invalid network name: {name}")
             return False
-        args = ["network", "inspect", name]
         # DockerError when docker could not say: the create below would fail on "already exists"
-        if not Docker._absent(args, Docker._run(args, timeout=QUERY_TIMEOUT)):
+        if Docker._object(DockerNetworkInspect, name) is not None:
             return True
         result = Docker._run(["network", "create", name])
         if result.returncode != 0:
@@ -2448,157 +2705,29 @@ class Docker:
         return Docker.exec(container_id, [shell], interactive=True)
 
     @staticmethod
-    def inspect(cls: type[Inspected], ref: str):
-        """`docker inspect` one object as `cls` (ContainerInspect, ImageInspect, ...); None when there is no such
-        object, or (after logging) when `ref` or the answer is not something we can use. DockerError when docker
-        could not say (no answer, daemon down, ...): that is not "no such object", and every caller reads None
-        as one. `--type` keeps a container and a network of the same name apart."""
+    def inspect(cls: type[DockerInspected], ref: str):
+        """One object as `cls` (DockerContainerInspect, DockerImageInspect, ...), as `docker inspect` would show it:
+        the CLI hands on what the daemon answers, and we ask the daemon (see _api). None when there is no such object,
+        or (after logging) when `ref` is not a name docker has anything under. DockerError when docker could not say
+        (no answer, daemon down, ...) or said something that is not the object we know (logged, by from_dict):
+        neither is "no such object", and every caller reads None as one.
+        Each kind has its own path: a container and a network of the same name stay apart."""
         if not cls.VALID(ref):
             log_error("docker.invalid_id", f"Invalid {cls.TYPE}: {ref}")
             return None
-        args = ["inspect", "--type", cls.TYPE, ref]
-        result = Docker._run(args, timeout=QUERY_TIMEOUT)
-        if Docker._absent(args, result):
+        data = Docker._object(cls, ref)
+        if data is None:  # only a 404 is "no such object"
             return None
-        try:
-            data = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            log_error(cls.CAT, f"docker {' '.join(args)}: not JSON", {"data": result.stdout[:200]})
-            return None
-        return cls.from_dict(data[0]) if data else None
+        row = cls.from_dict(data)
+        if row is None:
+            raise DockerError(Failure(*UNREADABLE_ANSWER, f"{cls.TYPE} {ref}: {str(data)[:200]}"))
+        return row
 
     @staticmethod
-    def investigate_source(container_id: str) -> dict:
-        """Investigate container source (compose, systemd, devcontainer, etc.)"""
-        if not is_valid_id(container_id):
-            log_error("docker.invalid_id", f"Invalid container ID: {container_id}")
-            return {"source": "error", "details": ["Invalid container ID"]}
-        result = {"source": "cli", "details": []}
-
-        # Get container info
-        info = Docker.inspect(ContainerInspect, container_id)
-        if not info:
-            return result
-
-        container_name = info.name_clean
-        labels = info.labels
-
-        # Check Docker Compose
-        if "com.docker.compose.project" in labels:
-            result["source"] = "docker-compose"
-            result["details"].append(f"Project: {labels.get('com.docker.compose.project')}")
-            result["details"].append(f"Service: {labels.get('com.docker.compose.service')}")
-            if "com.docker.compose.project.working_dir" in labels:
-                result["details"].append(f"Working dir: {labels.get('com.docker.compose.project.working_dir')}")
-            if "com.docker.compose.project.config_files" in labels:
-                for f in labels.get("com.docker.compose.project.config_files", "").split(","):
-                    if f and not f.startswith("/tmp/"):
-                        result["details"].append(f"Config: {f}")
-
-        # Check Devcontainer
-        if "devcontainer.config_file" in labels:
-            result["source"] = "devcontainer"
-            result["details"].append(f"Config: {labels.get('devcontainer.config_file')}")
-            if "devcontainer.local_folder" in labels:
-                result["details"].append(f"Folder: {labels.get('devcontainer.local_folder')}")
-
-        # Check Kubernetes
-        if "io.kubernetes.pod.name" in labels:
-            result["source"] = "kubernetes"
-            result["details"].append(f"Pod: {labels.get('io.kubernetes.pod.name')}")
-            result["details"].append(f"Namespace: {labels.get('io.kubernetes.pod.namespace')}")
-
-        # Check Portainer
-        if "io.portainer.accesscontrol.public" in labels or any(k.startswith("io.portainer") for k in labels):
-            result["source"] = "portainer"
-            result["details"].append("Managed by Portainer")
-
-        # Systemd heuristic scan (only if no other source found)
-        if result["source"] == "cli":
-            systemd_paths = ["/etc/systemd/system", os.path.expanduser("~/.config/systemd/user")]
-            for spath in systemd_paths:
-                if not os.path.isdir(spath):
-                    continue
-                try:
-                    for fname in os.listdir(spath):
-                        if not fname.endswith(".service"):
-                            continue
-                        fpath = os.path.join(spath, fname)
-                        try:
-                            with open(fpath, "r") as f:
-                                content = f.read()
-                                # Look for container name in docker run --name or docker start
-                                if f"--name {container_name}" in content or f"--name={container_name}" in content:
-                                    result["source"] = "systemd"
-                                    result["details"].append(f"Unit: {fpath}")
-                                    break
-                                if f"docker start {container_name}" in content:
-                                    result["source"] = "systemd"
-                                    result["details"].append(f"Unit: {fpath}")
-                                    break
-                        except (IOError, PermissionError) as e:
-                            log_error("source.systemd_read", str(e), {"path": fpath})
-                    if result["source"] == "systemd":
-                        break
-                except (IOError, PermissionError) as e:
-                    log_error("source.systemd_list", str(e), {"path": spath})
-
-        # If still cli, add a note
-        if result["source"] == "cli" and not result["details"]:
-            result["details"].append("No managed source detected")
-            result["details"].append("Likely started via: docker run ...")
-
-        return result
-
-    @staticmethod
-    def containers_by_name() -> dict[str, Container]:
+    def containers_by_name() -> dict[str, DockerContainerRow]:
         """One `docker ps -a`, keyed by container name. DockerError when it failed: a caller asking whether a
         container exists must not be told "no" by a call that never got an answer."""
         return {c.Names: c for c in Docker.list_containers().required()}
-
-    @staticmethod
-    def find_project_container(project_name: str) -> Container | None:
-        """Find a container belonging to a project by its cctl- name; None when there is none, DockerError
-        when docker couldn't say"""
-        return Docker.containers_by_name().get(f"{CONTAINER_PREFIX}{project_name}")
-
-    @staticmethod
-    def project_containers(project: "ProjectConfig") -> tuple[Container | None, Container | None]:
-        """(the project's container, what an unfinished spawn of it left), each None when there is none; one `ps`"""
-        existing = Docker.containers_by_name()
-        return existing.get(project.container_name), existing.get(project.spawning_name)
-
-    @staticmethod
-    def create_project_container(project: "ProjectConfig", name: str | None = None) -> str | None:
-        """Create and start a container for a project, as `name` (spawn's temporary one) when given. Its ID, as
-        `docker run -d` prints it (its name, should docker print nothing usable); None when it failed."""
-        network_name = f"{NETWORK_PREFIX}{project.name}"
-        if not Docker.ensure_network(network_name):
-            log_error("project.create", f"Failed to ensure network {network_name}", echo=True)
-            return None
-        if not Docker.ensure_image(project.image):
-            log_error("project.create", f"Failed to build or pull image {project.image}", echo=True)
-            return None
-        args = [
-            "run",
-            "-d",
-            "--init",  # PID 1 is `sleep infinity`, which never reaps the children `docker exec` leaves behind
-            "--name",
-            name or project.container_name,
-            "--network",
-            network_name,
-            "--label",
-            f"{LABEL_PROJECT}={project.name}",
-        ]
-        if project.repos:
-            args.extend(["--label", f"{LABEL_REPO}={','.join(r.url for r in project.repos)}"])
-        args.extend([project.image, "sleep", "infinity"])
-        result = Docker._run(args)
-        if result.returncode != 0:
-            log_error("project.create", f"Failed to create container: {result.stderr.strip()}", echo=True)
-            return None
-        container_id = result.stdout.strip()
-        return container_id if is_valid_id(container_id) else name or project.container_name
 
     @staticmethod
     def cp(src: str, container_id: str, dest: str) -> bool:
@@ -2643,15 +2772,82 @@ class Docker:
         args.append(container_id)
         return Docker._run(args + command, input=input, capture=capture)
 
+
+def ensure_image(ref: str) -> bool:
+    """Before `docker run`: get the image when it is absent. Built from its recipe when one claims the tag,
+    pulled otherwise: here rather than left to `docker run`, whose output we capture, so the progress shows.
+    Never rebuilds or re-pulls an existing image: `image build` is the explicit way."""
+    if not is_valid_image_ref(ref):  # image_exists says False to that too, and False here means "get it"
+        log_error("docker.invalid_id", f"Invalid image ref: {ref}")
+        return False
+    if Docker.image_exists(ref):
+        return True
+    recipe = find_image_recipe(ref, load_image_recipes())
+    if recipe is None:
+        print(f"Pulling {ref}...")
+        return Docker.pull_image(ref)
+    print(f"Building {recipe.tag} from {recipe.dockerfile}...")
+    return recipe.build()
+
+
+class Projects:
+    """A project's container, from its ProjectConfig: found, spawned, entered, destroyed"""
+
     @staticmethod
-    def spawn_project(project: "ProjectConfig") -> bool:
+    def find_container(project_name: str) -> DockerContainerRow | None:
+        """Find a container belonging to a project by its cctl- name; None when there is none, DockerError
+        when docker couldn't say"""
+        return Docker.containers_by_name().get(f"{CONTAINER_PREFIX}{project_name}")
+
+    @staticmethod
+    def containers(project: "ProjectConfig") -> tuple[DockerContainerRow | None, DockerContainerRow | None]:
+        """(the project's container, what an unfinished spawn of it left), each None when there is none; one `ps`"""
+        existing = Docker.containers_by_name()
+        return existing.get(project.container_name), existing.get(project.spawning_name)
+
+    @staticmethod
+    def create_container(project: "ProjectConfig", name: str | None = None) -> str | None:
+        """Create and start a container for a project, as `name` (spawn's temporary one) when given. Its ID, as
+        `docker run -d` prints it (its name, should docker print nothing usable); None when it failed."""
+        network_name = f"{NETWORK_PREFIX}{project.name}"
+        if not Docker.ensure_network(network_name):
+            log_error("project.create", f"Failed to ensure network {network_name}", echo=True)
+            return None
+        if not ensure_image(project.image):
+            log_error("project.create", f"Failed to build or pull image {project.image}", echo=True)
+            return None
+        options = [
+            "--init",  # PID 1 is `sleep infinity`, which never reaps the children `docker exec` leaves behind
+            "--network",
+            network_name,
+            "--label",
+            f"{LABEL_PROJECT}={project.name}",
+        ]
+        if project.repos:
+            options.extend(["--label", f"{LABEL_REPO}={','.join(r.url for r in project.repos)}"])
+        for vol in project.volumes:
+            options.extend(["-v", vol])
+        result = Docker.run_container(name or project.container_name, project.image, ["sleep", "infinity"], options)
+        if result.returncode != 0:
+            log_error("project.create", f"Failed to create container: {result.stderr.strip()}", echo=True)
+            return None
+        container_id = result.stdout.strip()
+        return container_id if is_valid_id(container_id) else name or project.container_name
+
+    @staticmethod
+    def spawn(project: "ProjectConfig") -> bool:
         """Full spawn flow: create the container, put everything in it (see _provision), and only then give it
         its project name. Nothing here cleans up after an interruption: an unfinished spawn keeps its spawning
         name, which is all the next one needs to know (see SPAWNING_PREFIX)."""
         name = project.spawning_name
         # Before anything is created: finding out after the clones would cost a whole spawn
         wanted = ([project.ssh_key] if project.ssh_key else []) + [ef.src for ef in project.env_files]
-        if missing := [path for path in wanted if not os.path.isfile(path)]:
+        missing = [path for path in wanted if not os.path.isfile(path)]
+        # A host dir docker has to create is root's, and no use to the project's user: it must be there first
+        # (a host side that is not a path is a docker volume: docker's to create)
+        binds = [vol.split(":")[0] for vol in project.volumes if vol.startswith("/")]
+        missing += [path for path in binds if not os.path.exists(path)]
+        if missing:
             log_error("project.spawn", f"not found on this host: {', '.join(missing)}. Nothing spawned.", echo=True)
             return False
         if leftover := Docker.containers_by_name().get(name):
@@ -2668,12 +2864,12 @@ class Docker:
         print(f"Creating container {project.container_name}...")
         # From here on by ID: the spawning name may change hands (another terminal said yes to "start over"), and
         # what we put in, rename or clean up must be the container we made
-        container_id = Docker.create_project_container(project, name=name)
+        container_id = Projects.create_container(project, name=name)
         if container_id is None:
             return False
-        if not Docker._provision(project, container_id):
+        if not Projects._provision(project, container_id):
             return False
-        result = Docker._run(["rename", container_id, project.container_name])
+        result = Docker.rename_container(container_id, project.container_name)
         if result.returncode != 0:  # it stays under its spawning name, complete: the Issues tab says what to do
             msg = f"Could not rename {name} to {project.container_name}: {result.stderr.strip()}"
             log_error("project.spawn", msg, echo=True)
@@ -2683,7 +2879,7 @@ class Docker:
 
     @staticmethod
     def _provision(project: "ProjectConfig", name: str) -> bool:
-        """What spawn puts in the fresh container `name` (its ID: see spawn_project): SSH key, forge host keys,
+        """What spawn puts in the fresh container `name` (its ID: see spawn): SSH key, forge host keys,
         clones, env files, containerctl. Any of it failing fails the spawn, and the container is removed: the
         project name is only given to a container that has all of it."""
 
@@ -2693,6 +2889,15 @@ class Docker:
             Docker.remove_container(name, force=True)
             return False
 
+        def step(what: str, command: list[str], user: str, **kwargs) -> bool:
+            """One command in the container, which must succeed: a failed one fails the spawn, named as `what`
+            with what it said, here and not three steps later as something else"""
+            result = Docker.exec_noninteractive(name, command, user=user, **kwargs)
+            if result.returncode == 0:
+                return True
+            said = (result.stderr or "").strip() or f"exit code {result.returncode}"
+            return fail(f"could not {what} (`{' '.join(command)}` as {user}): {said}")
+
         # Copy SSH key if configured
         if project.ssh_key:
             if not os.path.isfile(project.ssh_key):
@@ -2700,25 +2905,27 @@ class Docker:
             print("Injecting SSH key...")
             ssh_dir, user = f"{project.home}/.ssh", project.user
             key = f"{ssh_dir}/id_ed25519"
-            Docker.exec_noninteractive(name, ["mkdir", "-p", ssh_dir], user=user)
+            # As the user: this is also where a `user` the image doesn't have shows
+            if not step("create the .ssh dir", ["mkdir", "-p", ssh_dir], user):
+                return False
             if not Docker.cp(project.ssh_key, name, key):
                 return fail("failed to copy SSH key into container")
-            Docker.exec_noninteractive(name, ["chmod", "600", key], user=ROOT)
-            Docker.exec_noninteractive(name, ["chown", f"{user}:", key], user=ROOT)  # "user:" = its own group
+            if not step("restrict the SSH key", ["chmod", "600", key], ROOT):
+                return False
+            if not step("hand the SSH key over", ["chown", f"{user}:", key], ROOT):  # "user:" = its own group
+                return False
             # Verify the key is there for who will use it: this is also where a wrong `user` or `home` shows
             result = Docker.exec_noninteractive(name, ["test", "-r", key], user=user)
             if result.returncode != 0:
                 return fail(f"SSH key not readable by {user} inside container: {result.stderr.strip()}")
             # Pinned forge host keys (see KNOWN_HOSTS), appended as the user so ssh can keep adding to the file
-            result = Docker.exec_noninteractive(
-                name, ["tee", "-a", f"{ssh_dir}/known_hosts"], user=project.user, input=KNOWN_HOSTS
-            )
-            if result.returncode != 0:
-                return fail(f"could not write known_hosts: {result.stderr.strip()}")
+            if not step("write known_hosts", ["tee", "-a", f"{ssh_dir}/known_hosts"], user, input=KNOWN_HOSTS):
+                return False
 
         # Clone repos if configured (each into its own dir under the workspace)
         if project.repos:
-            Docker.exec_noninteractive(name, ["mkdir", "-p", project.workspace], user=project.user)
+            if not step("create the workspace", ["mkdir", "-p", project.workspace], project.user):
+                return False
             for repo in project.repos:
                 print(f"Cloning {repo.url}...")
                 clone = ["git", "clone", "--progress"]  # not captured: a long clone shows it is alive
@@ -2744,11 +2951,13 @@ class Docker:
                 dest_dir = os.path.dirname(ef.dest)
                 # Under the home it is the user's, like the rest; anywhere else (/etc/...) it is root's business
                 theirs = ef.dest.startswith(f"{project.home}/")
-                Docker.exec_noninteractive(name, ["mkdir", "-p", dest_dir], user=project.user if theirs else ROOT)
+                owner = project.user if theirs else ROOT
+                if not step(f"create the dir of {ef.dest}", ["mkdir", "-p", dest_dir], owner):
+                    return False
                 if not Docker.cp(ef.src, name, ef.dest):
                     return fail(f"failed to copy {ef.src} to {ef.dest}")
-                if theirs:
-                    Docker.exec_noninteractive(name, ["chown", f"{project.user}:", ef.dest], user=ROOT)
+                if theirs and not step(f"hand {ef.dest} over", ["chown", f"{project.user}:", ef.dest], ROOT):
+                    return False
             else:  # it was there when the spawn started
                 return fail(f"env file {ef.src} not found")
 
@@ -2761,21 +2970,30 @@ class Docker:
                 " another user or home, say so in the project file (`user`, `home`)"
             )
 
+        # A volume the user can't write to is still a container that works: said, not fatal (fix it and go on)
+        for vol in project.volumes:
+            source, dest, *mode = vol.split(":")
+            if mode == ["ro"]:
+                continue
+            if Docker.exec_noninteractive(name, ["test", "-w", dest], user=project.user).returncode != 0:
+                msg = f"{project.name}: volume {dest} is not writable by {project.user} in the container"
+                log_error("project.volume", f"{msg}: chown or chmod {source}, or mount it :ro", echo=True)
+
         return True
 
     @staticmethod
-    def enter_project(project: "ProjectConfig", user: str | None = None, workdir: str | None = None) -> int | None:
+    def enter(project: "ProjectConfig", user: str | None = None, workdir: str | None = None) -> int | None:
         """Enter a project: spawn if needed, start if stopped, then attach a shell. The shell's exit code (see
         exec), or None when no shell was entered: the spawn failed or was declined, and has said why. What to
         do with that is the caller's: the CLI exits with it, the TUI stays up.
 
         `workdir` (a shortcut target) overrides the default landing directory; `user` who the shell is for
         (the project's user unless said: never the image's default, see CONTAINER_USER)."""
-        container = Docker.find_project_container(project.name)
+        container = Projects.find_container(project.name)
 
         if container is None:
             # No container — spawn it
-            if not Docker.spawn_project(project):
+            if not Projects.spawn(project):
                 print(f"Failed to spawn project {project.name}", file=sys.stderr)
                 return None
         else:
@@ -2820,13 +3038,13 @@ class Docker:
         )
 
     @staticmethod
-    def destroy_project(project: "ProjectConfig", names: list[str] | None = None) -> bool:
+    def destroy(project: "ProjectConfig", names: list[str] | None = None) -> bool:
         """Stop and remove a project's containers. `names` are the ones the user was asked about: only those go,
         by name, whatever appeared since (a spawn started meanwhile was in no question; one that finished
         meanwhile no longer has the name that was agreed to). Unset: all that exist now, an unfinished spawn's
         leftover included."""
         if names is None:
-            names = [c.Names for c in Docker.project_containers(project) if c]
+            names = [c.Names for c in Projects.containers(project) if c]
         if not names:
             print(f"No container found for project {project.name}")
             return False
@@ -2839,70 +3057,63 @@ class Docker:
         Docker.remove_network(network_name)
         return True
 
+
+class Services:
+    """A service's container, from its ServiceConfig: found, created, brought up and down"""
+
     @staticmethod
-    def find_service_container(service_name: str) -> Container | None:
+    def find_container(service_name: str) -> DockerContainerRow | None:
         """Find a container belonging to a service by its cctl-svc- name; None when there is none, DockerError
         when docker couldn't say"""
         return Docker.containers_by_name().get(f"{SERVICE_PREFIX}{service_name}")
 
     @staticmethod
-    def create_service_container(service: "ServiceConfig") -> bool:
+    def create_container(service: "ServiceConfig") -> bool:
         """Create and start a container for a service"""
         # `docker run` takes a single --network; the rest are connected right after creation
         for network in service.networks:
             if not Docker.ensure_network(network):
                 log_error("service.create", f"Failed to ensure network {network}")
                 return False
-        if not Docker.ensure_image(service.image):
+        if not ensure_image(service.image):
             log_error("service.create", f"Failed to build or pull image {service.image}")
             return False
-        args = [
-            "run",
-            "-d",
-            "--name",
-            service.container_name,
-            "--restart",
-            service.restart,
-            "--label",
-            f"{LABEL_SERVICE}={service.name}",
-        ]
+        options = ["--restart", service.restart, "--label", f"{LABEL_SERVICE}={service.name}"]
         if service.networks:
-            args.extend(["--network", service.networks[0]])
+            options.extend(["--network", service.networks[0]])
         if service.read_only:
-            args.append("--read-only")
+            options.append("--read-only")
         for t in service.tmpfs:
-            args.extend(["--tmpfs", t])
+            options.extend(["--tmpfs", t])
         for c in service.cap_drop:
-            args.extend(["--cap-drop", c])
+            options.extend(["--cap-drop", c])
         for c in service.cap_add:
-            args.extend(["--cap-add", c])
+            options.extend(["--cap-add", c])
         if service.pids_limit:
-            args.extend(["--pids-limit", str(service.pids_limit)])
+            options.extend(["--pids-limit", str(service.pids_limit)])
         for port in service.ports:
-            args.extend(["-p", port])
+            options.extend(["-p", port])
         for vol in service.volumes:
-            args.extend(["-v", vol])
+            options.extend(["-v", vol])
         for e in service.env:
-            args.extend(["-e", e])
-        args.append(service.image)
-        args.extend(service.command)
-        result = Docker._run(args)
+            options.extend(["-e", e])
+        result = Docker.run_container(service.container_name, service.image, service.command, options)
         if result.returncode != 0:
             log_error(
                 "service.create",
                 f"Failed to create container: {result.stderr.strip()}",
             )
             return False
-        return Docker.apply_service_networks(service, already=set(service.networks[:1]))
+        return Services.apply_networks(service, already=set(service.networks[:1]))
 
     @staticmethod
-    def apply_service_networks(service: "ServiceConfig", already: set[str] | None = None) -> bool:
+    def apply_networks(service: "ServiceConfig", already: set[str] | None = None) -> bool:
         """Connect the service container to every configured network it is not on yet.
 
         `already` skips the inspect (used right after `run --network`). Networks the container
         is on but the config no longer lists are left alone: `recreate` is the way to drop them."""
         if already is None:
-            info = Docker.inspect(ContainerInspect, service.container_name)
+            info = Docker.inspect(DockerContainerInspect, service.container_name)
             if info is None:
                 return False
             already = set(((info.NetworkSettings or {}).get("Networks") or {}).keys())
@@ -2916,12 +3127,12 @@ class Docker:
         return ok
 
     @staticmethod
-    def service_up(service: "ServiceConfig") -> bool:
+    def up(service: "ServiceConfig") -> bool:
         """Bring a service up: create if missing, start if stopped"""
-        container = Docker.find_service_container(service.name)
+        container = Services.find_container(service.name)
         if container is None:
             print(f"Creating service {service.container_name}...")
-            return Docker.create_service_container(service)
+            return Services.create_container(service)
         state = container.State.lower()
         if state != "running":
             print(f"Starting {service.container_name}...")
@@ -2931,12 +3142,12 @@ class Docker:
             print(f"Service {service.container_name} is already running")
         # Networks added to the config since creation get connected; the hardening flags can't
         # be changed on a live container, use `service recreate` for those.
-        return Docker.apply_service_networks(service)
+        return Services.apply_networks(service)
 
     @staticmethod
-    def service_down(service: "ServiceConfig") -> bool:
+    def down(service: "ServiceConfig") -> bool:
         """Stop and remove a service container"""
-        container = Docker.find_service_container(service.name)
+        container = Services.find_container(service.name)
         if container is None:
             print(f"No container found for service {service.name}")
             return False
@@ -2944,15 +3155,102 @@ class Docker:
         return Docker.remove_container(service.container_name, force=True)
 
     @staticmethod
-    def service_recreate(service: "ServiceConfig") -> bool:
+    def recreate(service: "ServiceConfig") -> bool:
         """Recreate a service container (down + up)"""
-        container = Docker.find_service_container(service.name)
+        container = Services.find_container(service.name)
         if container is not None:
             print(f"Removing {service.container_name}...")
             if not Docker.remove_container(service.container_name, force=True):
                 return False
         print(f"Creating {service.container_name}...")
-        return Docker.create_service_container(service)
+        return Services.create_container(service)
+
+
+# =============================================================================
+# Where a container comes from
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class Source:
+    """Who made a container, as far as we can tell: `kind` names it (docker-compose, devcontainer, kubernetes,
+    portainer, systemd; cli when nobody claims it, gone when it is no longer there; every one of them, comma
+    separated, when its labels name several), `details` is what to show"""
+
+    kind: str
+    details: list[str]
+
+
+def source_from_labels(labels: dict) -> Source | None:
+    """The source the labels of a container give away, None when they name none. Several can: a devcontainer
+    made through compose, a compose stack deployed by Portainer. All of them name the source, most specific
+    first (the order below), and every one adds its details."""
+
+    def said(name: str, label: str) -> list[str]:
+        return [f"{name}: {labels[label]}"] if labels.get(label) else []
+
+    found: list[tuple[str, list[str]]] = []
+    if "devcontainer.config_file" in labels:
+        details = said("Config", "devcontainer.config_file") + said("Folder", "devcontainer.local_folder")
+        found.append(("devcontainer", details))
+    if "com.docker.compose.project" in labels:
+        compose = "com.docker.compose."
+        details = said("Project", f"{compose}project") + said("Service", f"{compose}service")
+        details += said("Working dir", f"{compose}project.working_dir")
+        configs = labels.get(f"{compose}project.config_files", "").split(",")
+        details += [f"Config: {path}" for path in configs if path and not path.startswith("/tmp/")]
+        found.append(("docker-compose", details))
+    if "io.kubernetes.pod.name" in labels:
+        details = said("Pod", "io.kubernetes.pod.name") + said("Namespace", "io.kubernetes.pod.namespace")
+        found.append(("kubernetes", details))
+    if any(label.startswith("io.portainer") for label in labels):
+        found.append(("portainer", ["Managed by Portainer"]))
+    if not found:
+        return None
+    return Source(", ".join(kind for kind, _ in found), [line for _, details in found for line in details])
+
+
+SYSTEMD_DIRS = ("/etc/systemd/system", "~/.config/systemd/user")
+
+
+def systemd_unit_for(container_name: str) -> str | None:
+    """A guess: the first systemd unit whose text runs or starts a container of that name. What can't be read is
+    logged and skipped."""
+    needles = (f"--name {container_name}", f"--name={container_name}", f"docker start {container_name}")
+    for directory in map(os.path.expanduser, SYSTEMD_DIRS):
+        try:
+            units = sorted(name for name in os.listdir(directory) if name.endswith(".service"))
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            log_error("source.systemd_list", str(e), {"path": directory})
+            continue
+        for unit in units:
+            path = os.path.join(directory, unit)
+            try:
+                with open(path, "r", errors="replace") as f:
+                    text = f.read()
+            except OSError as e:
+                log_error("source.systemd_read", str(e), {"path": path})
+                continue
+            if any(needle in text for needle in needles):
+                return path
+    return None
+
+
+def container_source(container_id: str) -> Source:
+    """Where a container comes from: its labels first, then the systemd units, then nobody (plain `docker run`)"""
+    if not is_valid_id(container_id):
+        log_error("docker.invalid_id", f"Invalid container ID: {container_id}")
+        return Source("error", ["Invalid container ID"])
+    info = Docker.inspect(DockerContainerInspect, container_id)
+    if info is None:  # it was in the list a moment ago
+        return Source("gone", ["No such container anymore"])
+    if source := source_from_labels(info.labels):
+        return source
+    if unit := systemd_unit_for(info.name_clean):
+        return Source("systemd", [f"Unit: {unit}"])
+    return Source("cli", ["No managed source detected", "Likely started via: docker run ..."])
 
 
 # =============================================================================
@@ -2980,7 +3278,7 @@ class ServiceRow:
     Ports: str
 
 
-def container_status(container: Container | None) -> str:
+def container_status(container: DockerContainerRow | None) -> str:
     return (container.State or container.Status) if container else "not created"
 
 
@@ -3074,7 +3372,7 @@ class DataFetcher:
         listings = Docker.listings(timeout=POLL_TIMEOUT)
         projects_config, broken_projects = read_projects()
         services_config, broken_services = read_services()
-        images_config, broken_images = read_images()
+        images_config, broken_images = read_image_recipes()
         issues = broken_projects + broken_services + broken_images
         issues += detect_issues(projects_config, services_config, images_config, listings)
 
@@ -3274,6 +3572,8 @@ class UI:
         def at(row: int) -> str:
             return f"\033[{start_row + row};{start_col}H"
 
+        if len(title) > box_width - 4:  # cut, and seen to be
+            title = title[: max(0, box_width - 5)] + "…"
         top = 0
         while True:
             out(at(0) + Term.style("┌" + "─" * (box_width - 2) + "┐", Term.CYAN))
@@ -3559,7 +3859,7 @@ class App:
             return
         self.set_message(f"Shell in {where} exited with code {code}", Term.YELLOW)
         try:
-            info = Docker.inspect(ContainerInspect, container)
+            info = Docker.inspect(DockerContainerInspect, container)
         except DockerError as e:  # docker could not say: that is not "it no longer exists"
             log_error("docker.exec", f"Shell in {where} exited with code {code}; then: {e.failure.detail}")
             self.set_message(
@@ -3825,10 +4125,8 @@ class App:
 
             elif key == "o":  # Origin/source
                 name = selected.Names
-                result = Docker.investigate_source(container_id)
-                title = f"Source: {result['source']}"
-                lines = [f"Container: {name}"] + result["details"]
-                UI.info_box(title, lines, rows, cols)
+                source = container_source(container_id)
+                UI.info_box(f"Source: {source.kind}", [f"Container: {name}", *source.details], rows, cols)
 
         # Image deletion
         elif self.current().key == "images" and key == "d" and selected_id:
@@ -3867,7 +4165,7 @@ class App:
                         self.set_message(f"Failed to delete {name}", Term.RED)
 
             elif key == "e":  # Edit — show connected containers
-                info = Docker.inspect(NetworkInspect, network_id)
+                info = Docker.inspect(DockerNetworkInspect, network_id)
                 if info:
                     containers = info.Containers
                     if containers:
@@ -3886,7 +4184,7 @@ class App:
 
             if project and key == "e":  # Enter
                 self.exit_tui_temporarily()
-                code = Docker.enter_project(project)
+                code = Projects.enter(project)
                 if code is None:  # why is on the main screen (and in the log): leave time to read it
                     self.pause()
                 self.enter_tui()
@@ -3902,7 +4200,7 @@ class App:
                     if UI.confirm(question.text, rows - 1, cols):
                         self.busy(f"Destroying {project_name}")
                         # Only what the prompt named: what appeared while it was up was never agreed to
-                        if Docker.destroy_project(project, question.names):
+                        if Projects.destroy(project, question.names):
                             self.set_message(f"Destroyed {project_name}", Term.GREEN)
                         else:
                             self.set_message(f"Failed to destroy {project_name}", Term.RED)
@@ -3917,15 +4215,15 @@ class App:
 
             if service and key == "u":  # Up
                 self.exit_tui_temporarily()
-                Docker.service_up(service)
+                Services.up(service)
                 self.pause()
                 self.enter_tui()
 
             elif service and key == "d":  # Down
-                if Docker.find_service_container(service_name):
+                if Services.find_container(service_name):
                     if UI.confirm(f"Stop service '{service_name}'?", rows - 1, cols):
                         self.busy(f"Stopping {service_name}")
-                        if Docker.service_down(service):
+                        if Services.down(service):
                             self.set_message(f"Stopped {service_name}", Term.GREEN)
                         else:
                             self.set_message(f"Failed to stop {service_name}", Term.RED)
@@ -3935,7 +4233,7 @@ class App:
             elif service and key == "r":  # Recreate
                 if UI.confirm(f"Recreate service '{service_name}'?", rows - 1, cols):
                     self.exit_tui_temporarily()
-                    if Docker.service_recreate(service):
+                    if Services.recreate(service):
                         print(f"Recreated {service_name}")
                     else:
                         print(f"Failed to recreate {service_name}")
@@ -4212,7 +4510,7 @@ def cli_enter(args: argparse.Namespace) -> None:
             print(f"Invalid user: {value}", file=sys.stderr)
             sys.exit(1)
         user = value
-    code = Docker.enter_project(project, user=user, workdir=workdir)
+    code = Projects.enter(project, user=user, workdir=workdir)
     if code != 0:  # no shell (None), or the shell's own exit code, as `shell` and `exec` hand it back
         sys.exit(1 if code is None else code)
 
@@ -4224,10 +4522,10 @@ def cli_spawn(args: argparse.Namespace) -> None:
         print(f"Unknown project: {args.project}", file=sys.stderr)
         sys.exit(1)
     project = projects[args.project]
-    if Docker.find_project_container(project.name):
+    if Projects.find_container(project.name):
         print(f"Container {project.container_name} already exists. Use 'enter' or 'destroy' first.", file=sys.stderr)
         sys.exit(1)
-    if not Docker.spawn_project(project):
+    if not Projects.spawn(project):
         sys.exit(1)
 
 
@@ -4268,7 +4566,7 @@ def cli_destroy(args: argparse.Namespace) -> None:
         nobody = "" if stdin_is_tty() else ": no terminal to ask on, use --force"
         print(f"Not destroyed{nobody}", file=sys.stderr)
         sys.exit(1)
-    if not Docker.destroy_project(project, question.names):  # what was asked about
+    if not Projects.destroy(project, question.names):  # what was asked about
         sys.exit(1)
     print(f"Destroyed {args.project}")
 
@@ -4307,7 +4605,7 @@ def _check_one(project: "ProjectConfig") -> bool | None:
 
     Returns True if clean, False if dirty or impossible to check, None if there is no container.
     """
-    container = Docker.find_project_container(project.name)
+    container = Projects.find_container(project.name)
     if container is None:
         print(f"{project.name}: no container (nothing to check)")
         return None
@@ -4352,7 +4650,7 @@ def current_issues() -> list[Issue]:
     """The issues as the TUI detects them, for one CLI run: nothing is logged, what is broken is in the list"""
     projects, broken_projects = read_projects()
     services, broken_services = read_services()
-    images, broken_images = read_images()
+    images, broken_images = read_image_recipes()
     issues = broken_projects + broken_services + broken_images
     return by_severity(issues + detect_issues(projects, services, images, Docker.listings()))
 
@@ -4412,7 +4710,7 @@ def cli_service_up(args: argparse.Namespace) -> None:
         )
         print(f"Add service configs to {SERVICES_DIR}/", file=sys.stderr)
         sys.exit(1)
-    if not Docker.service_up(services[args.service]):
+    if not Services.up(services[args.service]):
         sys.exit(1)
 
 
@@ -4422,7 +4720,7 @@ def cli_service_down(args: argparse.Namespace) -> None:
     if args.service not in services:
         print(f"Unknown service: {args.service}", file=sys.stderr)
         sys.exit(1)
-    if not Docker.service_down(services[args.service]):
+    if not Services.down(services[args.service]):
         sys.exit(1)
 
 
@@ -4432,7 +4730,7 @@ def cli_service_recreate(args: argparse.Namespace) -> None:
     if args.service not in services:
         print(f"Unknown service: {args.service}", file=sys.stderr)
         sys.exit(1)
-    if not Docker.service_recreate(services[args.service]):
+    if not Services.recreate(services[args.service]):
         sys.exit(1)
     print(f"Recreated {args.service}")
 
@@ -4449,7 +4747,7 @@ def cli_service_script(args: argparse.Namespace) -> None:
         print(f"Unknown script '{args.script}' for service {args.service}", file=sys.stderr)
         print(f"Available scripts: {', '.join(service.scripts.keys()) or 'none'}", file=sys.stderr)
         sys.exit(1)
-    container = Docker.find_service_container(service.name)
+    container = Services.find_container(service.name)
     if container is None:
         print(f"No container found for service {service.name} (run 'service up' first)", file=sys.stderr)
         sys.exit(1)
@@ -4491,7 +4789,7 @@ def cli_services(args: argparse.Namespace) -> None:
     print("\n".join(format_table(headers, rows, _table_width(args.wide), shrink=[4, 3, 2, 0, 1])))
 
 
-def _image_or_exit(name: str, images: dict[str, "ImageConfig"]) -> "ImageConfig":
+def _image_recipe_or_exit(name: str, images: dict[str, "ImageRecipeConfig"]) -> "ImageRecipeConfig":
     if name not in images:
         print(f"Unknown image: {name}", file=sys.stderr)
         print(f"Available images: {', '.join(images) or 'none'}", file=sys.stderr)
@@ -4502,14 +4800,14 @@ def _image_or_exit(name: str, images: dict[str, "ImageConfig"]) -> "ImageConfig"
 
 def cli_image_build(args: argparse.Namespace) -> None:
     """Build an image from its recipe (always; `up`/`spawn` only build when the image is missing)"""
-    image = _image_or_exit(args.image, load_images())
+    image = _image_recipe_or_exit(args.image, load_image_recipes())
     print(f"Building {image.tag} from {image.dockerfile}...")
-    if not Docker.build_image(image):
+    if not image.build():
         sys.exit(1)
 
 
 @dataclass
-class ImageState:
+class ImageRecipeState:
     """What `image ls` / `image check` know about one recipe from docker alone (no network)"""
 
     versions: list[int]  # every cctl-local-N of the repository
@@ -4521,7 +4819,7 @@ class ImageState:
         return "-" if self.current is None else f"{LOCAL_VERSION_PREFIX}{self.current:06d}"
 
 
-def image_state(image: "ImageConfig", rows: list[Image]) -> ImageState:
+def image_recipe_state(image: "ImageRecipeConfig", rows: list[DockerImageRow]) -> ImageRecipeState:
     """From the recipe files and the `docker images` rows (one listing serves every recipe)"""
     recipe = image.recipe_hash()
     versions, current, tag_id = local_versions(image, rows)
@@ -4530,13 +4828,13 @@ def image_state(image: "ImageConfig", rows: list[Image]) -> ImageState:
     elif tag_id is None:
         built = "not built"
     else:
-        info = Docker.inspect(ImageInspect, image.tag)
+        info = Docker.inspect(DockerImageInspect, image.tag)
         label = ((info.Config or {}).get("Labels") or {}).get(LABEL_RECIPE) if info else None
         built = "built elsewhere" if label is None else ("up to date" if label == recipe else "stale")
-    return ImageState(versions, current, built)
+    return ImageRecipeState(versions, current, built)
 
 
-def upstream_status(image: "ImageConfig") -> tuple[str, str | None]:
+def upstream_status(image: "ImageRecipeConfig") -> tuple[str, str | None]:
     """(status, diff): - | in sync | differs | unreachable, plus the unified diff upstream -> local when they differ"""
     if not image.upstream:
         return "-", None
@@ -4555,7 +4853,7 @@ def upstream_status(image: "ImageConfig") -> tuple[str, str | None]:
     return "differs", "".join(diff)
 
 
-def print_images(images: dict[str, "ImageConfig"], upstream: bool) -> bool:
+def print_image_recipes(images: dict[str, "ImageRecipeConfig"], upstream: bool) -> bool:
     """The recipes table, with upstream diffs after it when asked. True when nothing is off."""
     if not images:
         print(f"No image recipes. Add <name>.toml + <name>.Dockerfile to {IMAGES_DIR}/ (see: containerctl help config)")
@@ -4565,7 +4863,7 @@ def print_images(images: dict[str, "ImageConfig"], upstream: bool) -> bool:
     # Once, not one `docker images` per recipe. DockerError when it failed: "not built" would be a guess.
     listing = Docker.list_images().required()
     for name, image in images.items():
-        state = image_state(image, listing)
+        state = image_recipe_state(image, listing)
         row = [name, image.tag, state.current_display, str(len(state.versions)), state.built]
         ok = ok and state.built == "up to date"
         if upstream:
@@ -4575,7 +4873,7 @@ def print_images(images: dict[str, "ImageConfig"], upstream: bool) -> bool:
             if diff:
                 notes.append(diff)
         rows.append(row)
-        if issue := image_version_issue(name, image, state.versions, state.current):
+        if issue := image_recipe_version_issue(name, image, state.versions, state.current):
             notes.append(
                 f"warning: {issue.msg}; docker refuses to remove an image a container still uses,\n"
                 f"so this is safe to try:  {issue.hint}\n"
@@ -4589,15 +4887,15 @@ def print_images(images: dict[str, "ImageConfig"], upstream: bool) -> bool:
 
 def cli_image_ls(args: argparse.Namespace) -> None:
     """List recipes: current build, version count, built state. Docker only, never the network."""
-    print_images(load_images(), upstream=False)
+    print_image_recipes(load_image_recipes(), upstream=False)
 
 
 def cli_image_check(args: argparse.Namespace) -> None:
     """`image ls` plus local Dockerfile vs upstream, diffs included. Exit 1 when anything is off."""
-    images = load_images()
+    images = load_image_recipes()
     if args.image:
-        images = {args.image: _image_or_exit(args.image, images)}
-    if not print_images(images, upstream=True):
+        images = {args.image: _image_recipe_or_exit(args.image, images)}
+    if not print_image_recipes(images, upstream=True):
         sys.exit(1)
 
 
@@ -4612,8 +4910,10 @@ CONCEPTS = [
     "Concepts",
     "- project  ==> a throwaway dev container (cctl-prj-<name>, own network cctl-net-prj-<name>) from a TOML:",
     "               image, ssh key, repos cloned in ~/workspace, env files. `enter` spawns it when",
-    "               missing, then drops you in a shell. Nothing is mounted from the host: what is not pushed",
-    "               dies with the container. That is the point, and why `check` exists. It is made as",
+    "               missing, then drops you in a shell. Nothing is mounted from the host unless its",
+    "               `volumes` say so (a dropzone shared with other projects, a cache): what is neither",
+    "               pushed nor in a volume dies with the container. That is the point, and why `check`",
+    "               exists (it looks at the workspace: keep volumes out of it). It is made as",
     "               cctl-spawning-<name> and renamed once all of that is in: a spawn that died halfway is",
     "               not a project container: the next `enter` says how old it is, asks, and starts over.",
     "- check    ==> is it safe to destroy? Everything in the workspace must be a configured repo, and every",
@@ -4731,6 +5031,8 @@ def config_usage() -> int:
         "env_files = [                             # copied into the container (optional)",
         '  { src = "~/.secrets/app.env", dest = "/home/ubuntu/workspace/app/.env" },',
         "]",
+        'volumes = ["~/drop:/home/ubuntu/drop"]    # host dir (must exist) or docker volume, :path[:ro] (optional);',
+        "                                          # set at spawn: destroy + spawn after an edit. Not in the workspace",
         "[shortcuts]                               # `containerctl enter <alias>` lands there (optional)",
         'app = "app"                               # relative to <home>/workspace',
         'lib = "lib/src"',

@@ -7,14 +7,14 @@ from unittest import mock
 
 import containerctl
 from containerctl import (
-    Image,
-    ImageConfig,
+    DockerImageRow,
+    ImageRecipeConfig,
     ProjectConfig,
     RepoSpec,
     ServiceConfig,
     find_image_recipe,
     get_errors,
-    load_images,
+    load_image_recipes,
     normalize_image_ref,
     parse_env_table,
     parse_secrets_table,
@@ -81,6 +81,33 @@ class ProjectConfigTests(unittest.TestCase):
         self.assertEqual(cfg.image, "ubuntu:22.04")
         self.assertEqual(cfg.container_name, "cctl-prj-myproj")
         self.assertEqual(cfg.repos_display, "-")
+
+    def test_volumes_are_parsed_like_a_services(self):
+        content = 'image = "ubuntu"\nvolumes = ["/srv/drop:/home/dev/dropzone", "cache:/var/cache/x:ro"]\n'
+        cfg = ProjectConfig.from_toml(write_toml(self.dir, "p", content))
+        self.assertEqual(cfg.volumes, ["/srv/drop:/home/dev/dropzone", "cache:/var/cache/x:ro"])
+        home = write_toml(self.dir, "p", 'image = "ubuntu"\nvolumes = ["~/drop:/drop"]\n')
+        self.assertEqual(ProjectConfig.from_toml(home).volumes, [f"{Path.home()}/drop:/drop"])
+        self.assertEqual(ProjectConfig.from_toml(write_toml(self.dir, "p", 'image = "ubuntu"\n')).volumes, [])
+
+    def test_an_unsafe_volume_is_refused(self):
+        for volumes in (
+            '"/srv/drop:/drop"',  # not a list
+            '["/onlyhost"]',
+            '["/a:/b:ro:z"]',
+            '["/a:/b:xx"]',
+            '["/a:relative"]',
+            '["/a:/b/../c"]',
+            '["/a/../b:/c"]',
+            '[":/c"]',
+            '["--privileged:/c"]',
+            '["/a:/$(id)"]',
+            "[1]",
+        ):
+            path = write_toml(self.dir, "p", f'image = "ubuntu"\nvolumes = {volumes}\n')
+            error = rejected(ProjectConfig.from_toml, path)
+            self.assertEqual(error.cat, "project.config", volumes)
+            self.assertIn("volume", str(error), volumes)
 
     def test_invalid_project_name_from_filename(self):
         path = write_toml(self.dir, "bad name", 'image = "ubuntu"\n')
@@ -289,6 +316,10 @@ class ServiceConfigTests(unittest.TestCase):
         path = write_toml(self.dir, "web", 'image = "nginx"\nvolumes = ["/home/dev/d:/d:xx"]\n')
         rejected(ServiceConfig.from_toml, path)
 
+    def test_invalid_volume_container_path(self):
+        path = write_toml(self.dir, "web", 'image = "nginx"\nvolumes = ["/home/dev/d:d"]\n')
+        self.assertEqual(rejected(ServiceConfig.from_toml, path).cat, "service.config")
+
     def test_env_without_equals_rejected(self):
         path = write_toml(self.dir, "web", 'image = "nginx"\nenv = ["NOEQUALS"]\n')
         rejected(ServiceConfig.from_toml, path)
@@ -451,7 +482,7 @@ class ResolveEnvTests(unittest.TestCase):
 
 
 class ImageConfigTests(unittest.TestCase):
-    """`<name>.toml` + `<name>.Dockerfile` [+ `<name>/`] -> ImageConfig; the recipe hash covers all of it."""
+    """`<name>.toml` + `<name>.Dockerfile` [+ `<name>/`] -> ImageRecipeConfig; the recipe hash covers all of it."""
 
     def setUp(self):
         reset_errors()
@@ -467,17 +498,17 @@ class ImageConfigTests(unittest.TestCase):
         return path
 
     def test_defaults(self):
-        cfg = ImageConfig.from_toml(self.recipe())
+        cfg = ImageRecipeConfig.from_toml(self.recipe())
         self.assertEqual((cfg.name, cfg.tag, cfg.upstream, cfg.has_context), ("hermes", "hermes:latest", "", False))
         self.assertEqual(cfg.dockerfile, self.dir / "hermes.Dockerfile")
         self.assertEqual(get_errors(), [])
 
     def test_tag_and_upstream(self):
         toml = 'tag = "registry.local/hermes:1.2"\nupstream = "https://raw.githubusercontent.com/u/r/main/Dockerfile"\n'
-        cfg = ImageConfig.from_toml(self.recipe(toml=toml))
+        cfg = ImageRecipeConfig.from_toml(self.recipe(toml=toml))
         self.assertEqual(cfg.tag, "registry.local/hermes:1.2")
         self.assertEqual(cfg.upstream, "https://raw.githubusercontent.com/u/r/main/Dockerfile")
-        self.assertEqual(ImageConfig.from_toml(self.recipe(toml='tag = "hermes"\n')).tag, "hermes:latest")
+        self.assertEqual(ImageRecipeConfig.from_toml(self.recipe(toml='tag = "hermes"\n')).tag, "hermes:latest")
 
     def test_invalid_rejected(self):
         for toml in (
@@ -489,20 +520,20 @@ class ImageConfigTests(unittest.TestCase):
             "tag = [\n",
         ):
             reset_errors()
-            self.assertEqual(rejected(ImageConfig.from_toml, self.recipe(toml=toml)).cat, "image.config")
+            self.assertEqual(rejected(ImageRecipeConfig.from_toml, self.recipe(toml=toml)).cat, "image.config")
 
     def test_missing_dockerfile_rejected(self):
         path = write_toml(self.dir, "hermes", "")
-        self.assertIn("Missing hermes.Dockerfile", str(rejected(ImageConfig.from_toml, path)))
+        self.assertIn("Missing hermes.Dockerfile", str(rejected(ImageRecipeConfig.from_toml, path)))
 
     def test_invalid_name_rejected(self):
-        rejected(ImageConfig.from_toml, self.recipe(name="a b"))
+        rejected(ImageRecipeConfig.from_toml, self.recipe(name="a b"))
 
     def test_load_images_and_find_recipe(self):
         self.recipe("a")
         self.recipe("b", toml='tag = "other:2"\n')
         with mock.patch.object(containerctl, "IMAGES_DIR", self.dir):
-            images = load_images()
+            images = load_image_recipes()
         self.assertEqual(sorted(images), ["a", "b"])
         self.assertIs(find_image_recipe("a", images), images["a"])
         self.assertIs(find_image_recipe("a:latest", images), images["a"])
@@ -510,10 +541,10 @@ class ImageConfigTests(unittest.TestCase):
         self.assertIsNone(find_image_recipe("other", images))
         self.assertIsNone(find_image_recipe("a@sha256:abc", images))
         with mock.patch.object(containerctl, "IMAGES_DIR", self.dir / "nope"):
-            self.assertEqual(load_images(), {})
+            self.assertEqual(load_image_recipes(), {})
 
     def test_recipe_hash_covers_dockerfile_and_context(self):
-        cfg = ImageConfig.from_toml(self.recipe())
+        cfg = ImageRecipeConfig.from_toml(self.recipe())
         h0 = cfg.recipe_hash()
         self.assertEqual(len(h0), 64)
         self.assertEqual(cfg.recipe_hash(), h0)  # deterministic
@@ -533,7 +564,7 @@ class ImageConfigTests(unittest.TestCase):
         self.assertNotEqual(cfg.recipe_hash(), h3)
 
     def test_recipe_hash_ignores_git_history(self):
-        cfg = ImageConfig.from_toml(self.recipe())
+        cfg = ImageRecipeConfig.from_toml(self.recipe())
         ctx = self.dir / "hermes"
         (ctx / ".git" / "objects").mkdir(parents=True)
         (ctx / "src").mkdir()
@@ -546,7 +577,7 @@ class ImageConfigTests(unittest.TestCase):
         self.assertNotEqual(cfg.recipe_hash(), h)
 
     def test_recipe_hash_unreadable(self):
-        cfg = ImageConfig.from_toml(self.recipe())
+        cfg = ImageRecipeConfig.from_toml(self.recipe())
         (self.dir / "hermes.Dockerfile").unlink()
         self.assertIsNone(cfg.recipe_hash())
         self.assertEqual(get_errors()[0].cat, "image.recipe")
@@ -641,7 +672,7 @@ class IssueTests(unittest.TestCase):
         self.assertEqual([(e.cat, e.msg) for e in get_errors()], [(i.cat, i.msg) for i in problems])
 
     def test_a_missing_config_dir_is_no_config_and_no_issue(self):
-        for read in (containerctl.read_projects, containerctl.read_services, containerctl.read_images):
+        for read in (containerctl.read_projects, containerctl.read_services, containerctl.read_image_recipes):
             with (
                 mock.patch.object(containerctl, "PROJECTS_DIR", Path("/nonexistent/p")),
                 mock.patch.object(containerctl, "SERVICES_DIR", Path("/nonexistent/s")),
@@ -675,7 +706,7 @@ class IssueTests(unittest.TestCase):
 
     def test_a_failed_listing_is_not_read_as_an_empty_one(self):
         """No image rows because `docker images` failed: no verdict on versions. Same for orphans and `docker ps`."""
-        image = containerctl.ImageConfig(name="hermes", dockerfile=Path("h.Dockerfile"), context=Path("h"))
+        image = containerctl.ImageRecipeConfig(name="hermes", dockerfile=Path("h.Dockerfile"), context=Path("h"))
         with mock.patch.object(containerctl, "SECRETS_FILE", Path("/nonexistent/secrets.toml")):
             issues = containerctl.detect_issues(
                 {}, {}, {"hermes": image}, listings(failed={"images": "boom", "containers": "boom"})
@@ -717,10 +748,10 @@ class IssueTests(unittest.TestCase):
         )
 
     def test_image_versions_from_docker_images_rows(self):
-        image = containerctl.ImageConfig(name="hermes", dockerfile=Path("h.Dockerfile"), context=Path("h"))
-        rows = [Image(f"id{n}", "hermes", f"cctl-local-{n:06d}", "1MB") for n in range(4)]
-        rows.append(Image("id3", "hermes", "latest", "1MB"))  # the recipe tag points at version 3
-        rows.append(Image("x", "other", "cctl-local-000009", "1MB"))  # another repository
+        image = containerctl.ImageRecipeConfig(name="hermes", dockerfile=Path("h.Dockerfile"), context=Path("h"))
+        rows = [DockerImageRow(f"id{n}", "hermes", f"cctl-local-{n:06d}", "1MB") for n in range(4)]
+        rows.append(DockerImageRow("id3", "hermes", "latest", "1MB"))  # the recipe tag points at version 3
+        rows.append(DockerImageRow("x", "other", "cctl-local-000009", "1MB"))  # another repository
         self.assertEqual(containerctl.local_versions(image, rows), ([0, 1, 2, 3], 3, "id3"))
         with mock.patch.object(containerctl, "SECRETS_FILE", Path("/nonexistent/secrets.toml")):
             issues = containerctl.detect_issues({}, {}, {"hermes": image}, listings(images=rows))

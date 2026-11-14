@@ -104,7 +104,7 @@ class UsageTests(unittest.TestCase):
             sec.chmod(0o600)
             project = ProjectConfig.from_toml(prj)
             service = containerctl.ServiceConfig.from_toml(svc)
-            image = containerctl.ImageConfig.from_toml(img)
+            image = containerctl.ImageRecipeConfig.from_toml(img)
             with mock.patch.object(containerctl, "SECRETS_FILE", sec):
                 env = containerctl.resolve_env(project)
         self.assertIsNotNone(project, containerctl.get_errors())
@@ -193,13 +193,13 @@ class CliEnterOptionTests(unittest.TestCase):
         self._load.stop()
 
     def _enter(self, options):
-        with mock.patch.object(containerctl.Docker, "enter_project", return_value=0) as enter:
+        with mock.patch.object(containerctl.Projects, "enter", return_value=0) as enter:
             containerctl.cli_enter(argparse.Namespace(project="proj", options=options))
         return enter
 
     def test_exits_with_the_shell_code_and_with_1_when_no_shell_was_entered(self):
         for returned, code in ((3, 3), (None, 1)):
-            with mock.patch.object(containerctl.Docker, "enter_project", return_value=returned):
+            with mock.patch.object(containerctl.Projects, "enter", return_value=returned):
                 with self.assertRaises(SystemExit) as ctx:
                     containerctl.cli_enter(argparse.Namespace(project="proj", options=[]))
             self.assertEqual(ctx.exception.code, code)
@@ -213,7 +213,7 @@ class CliEnterOptionTests(unittest.TestCase):
     def test_shortcut_resolves_to_project_and_workdir(self):
         project = ProjectConfig(name="proj", image="ubuntu", shortcuts={"lib": "lib/src"})
         with mock.patch.object(containerctl, "load_projects", return_value={"proj": project}):
-            with mock.patch.object(containerctl.Docker, "enter_project", return_value=0) as enter:
+            with mock.patch.object(containerctl.Projects, "enter", return_value=0) as enter:
                 containerctl.cli_enter(argparse.Namespace(project="lib", options=["user=root"]))
         enter.assert_called_once_with(project, user="root", workdir="/home/dev/workspace/lib/src")
 
@@ -260,9 +260,9 @@ class CliDestroyTests(unittest.TestCase):
         code = 0
         with (
             mock.patch.object(containerctl, "stdin_is_tty", real_stdin_is_tty),
-            mock.patch.object(containerctl.Docker, "project_containers", return_value=(container, leftover)),
+            mock.patch.object(containerctl.Projects, "containers", return_value=(container, leftover)),
             mock.patch.object(containerctl, "project_report", side_effect=[report]) as check,
-            mock.patch.object(containerctl.Docker, "destroy_project", return_value=True) as destroy,
+            mock.patch.object(containerctl.Projects, "destroy", return_value=True) as destroy,
             mock.patch.object(containerctl.sys, "stdin", stdin),
             mock.patch("builtins.input", typed),
             redirect_stdout(out),
@@ -417,7 +417,7 @@ class ExitCodeTests(unittest.TestCase):
         out = io.StringIO()
         with (
             mock.patch.object(containerctl, "load_projects", return_value=projects),
-            mock.patch.object(containerctl.Docker, "find_project_container", return_value=container("c")),
+            mock.patch.object(containerctl.Projects, "find_container", return_value=container("c")),
             mock.patch.object(containerctl, "project_report", side_effect=[failed, WorkspaceReport()]) as check,
             redirect_stdout(out),
         ):
@@ -532,7 +532,7 @@ class CliIssuesTests(unittest.TestCase):
         with (
             mock.patch.object(containerctl, "read_projects", return_value=(projects or {}, list(broken))),
             mock.patch.object(containerctl, "read_services", return_value=({}, [])),
-            mock.patch.object(containerctl, "read_images", return_value=({}, [])),
+            mock.patch.object(containerctl, "read_image_recipes", return_value=({}, [])),
             mock.patch.object(containerctl, "SECRETS_FILE", Path("/nonexistent/secrets.toml")),
             mock.patch.object(containerctl.Docker, "listings", return_value=listings(failed)),
             redirect_stdout(out),
@@ -731,10 +731,12 @@ class CliImageTests(unittest.TestCase):
         """Fake docker: `versions` is (local versions, the one the tag points at, whether the tag exists), turned
         into `docker images` rows for the hermes recipe; `label` the cctl.recipe label on the tagged image."""
         local, current, tagged = versions
-        rows = [containerctl.Image(f"id{n}", "hermes", f"cctl-local-{n:06d}", "1MB") for n in local]
+        rows = [containerctl.DockerImageRow(f"id{n}", "hermes", f"cctl-local-{n:06d}", "1MB") for n in local]
         if tagged:
             rows.append(
-                containerctl.Image("elsewhere" if current is None else f"id{current}", "hermes", "latest", "1MB")
+                containerctl.DockerImageRow(
+                    "elsewhere" if current is None else f"id{current}", "hermes", "latest", "1MB"
+                )
             )
 
         def inspect(cls, ref):
@@ -779,7 +781,7 @@ class CliImageTests(unittest.TestCase):
 
     def test_up_to_date_and_in_sync(self):
         self.recipe(toml='upstream = "https://example.com/Dockerfile"\n')
-        recipe = containerctl.load_images()["hermes"].recipe_hash()
+        recipe = containerctl.load_image_recipes()["hermes"].recipe_hash()
         versions = ([0, 1, 2], 2, True)
         code, out, _, _ = self.run_cli(
             containerctl.cli_image_check, versions=versions, label=recipe, fetch=lambda url: "FROM debian:12\n"
@@ -811,7 +813,7 @@ class CliImageTests(unittest.TestCase):
 
     def test_ls_never_fetches_and_nags_past_three_versions(self):
         self.recipe(toml='upstream = "https://example.com/Dockerfile"\n')
-        recipe = containerctl.load_images()["hermes"].recipe_hash()
+        recipe = containerctl.load_image_recipes()["hermes"].recipe_hash()
         code, out, _, fetched = self.run_cli(containerctl.cli_image_ls, versions=([0, 1, 2, 3], 3, True), label=recipe)
         self.assertEqual(code, 0)
         fetched.assert_not_called()

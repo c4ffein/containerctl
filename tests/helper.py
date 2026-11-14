@@ -11,12 +11,12 @@ replace the two places a subprocess is launched and assert on the command that
 import subprocess
 
 import containerctl
-from containerctl import Container
+from containerctl import DockerContainerRow
 
 
-def container(name: str, state: str = "running", id_: str = "abc", image: str = "i") -> Container:
+def container(name: str, state: str = "running", id_: str = "abc", image: str = "i") -> DockerContainerRow:
     """A `docker ps` row as the parser would return it"""
-    return Container(ID=id_, Names=name, Image=image, Status=f"Up ({state})", State=state)
+    return DockerContainerRow(ID=id_, Names=name, Image=image, Status=f"Up ({state})", State=state)
 
 
 def listings(failed=None, **rows) -> dict:
@@ -74,6 +74,24 @@ class RunRecorder:
     @property
     def last(self):
         return self.calls[-1] if self.calls else None
+
+
+class ApiRecorder:
+    """Stand-in for ``Docker._api`` (the questions asked of the daemon on its socket): every path gets the same
+    ``status`` and ``body``. 200 by default: whatever is asked about is there, as a RunRecorder's exit code 0 says
+    every command worked; 404 is docker saying there is no such thing. With ``into``, each question is also noted
+    in that RunRecorder's calls as ``["GET", path]``: one list, in order, for a test of what came before what."""
+
+    def __init__(self, status=200, body="{}", into=None):
+        self.calls, self.status, self.body, self.into = [], status, body, into
+
+    def __call__(self, path, timeout=None):
+        self.calls.append(path)
+        if self.into is not None:
+            self.into.calls.append(["GET", path])
+            for column in (self.into.own_groups, self.into.stdins, self.into.inputs):
+                column.append(None)  # these go by the index of the call
+        return self.status, self.body
 
 
 class PopenRecorder:
