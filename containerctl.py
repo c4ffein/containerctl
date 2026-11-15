@@ -727,6 +727,7 @@ LABEL_ENV = "cctl.env"  # on a service container: the names of the env it was gi
 LABEL_COMMAND = "cctl.command"  # on a service container that was given a `command`: "1"
 LABEL_HEALTH = "cctl.health"  # on a service container that was given a `health_cmd`: "1"
 LABEL_IMAGE = "cctl.image"  # on images built from a recipe
+LABEL_BASES = "cctl.bases"  # on images built from a recipe: its FROM images, each as its registry had it then
 LABEL_RECIPE = "cctl.recipe"  # sha256 of the recipe (Dockerfile + context) the image was built from
 LOCAL_VERSION_PREFIX = "cctl-local-"  # each build is <repo>:cctl-local-NNNNNN; the recipe tag is re-pointed at it
 IMAGE_VERSIONS_WARN = 3  # `image ls` nags past this many local versions of one image
@@ -1404,9 +1405,36 @@ class ImageRecipeConfig:
     def has_context(self) -> bool:
         return self.context.is_dir()
 
+    def bases(self) -> list[str]:
+        """The images the Dockerfile builds on that a registry has: its FROM lines, without `scratch`, its own
+        stages (`FROM build`), what is pinned by digest (it can't go stale) and what only an ARG knows
+        (`FROM ${BASE}`: not ours to work out). [] when the Dockerfile can't be read: build says so."""
+        try:
+            lines = self.dockerfile.read_text(errors="replace").splitlines()
+        except OSError:
+            return []
+        found: list[str] = []
+        stages: set[str] = set()
+        for line in lines:
+            words = [word for word in line.split() if not word.startswith("--")]  # --platform=...
+            if len(words) < 2 or words[0].upper() != "FROM":
+                continue
+            ref = words[1]
+            if len(words) >= 4 and words[2].upper() == "AS":
+                stages.add(words[3].lower())
+            if ref.lower() in stages or ref == "scratch" or "@" in ref or not is_valid_image_ref(ref):
+                continue
+            if normalize_image_ref(ref) not in found:
+                found.append(normalize_image_ref(ref))
+        return found
+
     def build(self) -> bool:
         """Build the recipe as the next <repo>:cctl-local-NNNNNN and re-point the recipe tag at it (see
-        Docker.build_image). The context dir is sent when it exists."""
+        Docker.build_image). The context dir is sent when it exists. What its registry has each base image on
+        right now is written on the build (LABEL_BASES), for `image updates` to say later that one was replaced:
+        the image itself keeps no name of what it was built on. A registry that doesn't say is a base left out,
+        never a build that fails. (Asked a moment before docker resolves the same tags: right unless one moves in
+        between, or the builder is the old one, which builds on a local copy without asking.)"""
         recipe = self.recipe_hash()
         if recipe is None:
             return False
@@ -1414,7 +1442,13 @@ class ImageRecipeConfig:
         # versions" would re-point cctl-local-000000 at this build.
         versions, _, _ = local_versions(self, Docker.list_images().required())
         version = self.version_tag(max(versions, default=-1) + 1)
-        labels = {LABEL_IMAGE: self.name, LABEL_RECIPE: recipe}
+        on = []
+        for base in self.bases():
+            try:
+                on.append(f"{base}@{Docker.registry_digest(base)}")
+            except DockerError as e:
+                log_error("image.registry", f"{base}: {e.failure.detail or e}")
+        labels = {LABEL_IMAGE: self.name, LABEL_RECIPE: recipe, LABEL_BASES: " ".join(on)}
         context = self.context if self.has_context else None
         if not Docker.build_image([version, self.tag], labels, self.dockerfile, context):
             return False
@@ -1510,8 +1544,10 @@ def fetch_upstream(url: str, limit: int = 1 << 20) -> str | None:
 # A question for the network, so never asked by itself: `image updates` and the `u` of the Images tab
 # ask, the answers are kept in REGISTRY_FILE, and everything else (the fetcher, the issues, the Images tab) only
 # reads that file. The daemon does the asking (see Docker.registry_digest): its network, its proxy, no HTTP client
-# of ours. What is asked about: the `image` of every project and service that is pulled, not built from a recipe
-# (`image check` is for those) and not pinned by digest (nothing to be behind).
+# of ours. What is asked about: the `image` of every project and service, unless pinned by digest (nothing to be
+# behind), and every recipe. Pulled: is it the one its registry has under that tag now (check_registry)? Built from
+# a recipe: are the images it was built on still the ones their registries have (check_recipe)? Its Dockerfile
+# against upstream is another question: `image check`.
 
 
 @dataclass(frozen=True)
@@ -1528,7 +1564,8 @@ class RegistryCheck:
 
     @property
     def status(self) -> str:
-        return {True: "behind", False: "current"}.get(self.behind, self.note)
+        """In a word or a few: the note when there is one (why it is not known, or what it is behind on)"""
+        return self.note or ("behind" if self.behind else "current")
 
 
 def span(seconds: float) -> str:
@@ -1559,11 +1596,12 @@ def registry_lines(refs: dict[str, list[str]], checks: dict[str, RegistryCheck])
 def registry_refs(
     projects: dict[str, ProjectConfig], services: dict[str, "ServiceConfig"], images: dict[str, ImageRecipeConfig]
 ) -> dict[str, list[str]]:
-    """The images a registry can be asked about, each with who uses it ("project demo", "service web")"""
-    refs: dict[str, list[str]] = {}
+    """The images a registry can be asked about, each with who it matters to ("recipe dev", "project demo",
+    "service web"): every recipe's tag, used or not, and the image of every project and service"""
+    refs: dict[str, list[str]] = {image.tag: [f"recipe {name}"] for name, image in images.items()}
     for kind, configs in (("project", projects), ("service", services)):
         for name, config in configs.items():
-            if "@" not in config.image and find_image_recipe(config.image, images) is None:
+            if "@" not in config.image:
                 refs.setdefault(normalize_image_ref(config.image), []).append(f"{kind} {name}")
     return refs
 
@@ -1606,13 +1644,38 @@ def check_registry(ref: str) -> RegistryCheck:
     return RegistryCheck(ref, now, info.Id, remote, behind=remote not in pulled_as)
 
 
-def check_registries(refs: Sequence[str]) -> dict[str, RegistryCheck]:
-    """Ask about each of `refs` and keep the answers: REGISTRY_FILE is then those, and nothing of a ref no project
-    or service uses any more. Written after each: an interrupted run keeps what it had the time to learn."""
+def check_recipe(image: ImageRecipeConfig) -> RegistryCheck:
+    """Ask: are the images this recipe's build was made on still the ones their registries have under those tags?
+    By the digests written on the build when it was made (LABEL_BASES) against what the registries answer now.
+    Behind when one was replaced: the build still has the old one inside, and only a rebuild takes the new."""
+    now = time.time()
+    try:
+        info = Docker.inspect(DockerImageInspect, image.tag)
+        if info is None:
+            return RegistryCheck(image.tag, now, note="not built")
+        label = ((info.Config or {}).get("Labels") or {}).get(LABEL_BASES)
+        built_on = dict(item.split("@", 1) for item in (label or "").split() if "@" in item)
+        if not built_on:
+            if label is None and image.bases():
+                return RegistryCheck(image.tag, now, info.Id, note="bases not recorded: rebuild once")
+            return RegistryCheck(image.tag, now, info.Id, note="no base to check")
+        replaced = [base for base, digest in built_on.items() if Docker.registry_digest(base) != digest]
+    except DockerError as e:
+        log_error("image.registry", f"{image.tag}: {e.failure.detail or e}")
+        return RegistryCheck(image.tag, now, note=f"unknown: {e}")
+    note = f"built on an older {', '.join(replaced)}" if replaced else ""
+    return RegistryCheck(image.tag, now, info.Id, behind=bool(replaced), note=note)
+
+
+def check_registries(refs: Sequence[str], images: dict[str, ImageRecipeConfig]) -> dict[str, RegistryCheck]:
+    """Ask about each of `refs` (a recipe's by its bases, any other by its tag) and keep the answers:
+    REGISTRY_FILE is then those, and nothing of a ref nothing uses any more. Written after each: an interrupted
+    run keeps what it had the time to learn."""
     known = read_registry_checks()
     checks = {ref: known[ref] for ref in refs if ref in known}
     for ref in refs:
-        checks[ref] = check_registry(ref)
+        recipe = find_image_recipe(ref, images)
+        checks[ref] = check_recipe(recipe) if recipe else check_registry(ref)
         write_registry_checks(checks)
     return checks
 
@@ -1632,21 +1695,30 @@ def registry_notes(rows: list[DockerImageRow], checks: dict[str, RegistryCheck])
     for row in rows:
         check = checks.get(f"{row.Repository}:{row.Tag}")
         if standing(check, row.ID):
-            row.Registry = f"{check.status}, {ago(check.checked)} ago"
+            row.Registry = f"{'behind' if check.behind else 'current'}, {ago(check.checked)} ago"
 
 
 def registry_issues(
-    refs: dict[str, list[str]], checks: dict[str, RegistryCheck], rows: list[DockerImageRow]
+    refs: dict[str, list[str]],
+    checks: dict[str, RegistryCheck],
+    rows: list[DockerImageRow],
+    images: dict[str, ImageRecipeConfig],
 ) -> list[Issue]:
-    """An image a registry said is behind its tag, for as long as that image is the one the tag is on here"""
+    """An image a registry said is behind (its tag for a pulled one, what it was built on for a recipe's), for as
+    long as that image is the one the tag is on here"""
     tag_ids = _tag_ids(rows)
     issues = []
     for ref, users in refs.items():
         check = checks.get(ref)
-        if standing(check, tag_ids.get(ref)) and check.behind:
+        if not (standing(check, tag_ids.get(ref)) and check.behind):
+            continue
+        if recipe := find_image_recipe(ref, images):
+            msg = f"{ref} was {check.note} (asked {ago(check.checked)} ago)"
+            hint = f"containerctl image build {recipe.name}, then recreate what runs it"
+        else:
             msg = f"{ref} is behind its tag on the registry (asked {ago(check.checked)} ago)"
             hint = f"docker pull {ref}, then recreate what runs it"
-            issues.append(Issue(WARNING, "image.behind", msg, hint, f"used by: {', '.join(users)}"))
+        issues.append(Issue(WARNING, "image.behind", msg, hint, f"used by: {', '.join(users)}"))
     return issues
 
 
@@ -3969,7 +4041,7 @@ class DataFetcher:
         if stale := stale_registry_issue(refs, checks):
             issues.append(stale)
         if not listings["images"].failure:
-            issues += registry_issues(refs, checks, listings["images"].rows)
+            issues += registry_issues(refs, checks, listings["images"].rows, images_config)
             registry_notes(listings["images"].rows, checks)
 
         # Projects and services come from config, so they list whatever docker does; only their status needs `ps`
@@ -4740,20 +4812,22 @@ class App:
             self.attempt(self.DELETE, name, lambda: Docker.remove_image(row.ID, force=True))
 
     def images_updates(self, row: DockerImageRow | None) -> None:
-        """Ask the registries about the pulled images of the projects and services: the one key that needs the
-        network. The answers are kept (see RegistryCheck): the REGISTRY column and the issues read them."""
-        refs = registry_refs(read_projects()[0], read_services()[0], read_image_recipes()[0])
+        """Ask the registries about the images of the projects and services, and what the recipes were built
+        on: the one key that needs the network. The answers are kept (see RegistryCheck): the REGISTRY column and
+        the issues read them."""
+        images = read_image_recipes()[0]
+        refs = registry_refs(read_projects()[0], read_services()[0], images)
         if not refs:
-            self.set_message("No project or service runs a pulled image: nothing to ask", Term.YELLOW)
+            self.set_message("No recipe, and no project or service: nothing to ask", Term.YELLOW)
             return
         self.busy(f"Asking the registries about {len(refs)} image{'s' if len(refs) > 1 else ''}")
-        self.box("Registries, asked just now", registry_lines(refs, check_registries(list(refs))))
+        self.box("Registries, asked just now", registry_lines(refs, check_registries(list(refs), images)))
 
     def images_registry(self, row: DockerImageRow | None) -> None:
         """What the registries said when last asked, every image a project or a service uses: nothing is asked"""
         refs = registry_refs(read_projects()[0], read_services()[0], read_image_recipes()[0])
         lines = registry_lines(refs, read_registry_checks())
-        self.box("Registries, as last asked ([u] asks)", lines or ["No project or service runs a pulled image"])
+        self.box("Registries, as last asked ([u] asks)", lines or ["No recipe, and no project or service"])
 
     def volume_delete(self, row: DockerVolumeRow) -> None:
         if self.ask(f"Delete volume '{row.Name}'?"):
@@ -5275,7 +5349,7 @@ def current_issues() -> list[Issue]:
     if stale := stale_registry_issue(refs, checks):
         issues.append(stale)
     if not listings["images"].failure:
-        issues += registry_issues(refs, checks, listings["images"].rows)
+        issues += registry_issues(refs, checks, listings["images"].rows, images)
     return by_severity(issues)
 
 
@@ -5524,18 +5598,21 @@ def cli_image_check(args: argparse.Namespace) -> None:
 
 
 def cli_image_updates(args: argparse.Namespace) -> None:
-    """Ask the registries whether the pulled images of projects and services are behind their tags. Exit 1 when
-    one is."""
-    refs = registry_refs(load_projects(), load_services(), load_image_recipes())
+    """Ask the registries whether the pulled images of projects and services are behind their tags, and whether
+    what the recipes were built on has been replaced. Exit 1 when one is."""
+    images = load_image_recipes()
+    refs = registry_refs(load_projects(), load_services(), images)
     if not refs:
-        print("No project or service runs a pulled image: nothing to ask")
+        print("No recipe, and no project or service: nothing to ask")
         return
-    checks = check_registries(list(refs))
+    checks = check_registries(list(refs), images)
     rows = [[ref, checks[ref].status, ", ".join(users)] for ref, users in refs.items()]
     print("\n".join(format_table(["IMAGE", "REGISTRY", "USED BY"], rows, None, [])))
     behind = [ref for ref, check in checks.items() if check.behind]
     for ref in behind:
-        print(f"\n{ref}: docker pull {ref}, then recreate what runs it")
+        recipe = find_image_recipe(ref, images)
+        fix = f"containerctl image build {recipe.name}" if recipe else f"docker pull {ref}"
+        print(f"\n{ref}: {fix}, then recreate what runs it")
     if behind:
         sys.exit(1)
 
@@ -5575,10 +5652,11 @@ CONCEPTS = [
     "               <repo>:cctl-local-NNNNNN, and the recipe tag is re-pointed at it: the previous build is",
     "               still there to go back to. `spawn` / `up` build a missing image, never rebuild one.",
     "               `image check` says when the build is stale, and diffs the Dockerfile against upstream.",
-    "               A pulled image has no recipe: `image updates` (`u` on the Images tab) asks its registry",
-    "               whether it is behind its tag: when asked, never by itself. The answer is kept, the one",
-    "               thing that is (docker can't tell it again): behind is an issue until the image is pulled,",
-    "               and so is an answer older than 2 hours, or none: `u` again, or `r` to read the last.",
+    "               `image updates` (`u` on the Images tab) asks the registries, when asked and never by",
+    "               itself: is a pulled image behind its tag, was a recipe built on a base image (its FROM)",
+    "               that has been replaced since? The answers are kept, the one thing that is (docker can't",
+    "               tell them again): behind is an issue until the image is pulled or rebuilt, and so is an",
+    "               answer older than 2 hours, or none: `u` again, or `r` to read the last.",
     "               A project image must have: the project's user and its home (`dev` and /home/dev,",
     "               unless its TOML says another `user` / `home`), bash, git (+ ssh for git@ repos),",
     "               coreutils. python3 too, for `check-local` to run inside. Its USER does not matter: the",
@@ -5651,7 +5729,7 @@ def usage(full: bool = False) -> int:
         "- containerctl image ls                        ==> list recipes: current build, versions (nags past 3)",
         "- containerctl image build <name>              ==> build <repo>:cctl-local-NNNNNN, re-point the recipe tag",
         "- containerctl image check [name]              ==> built image vs recipe, local Dockerfile vs upstream",
-        "- containerctl image updates                   ==> ask the registries: are the pulled images behind?",
+        "- containerctl image updates                   ==> ask the registries: images behind, bases replaced?",
         "──────────────────────────────────────────────",
         f"Project configs: {PROJECTS_DIR}/<name>.toml",
         f"Service configs: {SERVICES_DIR}/<name>.toml",
@@ -5893,7 +5971,7 @@ def main() -> None:
     img_check.add_argument("image", nargs="?", help="Image name (default: all)")
     img_check.set_defaults(func=cli_image_check)
 
-    img_updates = image_sub.add_parser("updates", help="Ask the registries: are the pulled images behind their tags?")
+    img_updates = image_sub.add_parser("updates", help="Ask the registries: images behind, bases replaced?")
     img_updates.set_defaults(func=cli_image_updates)
 
     # services (list)

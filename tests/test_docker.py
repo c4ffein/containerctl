@@ -1462,6 +1462,41 @@ class ImageBuildTests(unittest.TestCase):
         self.assertNotIn("-f", argv)
         self.assertEqual(self.rec.stdins[-1].name, str(self.dir / "hermes.Dockerfile"))
 
+    def test_build_writes_on_the_image_what_its_bases_are_on_their_registries_right_now(self):
+        digest = "sha256:" + "a" * 64
+        self.api.body = json.dumps({"Descriptor": {"digest": digest}})
+        (self.dir / "hermes.Dockerfile").write_text("FROM node:22 AS build\nFROM debian:12\nCOPY --from=build /a /a\n")
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(self.image.build())
+        self.assertIn(f"cctl.bases=node:22@{digest} debian:12@{digest}", self.rec.last)
+        asked = [call[1] for call in self.rec.calls if call[0] == "GET"]
+        self.assertEqual(asked, ["/distribution/node:22/json", "/distribution/debian:12/json"])
+        self.assertEqual(get_errors(), [])
+
+    def test_build_goes_on_without_what_a_registry_did_not_say(self):
+        with redirect_stdout(io.StringIO()):  # the recorder's API answers `{}`: no digest in that
+            self.assertTrue(self.image.build())
+        self.assertIn("cctl.bases=", self.rec.last)
+        self.assertEqual([e.cat for e in get_errors()], ["image.registry"])
+
+    def test_the_bases_of_a_dockerfile(self):
+        (self.dir / "hermes.Dockerfile").write_text(
+            "# FROM commented:1\n"
+            "ARG BASE=alpine:3\n"
+            "FROM --platform=linux/amd64 golang:1.23 AS Build\n"
+            "from debian\n"
+            "FROM build AS test\n"
+            "FROM ${BASE}\n"
+            "FROM scratch\n"
+            "FROM ghcr.io/you/base:1 as final\n"
+            "FROM debian:latest\n"
+            "FROM pinned@sha256:" + "c" * 64 + "\n"
+            "RUN echo FROM nothing:1\n"
+        )
+        self.assertEqual(self.image.bases(), ["golang:1.23", "debian:latest", "ghcr.io/you/base:1"])
+        (self.dir / "hermes.Dockerfile").unlink()
+        self.assertEqual(self.image.bases(), [])
+
     def test_build_with_context_sends_the_directory(self):
         (self.dir / "hermes").mkdir()
         with redirect_stdout(io.StringIO()):

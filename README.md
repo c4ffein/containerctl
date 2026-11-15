@@ -37,10 +37,11 @@ Concepts
                <repo>:cctl-local-NNNNNN, and the recipe tag is re-pointed at it: the previous build is
                still there to go back to. `spawn` / `up` build a missing image, never rebuild one.
                `image check` says when the build is stale, and diffs the Dockerfile against upstream.
-               A pulled image has no recipe: `image updates` (`u` on the Images tab) asks its registry
-               whether it is behind its tag: when asked, never by itself. The answer is kept, the one
-               thing that is (docker can't tell it again): behind is an issue until the image is pulled,
-               and so is an answer older than 2 hours, or none: `u` again, or `r` to read the last.
+               `image updates` (`u` on the Images tab) asks the registries, when asked and never by
+               itself: is a pulled image behind its tag, was a recipe built on a base image (its FROM)
+               that has been replaced since? The answers are kept, the one thing that is (docker can't
+               tell them again): behind is an issue until the image is pulled or rebuilt, and so is an
+               answer older than 2 hours, or none: `u` again, or `r` to read the last.
                A project image must have: the project's user and its home (`dev` and /home/dev,
                unless its TOML says another `user` / `home`), bash, git (+ ssh for git@ repos),
                coreutils. python3 too, for `check-local` to run inside. Its USER does not matter: the
@@ -104,7 +105,7 @@ Concepts
 - containerctl image ls                        ==> list recipes: current build, versions (nags past 3)
 - containerctl image build <name>              ==> build <repo>:cctl-local-NNNNNN, re-point the recipe tag
 - containerctl image check [name]              ==> built image vs recipe, local Dockerfile vs upstream
-- containerctl image updates                   ==> ask the registries: are the pulled images behind?
+- containerctl image updates                   ==> ask the registries: images behind, bases replaced?
 ──────────────────────────────────────────────
 Project configs: ~/.config/containerctl/projects/<name>.toml
 Service configs: ~/.config/containerctl/services/<name>.toml

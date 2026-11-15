@@ -856,7 +856,7 @@ class AppOtherTabActionTests(AppBase):
             mock.patch.object(UI, "info_box") as box,
         ):
             self.feed("u")  # no image listed at all: the question is not about a row
-            ask.assert_called_once_with(["nginx:1.27"])
+            ask.assert_called_once_with(["nginx:1.27"], {})
             title, lines = box.call_args.args[:2]
             self.assertEqual(title, "Registries, asked just now")
             self.assertEqual(lines, ["nginx:1.27: behind, asked 0s ago (service web)"])

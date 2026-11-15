@@ -158,7 +158,7 @@ class RegistryFileTests(RegistryFileBase):
         containerctl.write_registry_checks({"gone:1": RegistryCheck("gone:1", 1.0, LOCAL, REMOTE, True)})
         answers = {"nginx:1.27": RegistryCheck("nginx:1.27", 2.0, LOCAL, REMOTE, False)}
         with mock.patch.object(containerctl, "check_registry", side_effect=lambda ref: answers[ref]):
-            self.assertEqual(containerctl.check_registries(["nginx:1.27"]), answers)
+            self.assertEqual(containerctl.check_registries(["nginx:1.27"], {}), answers)
         self.assertEqual(containerctl.read_registry_checks(), answers)
 
     def test_an_interrupted_run_keeps_what_it_learned(self):
@@ -167,7 +167,7 @@ class RegistryFileTests(RegistryFileBase):
         fresh = RegistryCheck("a:1", 2.0, LOCAL, REMOTE, False)
         with mock.patch.object(containerctl, "check_registry", side_effect=[fresh, KeyboardInterrupt]):
             with self.assertRaises(KeyboardInterrupt):
-                containerctl.check_registries(["a:1", "b:1"])
+                containerctl.check_registries(["a:1", "b:1"], {})
         self.assertEqual(containerctl.read_registry_checks(), {"a:1": fresh, "b:1": before["b:1"]})
 
 
@@ -176,7 +176,7 @@ class RegistryRefsAndIssuesTests(RegistryFileBase):
         recipe = containerctl.ImageRecipeConfig(name="hermes", dockerfile=Path("h.Dockerfile"), context=Path("h"))
         projects = {
             "demo": ProjectConfig(name="demo", image="ubuntu:24.04"),
-            "built": ProjectConfig(name="built", image="hermes"),  # a recipe's: `image check` is for those
+            "built": ProjectConfig(name="built", image="hermes"),  # a recipe's: asked about by its bases
             "pinned": ProjectConfig(name="pinned", image="ubuntu@sha256:" + "c" * 64),  # nothing to be behind
         }
         services = {
@@ -186,7 +186,11 @@ class RegistryRefsAndIssuesTests(RegistryFileBase):
         }
         self.assertEqual(
             containerctl.registry_refs(projects, services, {"hermes": recipe}),
-            {"ubuntu:24.04": ["project demo", "service tool"], "nginx:latest": ["service web", "service web2"]},
+            {
+                "hermes:latest": ["recipe hermes", "project built"],  # a recipe is asked about, used or not
+                "ubuntu:24.04": ["project demo", "service tool"],
+                "nginx:latest": ["service web", "service web2"],
+            },
         )
 
     def test_behind_is_an_issue_for_as_long_as_the_tag_is_on_that_image(self):
@@ -197,7 +201,7 @@ class RegistryRefsAndIssuesTests(RegistryFileBase):
             "redis:7": RegistryCheck("redis:7", asked, LOCAL, REMOTE, False),
         }
         rows = [DockerImageRow("1" * 12, "nginx", "latest", "1MB"), DockerImageRow("1" * 12, "redis", "7", "1MB")]
-        (issue,) = containerctl.registry_issues(refs, checks, rows)
+        (issue,) = containerctl.registry_issues(refs, checks, rows, {})
         self.assertEqual((issue.level, issue.cat), (containerctl.WARNING, "image.behind"))
         self.assertEqual(issue.msg, "nginx:latest is behind its tag on the registry (asked 3d ago)")
         self.assertEqual(issue.hint, "docker pull nginx:latest, then recreate what runs it")
@@ -206,13 +210,13 @@ class RegistryRefsAndIssuesTests(RegistryFileBase):
         self.assertEqual([row.Registry for row in rows], ["behind, 3d ago", "current, 3d ago"])
 
         pulled = [DockerImageRow("2" * 12, "nginx", "latest", "1MB")]  # since: another image, nothing known of it
-        self.assertEqual(containerctl.registry_issues(refs, checks, pulled), [])
+        self.assertEqual(containerctl.registry_issues(refs, checks, pulled, {}), [])
         containerctl.registry_notes(pulled, checks)
         self.assertEqual(pulled[0].Registry, "")
-        self.assertEqual(containerctl.registry_issues(refs, checks, []), [])  # removed
-        self.assertEqual(containerctl.registry_issues({}, checks, rows), [])  # nothing uses it any more
+        self.assertEqual(containerctl.registry_issues(refs, checks, [], {}), [])  # removed
+        self.assertEqual(containerctl.registry_issues({}, checks, rows, {}), [])  # nothing uses it any more
         unknown = {"nginx:latest": RegistryCheck("nginx:latest", asked, note="unknown: The registry did not say")}
-        self.assertEqual(containerctl.registry_issues(refs, unknown, rows), [])
+        self.assertEqual(containerctl.registry_issues(refs, unknown, rows, {}), [])
 
     def test_never_asked_or_not_for_a_while_is_one_issue_for_all_of_them(self):
         refs = {"nginx:latest": ["service web"], "redis:7": ["service cache"], "ubuntu:24.04": ["project demo"]}
@@ -256,6 +260,85 @@ class RegistryRefsAndIssuesTests(RegistryFileBase):
         registry.assert_not_called()
 
 
+class RecipeBasesTests(RegistryFileBase):
+    """A recipe's build against the registries: by what it was built on (LABEL_BASES), since it has no tag there"""
+
+    def setUp(self):
+        super().setUp()
+        self.recipe = containerctl.ImageRecipeConfig(
+            name="dev", dockerfile=Path(self._tmp.name) / "dev.Dockerfile", context=Path("x")
+        )
+        self.recipe.dockerfile.write_text("FROM debian:12\nFROM node:22\n")
+
+    def check(self, label, now):
+        """`label` is what the build has (None: no such label, False: no such image); `now` what the registries say"""
+        built = None
+        if label is not False:
+            built = image([], id_=LOCAL)
+            built.Config = {"Labels": {} if label is None else {containerctl.LABEL_BASES: label}}
+
+        def registry(ref):
+            if isinstance(now[ref], Exception):
+                raise now[ref]
+            return now[ref]
+
+        with (
+            mock.patch.object(Docker, "inspect", return_value=built) as inspect,
+            mock.patch.object(Docker, "registry_digest", side_effect=registry) as asked,
+        ):
+            result = containerctl.check_recipe(self.recipe)
+        inspect.assert_called_once_with(containerctl.DockerImageInspect, "dev:latest")
+        return result, [call.args[0] for call in asked.call_args_list]
+
+    def test_built_on_what_the_registries_still_have_is_current(self):
+        label = f"debian:12@{REMOTE} node:22@{OLDER}"
+        result, asked = self.check(label, {"debian:12": REMOTE, "node:22": OLDER})
+        self.assertEqual((result.behind, result.status, result.local), (False, "current", LOCAL))
+        self.assertEqual(asked, ["debian:12", "node:22"])
+
+    def test_a_base_replaced_since_the_build_is_behind_and_named(self):
+        label = f"debian:12@{OLDER} node:22@{OLDER}"
+        result, _ = self.check(label, {"debian:12": REMOTE, "node:22": OLDER})
+        self.assertEqual((result.behind, result.status), (True, "built on an older debian:12"))
+        result, _ = self.check(label, {"debian:12": REMOTE, "node:22": REMOTE})
+        self.assertEqual(result.status, "built on an older debian:12, node:22")
+
+    def test_what_keeps_us_from_knowing_is_said(self):
+        self.assertEqual(self.check(False, {})[0].status, "not built")
+        result, asked = self.check(None, {})  # built before the label, or by hand
+        self.assertEqual((result.behind, result.status, asked), (None, "bases not recorded: rebuild once", []))
+        self.recipe.dockerfile.write_text("FROM scratch\n")
+        self.assertEqual(self.check(None, {})[0].status, "no base to check")
+        self.assertEqual(self.check("", {})[0].status, "no base to check")  # recorded: there was none to
+        silent = DockerError(Failure("The registry did not say", "", "GET /distribution/debian:12/json: HTTP 500"))
+        result, _ = self.check(f"debian:12@{REMOTE}", {"debian:12": silent})
+        self.assertEqual((result.behind, result.status), (None, "unknown: The registry did not say"))
+        self.assertEqual(containerctl.get_errors()[-1].cat, "image.registry")
+
+    def test_a_recipe_is_asked_about_as_one_and_its_issue_says_to_rebuild(self):
+        recipes = {"dev": self.recipe}
+        behind = RegistryCheck("dev:latest", time.time() - 3700, LOCAL, behind=True, note="built on an older debian:12")
+        with (
+            mock.patch.object(containerctl, "check_recipe", return_value=behind) as by_bases,
+            mock.patch.object(
+                containerctl, "check_registry", side_effect=lambda ref: RegistryCheck(ref, 1.0)
+            ) as by_tag,
+        ):
+            checks = containerctl.check_registries(["dev:latest", "nginx:1.27"], recipes)
+        by_bases.assert_called_once_with(self.recipe)
+        by_tag.assert_called_once_with("nginx:1.27")
+        refs = {"dev:latest": ["recipe dev", "project demo"]}
+        rows = [DockerImageRow("1" * 12, "dev", "latest", "1MB")]
+        (issue,) = containerctl.registry_issues(refs, checks, rows, recipes)
+        self.assertEqual(issue.msg, "dev:latest was built on an older debian:12 (asked 1h ago)")
+        self.assertEqual(issue.hint, "containerctl image build dev, then recreate what runs it")
+        self.assertEqual(issue.detail, "used by: recipe dev, project demo")
+        containerctl.registry_notes(rows, checks)
+        self.assertEqual(rows[0].Registry, "behind, 1h ago")  # the column has no room for which base
+        rebuilt = [DockerImageRow("2" * 12, "dev", "latest", "1MB")]
+        self.assertEqual(containerctl.registry_issues(refs, checks, rebuilt, recipes), [])  # another image now
+
+
 class CliImageUpdatesTests(RegistryFileBase):
     def run_cli(self, services, checks):
         with (
@@ -274,7 +357,7 @@ class CliImageUpdatesTests(RegistryFileBase):
 
     def test_nothing_to_ask(self):
         code, out = self.run_cli({}, {})
-        self.assertEqual((code, out), (0, "No project or service runs a pulled image: nothing to ask\n"))
+        self.assertEqual((code, out), (0, "No recipe, and no project or service: nothing to ask\n"))
 
     def test_every_image_its_answer_and_who_uses_it_exit_1_when_one_is_behind(self):
         services = {"web": ServiceConfig("web", "nginx:1.27"), "cache": ServiceConfig("cache", "redis:7")}
