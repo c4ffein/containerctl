@@ -14,9 +14,57 @@ import containerctl
 from containerctl import DockerContainerRow
 
 
-def container(name: str, state: str = "running", id_: str = "abc", image: str = "i") -> DockerContainerRow:
+def container(
+    name: str, state: str = "running", id_: str = "abc", image: str = "i", labels: str = ""
+) -> DockerContainerRow:
     """A `docker ps` row as the parser would return it"""
-    return DockerContainerRow(ID=id_, Names=name, Image=image, Status=f"Up ({state})", State=state)
+    return DockerContainerRow(ID=id_, Names=name, Image=image, Status=f"Up ({state})", State=state, Labels=labels)
+
+
+def as_inspected(
+    service: containerctl.ServiceConfig,
+    secrets: dict | None = None,
+    id_: str = "abc",
+    image_id: str = "sha256:" + "1" * 64,
+) -> containerctl.DockerContainerInspect:
+    """What docker answers an inspect of a container made from `service` as it is now, as far as
+    service_differences reads it: a stand-in, so only as right as our reading of docker (tests/test_real_docker.py
+    asks the real one). `secrets` is secrets.toml when it was made."""
+    env = dict(service.env) | {name: (secrets or {}).get(key, "?") for name, key in service.secrets.items()}
+    bindings: dict = {}
+    for spec in service.ports:
+        for port, ip, to in sorted(containerctl.port_bindings(spec)):
+            bindings.setdefault(port, []).append({"HostIp": ip, "HostPort": to})
+    log = {"Type": "journald", "Config": {}}  # the daemon's own, whatever it is
+    if service.log_max_size:
+        log = {"Type": "json-file", "Config": {"max-size": service.log_max_size, "max-file": str(service.log_max_file)}}
+    host = {
+        "RestartPolicy": {"Name": service.restart, "MaximumRetryCount": 0},
+        "PortBindings": bindings,
+        "Binds": list(service.volumes) or None,
+        "ReadonlyRootfs": service.read_only,
+        "Tmpfs": dict(spec.partition(":")[::2] for spec in service.tmpfs) or None,
+        "CapDrop": list(service.cap_drop) or None,
+        "CapAdd": list(service.cap_add) or None,
+        "PidsLimit": service.pids_limit or None,
+        "Memory": containerctl.size_bytes(service.memory) if service.memory else 0,
+        "NanoCpus": containerctl.nano_cpus(service.cpus) if service.cpus else 0,
+        "SecurityOpt": ["no-new-privileges"] if service.no_new_privileges else None,
+        "LogConfig": log,
+    }
+    labels = {containerctl.LABEL_SERVICE: service.name, containerctl.LABEL_ENV: ",".join(env)}
+    if service.command:
+        labels[containerctl.LABEL_COMMAND] = "1"
+    config = {
+        "Image": service.image,
+        "User": service.user,
+        "Cmd": list(service.command) or ["the-image's-own"],
+        "Env": ["PATH=/usr/local/bin:/usr/bin", "IMAGE_OWN=1", *(f"{name}={value}" for name, value in env.items())],
+        "Labels": labels,
+    }
+    return containerctl.DockerContainerInspect(
+        Id=id_, Name=f"/{service.container_name}", Created="", State={}, Image=image_id, Config=config, HostConfig=host
+    )
 
 
 def listings(failed=None, **rows) -> dict:

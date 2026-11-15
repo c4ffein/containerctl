@@ -114,7 +114,8 @@ SPAWN_WARN_AFTER = 10
 #   - an *issue* is something that is true right now and wants an action from you: docker is unreachable, a
 #     listing failed, a config file doesn't parse (error level: something is broken), a shortcut two projects
 #     define, a world-readable secrets file, too many local image versions (warning level: works, but look at
-#     it). Detected from state already in hand on every fetch, never stored, gone by itself once fixed. Nothing
+#     it). Detected from state already in hand on every fetch (the listings, the config files, and one inspect per
+#     service container, believed for a minute: see service_drift), never stored, gone by itself once fixed. Nothing
 #     to clear: its `hint` is the action. Whatever is wrong tick after tick is an issue, however briefly: a
 #     daemon that drops for ten seconds is one, for ten seconds.
 #   - an *error* is the trace of something that happened once: an action or a build that failed, what a CLI run
@@ -712,6 +713,8 @@ NETWORK_PREFIX = "cctl-net-prj-"  # one per project; mirrors CONTAINER_PREFIX
 LABEL_PROJECT = "cctl.project"
 LABEL_REPO = "cctl.repo"
 LABEL_SERVICE = "cctl.service"
+LABEL_ENV = "cctl.env"  # on a service container: the names of the env it was given, comma separated (no values)
+LABEL_COMMAND = "cctl.command"  # on a service container that was given a `command`: "1"
 LABEL_IMAGE = "cctl.image"  # on images built from a recipe
 LABEL_RECIPE = "cctl.recipe"  # sha256 of the recipe (Dockerfile + context) the image was built from
 LOCAL_VERSION_PREFIX = "cctl-local-"  # each build is <repo>:cctl-local-NNNNNN; the recipe tag is re-pointed at it
@@ -1034,29 +1037,40 @@ def resolve_enter_target(name: str, projects: dict[str, ProjectConfig]) -> tuple
 # =============================================================================
 
 
-def load_secrets() -> dict[str, str]:
-    """secrets.toml: flat `key = "value"`. Values are never logged; a malformed entry is skipped, a malformed
-    file yields nothing. A file readable by others is reported: a token is only as private as the file's mode."""
+def read_secrets() -> tuple[dict[str, str] | None, list[str]]:
+    """secrets.toml: flat `key = "value"`, and what is wrong with it, in words that have no value in them. A
+    malformed entry is left out; a file that can't be read is None (no file is no secrets: {}). Nothing is logged:
+    see load_secrets."""
     if not SECRETS_FILE.is_file():
-        return {}
+        return {}, []
     try:
         with open(SECRETS_FILE, "rb") as f:
             data = tomllib.load(f)
     except (OSError, tomllib.TOMLDecodeError) as e:
-        log_error("env.secret", f"Failed to load {SECRETS_FILE}: {e}")
-        return {}
-    if issue := secrets_mode_issue():  # a standing issue too; echoed here so `enter` shows it when it matters
-        log_error(issue.cat, f"{issue.msg}: {issue.hint}")
+        return None, [f"Failed to load {SECRETS_FILE}: {e}"]
     secrets: dict[str, str] = {}
+    problems = []
     for key, value in data.items():
         if not is_valid_env_name(key):
-            log_error("env.secret", f"Invalid key '{key}' in {SECRETS_FILE}")
-            continue
-        if not isinstance(value, str) or not value or "\x00" in value:
-            log_error("env.secret", f"Invalid value for '{key}' in {SECRETS_FILE}: must be a non-empty string")
-            continue
-        secrets[key] = value
-    return secrets
+            problems.append(f"Invalid key '{key}' in {SECRETS_FILE}")
+        elif not isinstance(value, str) or not value or "\x00" in value:
+            problems.append(f"Invalid value for '{key}' in {SECRETS_FILE}: must be a non-empty string")
+        else:
+            secrets[key] = value
+    return secrets, problems
+
+
+def load_secrets() -> dict[str, str]:
+    """secrets.toml, for a caller about to use it: what is wrong with it is logged (values never are). A malformed
+    entry is skipped, a malformed file yields nothing. A file readable by others is reported: a token is only as
+    private as the file's mode."""
+    secrets, problems = read_secrets()
+    if secrets is not None and SECRETS_FILE.is_file():
+        if issue := secrets_mode_issue():  # a standing issue too; echoed here so `enter` shows it when it matters
+            log_error(issue.cat, f"{issue.msg}: {issue.hint}")
+    for problem in problems:
+        log_error("env.secret", problem)
+    return secrets or {}
 
 
 def resolve_env(project: "ProjectConfig | ServiceConfig") -> dict[str, str]:
@@ -1108,15 +1122,13 @@ def is_valid_user_spec(text: str) -> bool:
     return len(parts) in (1, 2) and all(is_valid_id(part) for part in parts)
 
 
-LOG_DRIVER = (
-    "json-file"  # said at every run: `max-size` is this driver's option, and the daemon's default may be another
-)
+NO_NEW_PRIVILEGES = ("no-new-privileges", "no-new-privileges:true")  # how docker may hand the option back
+# Said at every run: `max-size` is this driver's option, and the daemon's default may be another
+LOG_DRIVER = "json-file"
 LOG_MAX_SIZE = "10m"
 LOG_MAX_FILE = 3
 
 # What services still want before they run for months on a server (one line each; drop the line when done):
-# TODO(services): drift: an issue when a running container no longer matches its TOML (label a config hash at run);
-#                 only the image is compared today (see service_issues)
 # TODO(services): healthcheck of our own in the TOML (the image's own already shows: see service_issues)
 # TODO(services): updates: say when a pulled image is behind its tag on the registry (needs the network, so a
 #                 command and a cache, never the fetcher); `recreate` is downtime with no way back
@@ -1538,35 +1550,197 @@ def orphan_issues(names: list[str], projects: set[str], services: set[str]) -> l
     return issues
 
 
-def is_image_id(text: str) -> bool:
-    """An image ID, short or whole: what `docker ps` has in its IMAGE column once no tag points at the image a
-    container was made of (a ref never reads as one unless it is a bare hex name of 12 or more: don't)"""
-    digits = text.removeprefix("sha256:")
-    return len(digits) >= 12 and all(c in HEX for c in digits)
-
-
 def service_issues(services: dict[str, "ServiceConfig"], containers: list[DockerContainerRow]) -> list[Issue]:
-    """What `docker ps` alone says of a service's container, against its TOML: nothing more is asked of docker.
-    - its image: `up` never changes a container, so one made of another image than the TOML's `image` goes on
-      until a `recreate`. Either the TOML now names another, or the tag itself moved (an `image build`, a pull),
-      and `docker ps` then shows the ID of the image the container is still of.
-    - its health, when the image has a HEALTHCHECK: docker says `(unhealthy)` in the status."""
+    """What `docker ps` alone says of a service's container: its health, when the image has a HEALTHCHECK (docker
+    says `(unhealthy)` in the status). How it compares to its TOML takes an inspect: see service_drift."""
     by_name = {c.Names: c for c in containers}
     issues = []
     for name, service in services.items():
         container = by_name.get(service.container_name)
-        if container is None:
-            continue
-        hint = f"containerctl service recreate {name}"
-        if is_image_id(container.Image) and not is_image_id(service.image):
-            msg = f"Service {name} runs an older {service.image}: the tag has moved since it was created"
-            issues.append(Issue(WARNING, "service.image", msg, hint, f"its image: {container.Image}"))
-        elif normalize_image_ref(container.Image) != normalize_image_ref(service.image):
-            msg = f"Service {name} runs {container.Image}, its TOML says {service.image}"
-            issues.append(Issue(WARNING, "service.image", msg, hint))
-        if "(unhealthy)" in container.Status:
+        if container is not None and "(unhealthy)" in container.Status:
             msg = f"Service {name} is unhealthy: its image's healthcheck fails"
             issues.append(Issue(WARNING, "service.health", msg, f"containerctl logs {service.container_name}"))
+    return issues
+
+
+SIZE_UNITS = {"b": 1, "k": 1024, "m": 1024**2, "g": 1024**3}
+
+
+def size_bytes(text: str) -> int:
+    """A size that is_valid_size took, as docker reads it: `512m` is 512 * 1024 * 1024"""
+    unit = SIZE_UNITS.get(text[-1].lower())
+    return int(text[:-1]) * unit if unit else int(text)
+
+
+def nano_cpus(text: str) -> int:
+    """A `cpus` that is_valid_cpus took, as docker keeps it: billionths of a CPU. No float on the way: 0.1 is one"""
+    whole, _, fraction = text.partition(".")
+    return int(whole) * 10**9 + int(fraction[:9].ljust(9, "0"))
+
+
+def port_bindings(spec: str) -> set[tuple[str, str, str]] | None:
+    """A publish spec that is_valid_port_spec took, as the bindings docker keeps for it: (container port/protocol,
+    host ip, host port), one per port of a range, the host port empty when docker is to pick one. None when which
+    port goes where is docker's choice too (ranges of different lengths): nothing to compare then."""
+    body, _, protocol = spec.rpartition("/")
+    if not body:
+        body, protocol = protocol, "tcp"
+    *host, inside = body.split(":")
+
+    def ports(text: str) -> list[int]:
+        first, _, last = text.partition("-")
+        return list(range(int(first), int(last or first) + 1))
+
+    ip = host[0] if len(host) == 2 else ""
+    if not host:
+        return {(f"{port}/{protocol}", ip, "") for port in ports(inside)}
+    outside = ports(host[-1])
+    if len(outside) != len(ports(inside)):
+        return None
+    return {(f"{port}/{protocol}", ip, str(to)) for port, to in zip(ports(inside), outside)}
+
+
+def same_image(one: str, other: str) -> bool:
+    """Two image IDs, short or whole, with `sha256:` or without: the same image?"""
+    one, other = one.removeprefix("sha256:"), other.removeprefix("sha256:")
+    return min(len(one), len(other)) >= 12 and (one.startswith(other) or other.startswith(one))
+
+
+def _caps(names: Sequence[str] | None) -> list[str]:
+    """Capabilities as one way of writing them: docker takes `CAP_CHOWN`, `chown` and `CHOWN` alike"""
+    return sorted({name.upper().removeprefix("CAP_") for name in names or []})
+
+
+def service_differences(
+    service: "ServiceConfig", info: DockerContainerInspect, secrets: dict[str, str], tag_id: str | None
+) -> list[tuple[str, str]]:
+    """Where a service's container is not what its TOML would make now: (what, the sentence saying it), none when
+    they agree. The container as docker has it (an inspect) against each field of the TOML, as `docker run` would
+    have been given it (see DockerServices.options): so a TOML edited since, a tag moved since, a secret rotated
+    since and a `docker update` by hand all show, and what docker can't have changed costs nothing to compare.
+    `secrets` is secrets.toml (a key it doesn't have is not compared); `tag_id` the image the service's `image`
+    names now (None when that is not known: not compared either). No secret value is ever in a sentence.
+    Not compared: its networks (`up` connects new ones), its scripts (they are for `exec`), and whatever the TOML
+    leaves to docker or to the image (no `command`, no `user`, `log_max_size = ""`)."""
+    found: list[tuple[str, str]] = []
+    host, config = info.HostConfig or {}, info.Config
+
+    def compare(what: str, there: object, wanted: object) -> None:
+        if there != wanted:
+            found.append((what, f"{what}: {there} on the container, {wanted} in its TOML"))
+
+    made_with = config.get("Image") or ""
+    if normalize_image_ref(made_with) != normalize_image_ref(service.image):
+        compare("image", made_with, service.image)
+    elif tag_id is not None and not same_image(info.Image, tag_id):
+        found.append(("image", f"image: an older {service.image}, the tag has moved since the container was made"))
+
+    compare("restart", (host.get("RestartPolicy") or {}).get("Name") or "no", service.restart)
+    wanted_ports = [port_bindings(spec) for spec in service.ports]
+    if None not in wanted_ports:
+        there = {
+            (port, binding.get("HostIp") or "", binding.get("HostPort") or "")
+            for port, bindings in (host.get("PortBindings") or {}).items()
+            for binding in bindings or []
+        }
+        if there != set().union(*wanted_ports):
+            said = ", ".join(sorted(f"{ip + ':' if ip else ''}{to}:{port}" for port, ip, to in there)) or "none"
+            compare("ports", said, ", ".join(service.ports) or "none")
+    compare("volumes", sorted(host.get("Binds") or []), sorted(service.volumes))
+    compare("read_only", bool(host.get("ReadonlyRootfs")), service.read_only)
+    compare("tmpfs", host.get("Tmpfs") or {}, dict(spec.partition(":")[::2] for spec in service.tmpfs))
+    compare("cap_drop", _caps(host.get("CapDrop")), _caps(service.cap_drop))
+    compare("cap_add", _caps(host.get("CapAdd")), _caps(service.cap_add))
+    compare("pids_limit", max(host.get("PidsLimit") or 0, 0), service.pids_limit)  # none: null, 0 or -1
+    compare("memory", host.get("Memory") or 0, size_bytes(service.memory) if service.memory else 0)
+    compare("cpus", host.get("NanoCpus") or 0, nano_cpus(service.cpus) if service.cpus else 0)
+    if service.user:
+        compare("user", config.get("User") or "", service.user)
+    no_new = any(opt.replace("=", ":") in NO_NEW_PRIVILEGES for opt in host.get("SecurityOpt") or [])
+    compare("no_new_privileges", no_new, service.no_new_privileges)
+    if service.log_max_size:
+        log = host.get("LogConfig") or {}
+        options = log.get("Config") or {}
+        there = (log.get("Type"), options.get("max-size"), options.get("max-file"))
+        compare("logs", there, (LOG_DRIVER, service.log_max_size, str(service.log_max_file)))
+
+    if service.command:
+        compare("command", config.get("Cmd") or [], service.command)
+    elif info.labels.get(LABEL_COMMAND):
+        found.append(("command", "command: one was given to the container, none is in its TOML"))
+
+    env = dict(item.partition("=")[::2] for item in config.get("Env") or [])
+    for name, value in service.env.items():
+        if name not in env:
+            found.append((f"env {name}", f"env {name}: not on the container"))
+        else:
+            compare(f"env {name}", repr(env[name]), repr(value))
+    for name, key in service.secrets.items():
+        if name not in env:
+            found.append((f"env {name}", f"env {name}: not on the container"))
+        elif key in secrets and env[name] != secrets[key]:
+            found.append((f"env {name}", f"env {name}: not the value secrets.toml has under '{key}' now"))
+    # What it was given and the TOML no longer has: the image's own ENV is in the container too, so only the
+    # names we wrote on it at creation (LABEL_ENV) can say which were ours. No label (made before it): not known.
+    for name in (info.labels.get(LABEL_ENV) or "").split(","):
+        if name and name not in service.env and name not in service.secrets:
+            found.append((f"env {name}", f"env {name}: given to the container, no longer in its TOML"))
+    return found
+
+
+# Seconds an inspect of a service container is believed (see service_drift): what a hand changed on the container
+# shows within that. An edit of the TOML shows at once: it is compared at every fetch.
+INSPECT_TTL = 60
+
+
+def service_drift(
+    services: dict[str, "ServiceConfig"],
+    listings: dict[str, Listing],
+    cache: dict[str, tuple[float, DockerContainerInspect]] | None = None,
+    timeout: float = QUERY_TIMEOUT,
+) -> list[Issue]:
+    """One issue per service whose container is not what its TOML would make now (see service_differences), and
+    one when docker would not say. Each service container is inspected: with a `cache` (the fetcher's, by
+    container ID, so a recreated one is new), only those it doesn't have or has had for INSPECT_TTL. The first
+    inspect docker doesn't answer is the last one asked this time: a daemon that hangs costs one `timeout`, not
+    one per service, and what the cache still has is compared all the same."""
+    if listings["containers"].failure:  # the failure is the issue
+        return []
+    by_name = {c.Names: c for c in listings["containers"].rows}
+    rows = {name: by_name[s.container_name] for name, s in services.items() if s.container_name in by_name}
+    known = cache if cache is not None else {}
+    for gone in set(known) - {row.ID for row in rows.values()}:
+        del known[gone]
+    issues = []
+    now = time.monotonic()
+    for row in rows.values():
+        if row.ID in known and now - known[row.ID][0] < INSPECT_TTL:
+            continue
+        try:
+            info = Docker.inspect(DockerContainerInspect, row.ID, timeout=timeout)
+        except DockerError as e:
+            msg = f"Service containers could not be inspected: {e}"
+            issues.append(Issue(WARNING, "service.drift", msg, e.failure.hint, e.failure.detail))
+            break
+        if info is None:  # gone since the listing: the next one says so
+            known.pop(row.ID, None)
+        else:
+            known[row.ID] = (now, info)
+
+    secrets: dict[str, str] = {}
+    if any(services[name].secrets for name in rows):
+        secrets = read_secrets()[0] or {}
+    images = [] if listings["images"].failure else listings["images"].rows
+    tags = {f"{image.Repository}:{image.Tag}": image.ID for image in images}
+    for name, row in rows.items():
+        if row.ID not in known:
+            continue
+        service = services[name]
+        tag_id = tags.get(normalize_image_ref(service.image))
+        if differences := service_differences(service, known[row.ID][1], secrets, tag_id):
+            msg = f"Service {name} is not what its TOML says: {', '.join(what for what, _ in differences)}"
+            hint = f"containerctl service recreate {name}"
+            issues.append(Issue(WARNING, "service.drift", msg, hint, "\n".join(said for _, said in differences)))
     return issues
 
 
@@ -2523,14 +2697,14 @@ class Docker:
             connection.close()
 
     @staticmethod
-    def _object(kind: type[DockerInspected], ref: str) -> dict | None:
+    def _object(kind: type[DockerInspected], ref: str, timeout: float = QUERY_TIMEOUT) -> dict | None:
         """What the daemon has under `ref` for this kind (see DockerInspected.API); None when it says there is no such
         thing (404). DockerError for anything else: not knowing is neither yes nor no, and a caller that read it
         as "no" would create, pull or report over something that is there."""
         if not kind.VALID(ref):  # here too, whoever calls: the ref is about to be part of a path
             raise DockerError(Failure("Not a name docker has anything under", "", f"refused {kind.TYPE}: {ref!r}"))
         path = kind.API.format(urllib.parse.quote(ref, safe="/:@"))
-        status, body = Docker._api(path)
+        status, body = Docker._api(path, timeout)
         if status == 404:
             return None
         try:
@@ -2823,7 +2997,7 @@ class Docker:
         return Docker.exec(container_id, [shell], interactive=True)
 
     @staticmethod
-    def inspect(cls: type[DockerInspected], ref: str):
+    def inspect(cls: type[DockerInspected], ref: str, timeout: float = QUERY_TIMEOUT):
         """One object as `cls` (DockerContainerInspect, DockerImageInspect, ...), as `docker inspect` would show it:
         the CLI hands on what the daemon answers, and we ask the daemon (see _api). None when there is no such object,
         or (after logging) when `ref` is not a name docker has anything under. DockerError when docker could not say
@@ -2833,7 +3007,7 @@ class Docker:
         if not cls.VALID(ref):
             log_error("docker.invalid_id", f"Invalid {cls.TYPE}: {ref}")
             return None
-        data = Docker._object(cls, ref)
+        data = Docker._object(cls, ref, timeout)
         if data is None:  # only a 404 is "no such object"
             return None
         row = cls.from_dict(data)
@@ -3213,10 +3387,30 @@ class DockerServices:
             env = DockerServices.prepare(service)
             if env is None:
                 return False
+        options = DockerServices.options(service, list(env))
         # `docker run` takes a single --network; the rest are connected right after creation
-        options = ["--restart", service.restart, "--label", f"{LABEL_SERVICE}={service.name}"]
         if service.networks:
             options.extend(["--network", service.networks[0]])
+        result = Docker.run_container(service.container_name, service.image, service.command, options, env=env)
+        if result.returncode != 0:
+            log_error(
+                "service.create",
+                f"Failed to create container: {result.stderr.strip()}",
+            )
+            return False
+        return DockerServices.apply_networks(service, already=set(service.networks[:1]))
+
+    @staticmethod
+    def options(service: "ServiceConfig", env_names: Sequence[str] = ()) -> list[str]:
+        """The `docker run` options that are the service's TOML, written as docker takes them: what a container is
+        made with once and for all, so not its networks (`up` connects new ones). service_differences is this,
+        read back off the container: a field added here is one to compare there. Its labels too, among them
+        what an inspect could not tell from the image's own afterwards: the names of the env it is given
+        (`env_names`), and that it is given a command."""
+        options = ["--label", f"{LABEL_SERVICE}={service.name}", "--label", f"{LABEL_ENV}={','.join(env_names)}"]
+        if service.command:
+            options += ["--label", f"{LABEL_COMMAND}=1"]
+        options += ["--restart", service.restart]
         if service.read_only:
             options.append("--read-only")
         for t in service.tmpfs:
@@ -3242,14 +3436,7 @@ class DockerServices:
         if service.log_max_size:
             options.extend(["--log-driver", LOG_DRIVER, "--log-opt", f"max-size={service.log_max_size}"])
             options.extend(["--log-opt", f"max-file={service.log_max_file}"])
-        result = Docker.run_container(service.container_name, service.image, service.command, options, env=env)
-        if result.returncode != 0:
-            log_error(
-                "service.create",
-                f"Failed to create container: {result.stderr.strip()}",
-            )
-            return False
-        return DockerServices.apply_networks(service, already=set(service.networks[:1]))
+        return options
 
     @staticmethod
     def apply_networks(service: "ServiceConfig", already: set[str] | None = None) -> bool:
@@ -3460,6 +3647,8 @@ class DataFetcher:
         self.version = 0  # how many fetches landed: the TUI redraws when it moves
         self.failures: dict[str, str] = {}  # tab key -> why the last fetch has nothing to show there (our words)
         self.notes: dict[str, str] = {}  # tab key -> why the rows listed there may not be all of them
+        # container ID -> (when, its inspect): the fetcher thread's own, see service_drift
+        self.inspected: dict[str, tuple[float, DockerContainerInspect]] = {}
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -3526,6 +3715,7 @@ class DataFetcher:
         images_config, broken_images = read_image_recipes()
         issues = broken_projects + broken_services + broken_images
         issues += detect_issues(projects_config, services_config, images_config, listings)
+        issues += service_drift(services_config, listings, self.inspected, POLL_TIMEOUT)
 
         # Projects and services come from config, so they list whatever docker does; only their status needs `ps`
         status = status_lookup(listings["containers"])
@@ -4802,7 +4992,9 @@ def current_issues() -> list[Issue]:
     services, broken_services = read_services()
     images, broken_images = read_image_recipes()
     issues = broken_projects + broken_services + broken_images
-    return by_severity(issues + detect_issues(projects, services, images, Docker.listings()))
+    listings = Docker.listings()
+    issues += detect_issues(projects, services, images, listings) + service_drift(services, listings)
+    return by_severity(issues)
 
 
 def print_issues(issues: list[Issue], file=None) -> None:
@@ -5076,10 +5268,10 @@ CONCEPTS = [
     "               `enter` shell only: never argv, never the container's config, never a project file.",
     "- service  ==> a long-lived container (cctl-svc-<name>): `docker run` written as TOML, plus scripts to",
     "               exec in it. `up` creates or starts (and connects new networks), it never changes a",
-    "               container: any other TOML edit needs `recreate` (an issue says so for the image, and when",
-    "               its tag has moved). [env] plain values, [secrets] names of keys in secrets.toml, read at",
-    "               creation: neither is in argv, both are in the container: who can `docker inspect` reads",
-    "               them. Logs are rotated (10m x 3) unless its TOML says otherwise.",
+    "               container: any other TOML edit needs `recreate` (an issue says when it no longer matches,",
+    "               or its image's tag has moved). [env] plain values, [secrets] names of keys in",
+    "               secrets.toml, read at creation: neither is in argv, both are in the container: who can",
+    "               `docker inspect` reads them. Logs are rotated (10m x 3) unless its TOML says otherwise.",
     "- image    ==> a recipe: a Dockerfile (+ context dir) beside a TOML. Each build is its own tag,",
     "               <repo>:cctl-local-NNNNNN, and the recipe tag is re-pointed at it: the previous build is",
     "               still there to go back to. `spawn` / `up` build a missing image, never rebuild one.",

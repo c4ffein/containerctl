@@ -8,7 +8,7 @@ docker is a failure instead: there, a skip would be a check that silently stoppe
 
 Nothing is pulled and no container is run: an inspect of what isn't there, one of each kind made (an image built
 `FROM scratch`, a container of it created and never started, a volume, a network), found and removed, the four
-listings, a tag moved from under a container (how `docker ps` then names its image), and a daemon that isn't there
+listings, a service container read back against its config (see service_differences), and a daemon that isn't there
 (DOCKER_HOST pointed at no socket: needs the client only).
 """
 
@@ -133,37 +133,65 @@ class WhatIsThereTests(unittest.TestCase):
         self.assertFalse(Docker.image_exists(tag))
         self.assertEqual(containerctl.get_errors(), [])  # every answer was one we could read
 
-    def test_a_container_whose_tag_has_moved_is_listed_under_its_image_id(self):
-        """service_issues reads "the tag has moved" off `docker ps`: a container made of an image its tag no longer
-        points at is listed under the image's ID, not under the ref it was made with. Is that still what docker
-        does (and with this image store)?"""
-        service = f"{self.PREFIX}-moved"
+    def test_a_service_container_as_docker_has_it_is_read_as_its_toml_then_as_what_changed(self):
+        """service_differences reads an inspect against a ServiceConfig, field by field, in docker's own shapes
+        (bytes, billionths of a CPU, one binding per port, ...). Made of every option we write, is a container
+        still read as what its config says? And once its tag has moved, once a hand has updated it, is that seen?"""
+        service = f"{self.PREFIX}-drift"
         tag, name = f"{service}:probe", f"{containerctl.SERVICE_PREFIX}{service}"
-        config = containerctl.ServiceConfig(name=service, image=tag)
+        config = containerctl.ServiceConfig(
+            name=service,
+            image=tag,
+            restart="always",
+            ports=["127.0.0.1:18080:80", "14000-14002:5000-5002/udp", "9000"],
+            volumes=[f"{tempfile.gettempdir()}:/host:ro"],
+            env={"TZ": "UTC", "EMPTY": ""},
+            secrets={"API_TOKEN": "token"},
+            command=["/nothing", "--at", "all"],
+            read_only=True,
+            tmpfs=["/tmp", "/run:size=16m"],
+            cap_drop=["ALL"],
+            cap_add=["NET_BIND_SERVICE"],
+            pids_limit=256,
+            memory="64m",
+            cpus="0.5",
+            user="101:101",
+            no_new_privileges=True,
+        )
+        secrets = {"token": "s3cr3t"}
+        env = {"TZ": "UTC", "EMPTY": "", "API_TOKEN": "s3cr3t"}
         self.later("rmi", "-f", tag)
 
         def build(content: str) -> str:
             with tempfile.TemporaryDirectory() as context:  # FROM scratch: nothing to pull
                 with open(os.path.join(context, "Dockerfile"), "w") as f:
-                    f.write(f"FROM scratch\nCOPY Dockerfile /Dockerfile\nLABEL cctl.test={content}\n")
+                    f.write(f'FROM scratch\nCOPY Dockerfile /Dockerfile\nENV IMAGE_OWN={content}\nCMD ["/own"]\n')
                 self.docker("build", "-q", "-t", tag, context)
             return Docker.inspect(containerctl.DockerImageInspect, tag).Id
 
-        def row() -> containerctl.DockerContainerRow:
-            return next(c for c in Docker.list_containers().required() if c.Names == name)
+        def differences() -> list[str]:
+            info = Docker.inspect(containerctl.DockerContainerInspect, name)
+            row = next(image for image in Docker.list_images().required() if f"{image.Repository}:{image.Tag}" == tag)
+            return [said for _, said in containerctl.service_differences(config, info, secrets, row.ID)]
 
         first = build("first")
         self.later("rmi", "-f", first)  # once the tag has moved, only its ID names it
         self.later("rm", "-f", name)  # cleanups run last first: the container goes before its images
-        self.docker("create", "--name", name, tag, "/nothing")  # created, never started: there is nothing to run
-        self.assertEqual(row().Image, tag)
-        self.assertEqual(containerctl.service_issues({service: config}, [row()]), [])
+        # As DockerServices.create_container would run it, created only: there is nothing to run
+        options = containerctl.DockerServices.options(config, list(env))
+        names = [word for key in env for word in ("-e", key)]
+        made = Docker._run(["create", *options, *names, "--name", name, tag, *config.command], env=env)
+        self.assertEqual(made.returncode, 0, made.stderr)
+        self.assertEqual(differences(), [])
+
+        self.docker("update", "--restart", "no", "--pids-limit", "99", name)  # by hand: the TOML has not moved
+        self.assertEqual([said.split(":")[0] for said in differences()], ["restart", "pids_limit"])
+        self.docker("update", "--restart", "always", "--pids-limit", "256", name)
+        self.assertEqual(differences(), [])
 
         self.assertNotEqual(build("second"), first)  # the same tag, another image
-        self.assertTrue(containerctl.is_image_id(row().Image), row().Image)
-        (issue,) = containerctl.service_issues({service: config}, [row()])
-        self.assertEqual(issue.cat, "service.image")
-        self.assertIn("the tag has moved", issue.msg)
+        self.assertEqual([said.split(":")[0] for said in differences()], ["image"])
+        self.assertEqual(containerctl.get_errors(), [])
 
 
 class ListingsTests(unittest.TestCase):

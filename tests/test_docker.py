@@ -406,6 +406,8 @@ class ProjectAndServiceRunTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--restart") + 1], "always")
         self.assertEqual(argv[argv.index("-p") + 1], "8080:80")
         self.assertEqual(argv[argv.index("-v") + 1], "/data:/data:ro")
+        labels = [argv[i + 1] for i, word in enumerate(argv) if word == "--label"]
+        self.assertEqual(labels, ["cctl.service=web", "cctl.env=FOO"])  # the names it is given: never a value
         self.assertEqual(argv[argv.index("-e") + 1], "FOO")  # the name alone: the value rides in the client's env
         self.assertEqual(self.rec.envs[-1], {"FOO": "bar"})
         self.assertNotIn("bar", " ".join(argv))
@@ -451,6 +453,7 @@ class ProjectAndServiceRunTests(unittest.TestCase):
                 self.assertTrue(DockerServices.create_container(service))
         argv = self.rec.last
         self.assertEqual([argv[i + 1] for i, a in enumerate(argv) if a == "-e"], ["TZ", "API_TOKEN"])
+        self.assertIn("cctl.env=TZ,API_TOKEN", argv)
         self.assertEqual(self.rec.envs[-1], {"TZ": "UTC", "API_TOKEN": "s3cr3t-value"})  # only what it names
         self.assertNotIn("s3cr3t-value", " ".join(word for call in self.rec.calls for word in call))
         self.assertEqual(get_errors(), [])
@@ -501,6 +504,8 @@ class ProjectAndServiceRunTests(unittest.TestCase):
         service = ServiceConfig(name="h", image="hermes:latest", command=["gateway", "run"])
         self.assertTrue(DockerServices.create_container(service))
         self.assertEqual(self.rec.last[-3:], ["hermes:latest", "gateway", "run"])
+        self.assertIn("cctl.command=1", self.rec.last)  # an inspect can't tell it from the image's own afterwards
+        self.assertIn("cctl.env=", self.rec.last)  # given none
 
     def test_create_service_container_hardening_flags(self):
         service = ServiceConfig(

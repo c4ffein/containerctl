@@ -1,6 +1,8 @@
 """Tests for TOML project/service config parsing and validation."""
 
+import dataclasses
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -21,7 +23,7 @@ from containerctl import (
     resolve_enter_target,
     resolve_env,
 )
-from tests.helper import container, listings, rejected, reset_errors
+from tests.helper import as_inspected, container, listings, rejected, reset_errors
 
 
 def write_toml(directory, name, content):
@@ -813,49 +815,6 @@ class IssueTests(unittest.TestCase):
             ],
         )
 
-    def test_a_service_on_another_image_than_its_toml_is_an_issue(self):
-        services = {
-            "same": ServiceConfig(name="same", image="nginx"),  # `nginx` and `nginx:latest` are one ref
-            "edited": ServiceConfig(name="edited", image="nginx:1.28"),
-            "moved": ServiceConfig(name="moved", image="hermes:latest"),
-            "down": ServiceConfig(name="down", image="nginx"),  # no container: nothing to say
-        }
-        rows = [
-            container("cctl-svc-same", image="nginx:latest"),
-            container("cctl-svc-edited", image="nginx:1.27"),
-            container("cctl-svc-moved", image="0123456789ab"),  # what `docker ps` shows once the tag is elsewhere
-            container("cctl-prj-moved", image="0123456789ab"),  # not a service
-        ]
-        issues = containerctl.service_issues(services, rows)
-        self.assertEqual(
-            [(i.level, i.cat, i.msg, i.hint) for i in issues],
-            [
-                (
-                    containerctl.WARNING,
-                    "service.image",
-                    "Service edited runs nginx:1.27, its TOML says nginx:1.28",
-                    "containerctl service recreate edited",
-                ),
-                (
-                    containerctl.WARNING,
-                    "service.image",
-                    "Service moved runs an older hermes:latest: the tag has moved since it was created",
-                    "containerctl service recreate moved",
-                ),
-            ],
-        )
-        with mock.patch.object(containerctl, "SECRETS_FILE", Path("/nonexistent/secrets.toml")):
-            detected = containerctl.detect_issues({}, services, {}, listings(containers=rows[:3]))
-            unknown = containerctl.detect_issues({}, services, {}, listings(failed={"containers": "boom"}))
-        self.assertEqual(detected, issues)
-        self.assertEqual([i.cat for i in unknown], ["docker"])  # no listing, no verdict
-
-    def test_what_reads_as_an_image_id(self):
-        for text in ("0123456789ab", "sha256:" + "a" * 64, "A" * 12):
-            self.assertTrue(containerctl.is_image_id(text), text)
-        for text in ("nginx", "nginx:1.27", "0123456789a", "deadbeefcafe:latest", "registry:5000/app", ""):
-            self.assertFalse(containerctl.is_image_id(text), text)
-
     def test_an_unhealthy_service_is_an_issue(self):
         services = {name: ServiceConfig(name=name, image="i") for name in ("ok", "sick")}
         sick = container("cctl-svc-sick")
@@ -866,6 +825,267 @@ class IssueTests(unittest.TestCase):
         self.assertEqual((issue.level, issue.cat), (containerctl.WARNING, "service.health"))
         self.assertEqual(issue.msg, "Service sick is unhealthy: its image's healthcheck fails")
         self.assertEqual(issue.hint, "containerctl logs cctl-svc-sick")
+
+
+SECRETS = {"web_token": "s3cr3t-value"}
+IMAGE_ID = "sha256:" + "1" * 64
+FULL = ServiceConfig(
+    name="web",
+    image="nginx:1.27",
+    restart="always",
+    ports=["127.0.0.1:8080:80", "4000-4002:5000-5002/udp", "9000"],
+    volumes=["/srv/www:/usr/share/nginx/html:ro", "cache:/var/cache"],
+    env={"TZ": "UTC", "EMPTY": ""},
+    secrets={"API_TOKEN": "web_token"},
+    command=["nginx", "-g", "daemon off;"],
+    networks=["proxy"],
+    read_only=True,
+    tmpfs=["/tmp", "/run:size=16m"],
+    cap_drop=["ALL"],
+    cap_add=["NET_BIND_SERVICE"],
+    pids_limit=256,
+    memory="512m",
+    cpus="1.5",
+    user="101:101",
+    no_new_privileges=True,
+    log_max_size="10m",
+    log_max_file=3,
+)
+
+
+class ServiceDifferencesTests(unittest.TestCase):
+    """A service's container, as an inspect has it, against its TOML: service_differences. The inspects here are
+    stand-ins (tests.helper.as_inspected): the real docker is asked in tests/test_real_docker.py."""
+
+    def setUp(self):
+        reset_errors()
+
+    def whats(self, service, info, secrets=SECRETS, tag_id=IMAGE_ID):
+        return [what for what, _ in containerctl.service_differences(service, info, secrets, tag_id)]
+
+    def test_a_container_as_its_toml_would_make_it_has_none(self):
+        for service in (FULL, ServiceConfig(name="bare", image="nginx"), ServiceConfig("x", "i", log_max_size="")):
+            self.assertEqual(
+                containerctl.service_differences(service, as_inspected(service, SECRETS), SECRETS, IMAGE_ID), []
+            )
+
+    def test_what_is_not_the_containers_to_keep_is_not_compared(self):
+        info = as_inspected(FULL, SECRETS)
+        for same in (
+            dataclasses.replace(FULL, networks=[]),  # `up` connects new ones
+            dataclasses.replace(FULL, scripts={"reload": ["nginx", "-s", "reload"]}),  # for `exec`
+            dataclasses.replace(FULL, user=""),  # left to the image
+            dataclasses.replace(FULL, log_max_size=""),  # left to the daemon
+            dataclasses.replace(FULL, cap_add=["cap_net_bind_service"]),  # one capability, written another way
+            dataclasses.replace(FULL, ports=[*FULL.ports[:2], "9000/tcp"]),
+        ):
+            self.assertEqual(self.whats(same, info), [])
+
+    def test_every_edit_of_the_toml_is_named(self):
+        info = as_inspected(FULL, SECRETS)
+        edits = {
+            "restart": {"restart": "unless-stopped"},
+            "ports": {"ports": ["127.0.0.1:8081:80", *FULL.ports[1:]]},
+            "volumes": {"volumes": FULL.volumes[:1]},
+            "read_only": {"read_only": False},
+            "tmpfs": {"tmpfs": ["/tmp", "/run:size=32m"]},
+            "cap_drop": {"cap_drop": []},
+            "cap_add": {"cap_add": ["NET_BIND_SERVICE", "CHOWN"]},
+            "pids_limit": {"pids_limit": 0},
+            "memory": {"memory": "1g"},
+            "cpus": {"cpus": "2"},
+            "user": {"user": "0"},
+            "no_new_privileges": {"no_new_privileges": False},
+            "logs": {"log_max_file": 5},
+            "command": {"command": ["nginx"]},
+            "env TZ": {"env": {"TZ": "Europe/Paris", "EMPTY": ""}},
+            "env NEW": {"env": {**FULL.env, "NEW": "1"}},
+            "env EMPTY": {"env": {"TZ": "UTC"}},  # no longer in the TOML: its label says it was given
+            "env API_TOKEN": {"secrets": {}},
+            "env OTHER": {"secrets": {**FULL.secrets, "OTHER": "web_token"}},
+        }
+        for what, change in edits.items():
+            self.assertEqual(self.whats(dataclasses.replace(FULL, **change), info), [what], what)
+        (said,) = containerctl.service_differences(dataclasses.replace(FULL, memory="1g"), info, SECRETS, IMAGE_ID)
+        self.assertEqual(said, ("memory", "memory: 536870912 on the container, 1073741824 in its TOML"))
+        self.assertEqual(self.whats(dataclasses.replace(FULL, command=[]), info), ["command"])  # by its label too
+
+    def test_a_docker_update_by_hand_is_named(self):
+        """The TOML has not moved: only an inspect can say"""
+        info = as_inspected(FULL, SECRETS)
+        info.HostConfig.update(Memory=1024**3, NanoCpus=2 * 10**9, PidsLimit=-1)
+        info.HostConfig["RestartPolicy"] = {"Name": "no", "MaximumRetryCount": 0}
+        self.assertEqual(self.whats(FULL, info), ["restart", "pids_limit", "memory", "cpus"])
+        info = as_inspected(ServiceConfig(name="bare", image="nginx"))
+        info.HostConfig["RestartPolicy"] = {"Name": "", "MaximumRetryCount": 0}  # how an old docker says "no"
+        self.assertEqual(self.whats(ServiceConfig(name="bare", image="nginx", restart="no"), info), [])
+
+    def test_the_image_is_compared_by_name_then_by_what_the_name_is_now(self):
+        info = as_inspected(FULL, SECRETS, image_id=IMAGE_ID)
+        ((what, said),) = containerctl.service_differences(
+            dataclasses.replace(FULL, image="nginx:1.28"), info, SECRETS, None
+        )
+        self.assertEqual((what, said), ("image", "image: nginx:1.27 on the container, nginx:1.28 in its TOML"))
+        moved = "sha256:" + "2" * 64
+        ((what, said),) = containerctl.service_differences(FULL, info, SECRETS, moved)
+        self.assertEqual(what, "image")
+        self.assertEqual(said, "image: an older nginx:1.27, the tag has moved since the container was made")
+        for same in (IMAGE_ID, "1" * 12, "sha256:" + "1" * 12, None):  # short as `docker images` has it; not known
+            self.assertEqual(self.whats(FULL, info, tag_id=same), [], same)
+        bare = ServiceConfig(name="bare", image="nginx")  # `nginx` and `nginx:latest` are one ref
+        self.assertEqual(self.whats(dataclasses.replace(bare, image="nginx:latest"), as_inspected(bare)), [])
+
+    def test_a_rotated_secret_is_named_and_never_shown(self):
+        info = as_inspected(FULL, SECRETS)
+        ((what, said),) = containerctl.service_differences(FULL, info, {"web_token": "the-new-one"}, IMAGE_ID)
+        self.assertEqual(what, "env API_TOKEN")
+        self.assertEqual(said, "env API_TOKEN: not the value secrets.toml has under 'web_token' now")
+        self.assertEqual(self.whats(FULL, info, secrets={}), [])  # no such key any more: nothing to compare with
+        every = containerctl.service_differences(dataclasses.replace(FULL, secrets={}), info, {"web_token": "x"}, None)
+        self.assertNotIn("s3cr3t-value", str(every))
+
+    def test_a_container_made_before_the_labels_is_compared_as_far_as_it_can_be(self):
+        info = as_inspected(FULL, SECRETS)
+        del info.Config["Labels"][containerctl.LABEL_ENV], info.Config["Labels"][containerctl.LABEL_COMMAND]
+        self.assertEqual(self.whats(FULL, info), [])
+        # what was given and is no longer in the TOML can't be told from the image's own: not said
+        self.assertEqual(self.whats(dataclasses.replace(FULL, env={}, command=[]), info), [])
+        self.assertEqual(self.whats(dataclasses.replace(FULL, env={"TZ": "CET", "EMPTY": ""}), info), ["env TZ"])
+
+    def test_sizes_cpus_and_ports_as_docker_keeps_them(self):
+        sizes = {"1": 1, "10b": 10, "2k": 2048, "512m": 512 * 1024**2, "2G": 2 * 1024**3}
+        self.assertEqual({text: containerctl.size_bytes(text) for text in sizes}, sizes)
+        cpus = {"2": 2 * 10**9, "1.5": 1_500_000_000, "0.1": 100_000_000, "0.25": 250_000_000}
+        self.assertEqual({text: containerctl.nano_cpus(text) for text in cpus}, cpus)
+        self.assertEqual(containerctl.port_bindings("80"), {("80/tcp", "", "")})
+        self.assertEqual(containerctl.port_bindings("8080:80/udp"), {("80/udp", "", "8080")})
+        self.assertEqual(containerctl.port_bindings("127.0.0.1:8080:80"), {("80/tcp", "127.0.0.1", "8080")})
+        self.assertEqual(containerctl.port_bindings("1-2:3-4"), {("3/tcp", "", "1"), ("4/tcp", "", "2")})
+        self.assertIsNone(containerctl.port_bindings("8000-8010:80"))  # docker picks one of them
+        ranged = ServiceConfig(name="r", image="i", ports=["8000-8010:80"])
+        info = as_inspected(ServiceConfig(name="r", image="i", ports=["8005:80"]))
+        self.assertEqual(self.whats(ranged, info, tag_id=None), [])  # so its ports are not compared
+
+
+class ServiceDriftTests(unittest.TestCase):
+    """service_drift: which containers are inspected and when, and what becomes of the differences"""
+
+    def setUp(self):
+        reset_errors()
+        self.services = {name: ServiceConfig(name=name, image="nginx") for name in ("a", "b", "down")}
+        self.rows = [
+            container("cctl-svc-a", id_="ida"),
+            container("cctl-svc-b", id_="idb"),
+            container("other", id_="x"),
+        ]
+        self.answers = {"ida": as_inspected(self.services["a"], id_="ida"), "idb": as_inspected(self.services["b"])}
+        self.inspect = mock.Mock(side_effect=lambda cls, ref, timeout=None: self.answer(ref))
+        for patch in (
+            mock.patch.object(containerctl.Docker, "inspect", self.inspect),
+            mock.patch.object(containerctl, "SECRETS_FILE", Path("/nonexistent/secrets.toml")),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def answer(self, ref):
+        if isinstance(self.answers.get(ref), Exception):
+            raise self.answers[ref]
+        return self.answers.get(ref)
+
+    def drift(self, cache=None, **kwargs):
+        return containerctl.service_drift(self.services, listings(containers=self.rows), cache, **kwargs)
+
+    def asked(self):
+        return [call.args[1] for call in self.inspect.call_args_list]
+
+    def test_only_the_containers_of_services_are_inspected(self):
+        self.assertEqual(self.drift(timeout=1), [])
+        self.assertEqual(self.asked(), ["ida", "idb"])
+        self.assertEqual(self.inspect.call_args.kwargs, {"timeout": 1})
+
+    def test_a_difference_is_one_issue_per_service_with_every_sentence_in_its_detail(self):
+        self.services["a"] = dataclasses.replace(self.services["a"], memory="1g", restart="always")
+        (issue,) = self.drift()
+        self.assertEqual((issue.level, issue.cat), (containerctl.WARNING, "service.drift"))
+        self.assertEqual(issue.msg, "Service a is not what its TOML says: restart, memory")
+        self.assertEqual(issue.hint, "containerctl service recreate a")
+        self.assertEqual(len(issue.detail.splitlines()), 2)
+
+    def test_the_tag_is_looked_up_in_the_images_listing(self):
+        rows = [containerctl.DockerImageRow("2" * 12, "nginx", "latest", "1MB")]
+        every = listings(containers=self.rows, images=rows)
+        self.assertEqual(len(containerctl.service_drift(self.services, every)), 2)  # both are of an older nginx
+        every = listings(failed={"images": "boom"}, containers=self.rows)
+        self.assertEqual(containerctl.service_drift(self.services, every), [])  # not known: not said
+
+    def test_with_a_cache_a_container_is_asked_about_again_only_when_its_time_is_up(self):
+        cache = {}
+        with mock.patch.object(containerctl.time, "monotonic", return_value=1000.0):
+            self.drift(cache)
+            self.drift(cache)
+        self.assertEqual(self.asked(), ["ida", "idb"])
+        with mock.patch.object(containerctl.time, "monotonic", return_value=1000.0 + containerctl.INSPECT_TTL - 1):
+            self.drift(cache)
+        self.assertEqual(self.asked(), ["ida", "idb"])
+        self.answers["ida"].HostConfig["Memory"] = 1024  # a `docker update` by hand, meanwhile
+        with mock.patch.object(containerctl.time, "monotonic", return_value=1000.0 + containerctl.INSPECT_TTL):
+            (issue,) = self.drift(cache)
+        self.assertEqual(self.asked(), ["ida", "idb", "ida", "idb"])
+        self.assertEqual(issue.msg, "Service a is not what its TOML says: memory")
+
+    def test_a_recreated_container_is_new_and_the_gone_one_forgotten(self):
+        cache = {}
+        self.drift(cache)
+        self.rows[0] = container("cctl-svc-a", id_="idnew")
+        self.answers["idnew"] = as_inspected(self.services["a"], id_="idnew")
+        self.drift(cache)
+        self.assertEqual(self.asked(), ["ida", "idb", "idnew"])
+        self.assertEqual(sorted(cache), ["idb", "idnew"])
+
+    def test_the_first_inspect_docker_does_not_answer_is_the_last_asked(self):
+        cache = {}
+        self.drift(cache)
+        silent = containerctl.DockerError(containerctl.Failure("Docker did not answer in time", "is it hung?", "raw"))
+        self.answers = {"ida": silent, "idb": silent}
+        self.services["b"] = dataclasses.replace(self.services["b"], memory="1g")
+        with mock.patch.object(containerctl.time, "monotonic", return_value=time.monotonic() + 3600):
+            issues = self.drift(cache)
+        self.assertEqual(self.asked(), ["ida", "idb", "ida"])  # one timeout, not one per service
+        self.assertEqual(
+            [(i.cat, i.msg) for i in issues],
+            [
+                ("service.drift", "Service containers could not be inspected: Docker did not answer in time"),
+                ("service.drift", "Service b is not what its TOML says: memory"),  # what is known is still compared
+            ],
+        )
+        self.assertEqual(get_errors(), [])  # state: an issue, never the log
+
+    def test_no_listing_no_inspect_and_a_container_gone_meanwhile_is_nothing(self):
+        failed = listings(failed={"containers": "boom"})
+        self.assertEqual(containerctl.service_drift(self.services, failed), [])
+        self.assertEqual(self.asked(), [])
+        self.answers["ida"] = None  # removed between the listing and the inspect
+        self.assertEqual(self.drift(), [])
+
+    def test_secrets_are_read_quietly_and_only_when_a_running_service_has_some(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "secrets.toml"
+            path.write_text('web_token = "the-new-one"\n"bad key" = "x"\n')  # world-readable, one bad entry
+            with mock.patch.object(containerctl, "SECRETS_FILE", path):
+                with mock.patch.object(containerctl, "read_secrets", wraps=containerctl.read_secrets) as read:
+                    self.drift()
+                    read.assert_not_called()
+                    self.services["a"] = dataclasses.replace(self.services["a"], secrets={"API_TOKEN": "web_token"})
+                    self.answers["ida"] = as_inspected(self.services["a"], SECRETS, id_="ida")
+                    (issue,) = self.drift()
+        self.assertEqual(issue.msg, "Service a is not what its TOML says: env API_TOKEN")
+        self.assertNotIn("the-new-one", issue.detail + issue.msg)
+        self.assertEqual(get_errors(), [])  # every fetch reads it: its problems are load_secrets's to log
+
+
+class ImageVersionIssueTests(unittest.TestCase):
+    def setUp(self):
+        reset_errors()
 
     def test_image_versions_from_docker_images_rows(self):
         image = containerctl.ImageRecipeConfig(name="hermes", dockerfile=Path("h.Dockerfile"), context=Path("h"))

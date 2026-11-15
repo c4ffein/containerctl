@@ -23,6 +23,7 @@ from containerctl import (
     App,
     DataFetcher,
     Docker,
+    DockerContainerInspect,
     DockerContainerRow,
     DockerImageRow,
     DockerNetworkRow,
@@ -40,7 +41,7 @@ from containerctl import (
     WorkspaceReport,
     log_error,
 )
-from tests.helper import RunRecorder, container, listings, reset_errors
+from tests.helper import RunRecorder, as_inspected, container, listings, reset_errors
 
 WARNING, ERROR = containerctl.WARNING, containerctl.ERROR
 DOWN = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"
@@ -1401,6 +1402,8 @@ class DataFetcherTests(unittest.TestCase):
         ]
         self.projects = {"demo": ProjectConfig(name="demo", image="i")}
         self.services = {"web": ServiceConfig(name="web", image="n")}
+        # What an inspect of the service container answers: made from the config as it is, until a test says otherwise
+        self.inspect = mock.Mock(side_effect=lambda cls, ref, timeout=None: as_inspected(self.services["web"], id_=ref))
 
     def _patches(self, projects=None, services=None, broken=(), failed=None, docker=None):
         """Config as read_* hands it back, docker as Docker.listings() does. `failed` maps listing keys to stderr;
@@ -1411,6 +1414,7 @@ class DataFetcherTests(unittest.TestCase):
             mock.patch.object(
                 Docker, "listings", docker or (lambda timeout=None: listings(failed, containers=self.containers))
             ),
+            mock.patch.object(Docker, "inspect", self.inspect),
             mock.patch.object(containerctl, "read_projects", return_value=(projects, list(broken))),
             mock.patch.object(containerctl, "read_services", return_value=(services, [])),
             mock.patch.object(containerctl, "read_image_recipes", return_value=({}, [])),
@@ -1580,6 +1584,27 @@ class DataFetcherTests(unittest.TestCase):
         self._fetch()  # fixed: the issues are simply gone, nothing to clear
         self.assertEqual(self.fetcher.get("issues"), [])
         self.assertEqual(self.log(), [])  # and none of it was ever an error
+
+    def test_a_service_container_is_inspected_once_then_believed_for_a_while(self):
+        for _ in range(3):
+            self._fetch()
+        self.inspect.assert_called_once_with(DockerContainerInspect, "def", timeout=containerctl.POLL_TIMEOUT)
+        self.assertEqual(self.fetcher.get("issues"), [])
+        # The TOML is compared at every fetch: an edit shows at the next one, with no inspect asked
+        edited = {"web": ServiceConfig(name="web", image="n", memory="512m")}
+        self._fetch(services=edited)
+        self.assertEqual(self.inspect.call_count, 1)
+        (issue,) = self.fetcher.get("issues")
+        self.assertEqual((issue.level, issue.cat), (WARNING, "service.drift"))
+        self.assertEqual(issue.msg, "Service web is not what its TOML says: memory")
+        self.assertEqual(issue.hint, "containerctl service recreate web")
+        self.assertEqual(issue.detail, "memory: 0 on the container, 536870912 in its TOML")
+        self.assertEqual(self.log(), [])  # state, not an error
+        # Recreated: another ID, asked at once, and the one that is gone is forgotten
+        self.containers[1] = container("cctl-svc-web", id_="new", image="n")
+        self._fetch()
+        self.assertEqual(self.inspect.call_args.args[1], "new")
+        self.assertEqual(list(self.fetcher.inspected), ["new"])
 
     def test_a_container_whose_config_is_gone_is_an_orphan(self):
         self._fetch(projects={}, services={})
