@@ -949,6 +949,18 @@ class ServiceDifferencesTests(unittest.TestCase):
         }
         for what, change in edits.items():
             self.assertEqual(self.whats(dataclasses.replace(FULL, **change), info), [what], what)
+        self.assertEqual(self.whats(dataclasses.replace(FULL, log_max_size="20m"), info), ["logs"])
+        # DockerServices.options writes a field, service_differences reads it back: two lists, kept by hand. A field
+        # added to ServiceConfig must be in the edits above (so: compared), or here, with why it is not
+        elsewhere = {
+            "name": "what the container is found by",
+            "image": "compared by name, then by ID: its own test",
+            "networks": "`up` connects new ones",
+            "scripts": "for `exec`, never in the container",
+            "log_max_size": "just above",
+        }
+        edited = {field for change in edits.values() for field in change}
+        self.assertEqual(edited | set(elsewhere), {field.name for field in dataclasses.fields(ServiceConfig)})
         (said,) = containerctl.service_differences(dataclasses.replace(FULL, memory="1g"), info, SECRETS, IMAGE_ID)
         self.assertEqual(said, ("memory", "memory: 536870912 on the container, 1073741824 in its TOML"))
         self.assertEqual(self.whats(dataclasses.replace(FULL, command=[]), info), ["command"])  # by its label too
