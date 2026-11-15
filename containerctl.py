@@ -70,6 +70,24 @@ TUI
 │ UI                     │ what is drawn: tabs, table, status bar, boxes, prompts                            │
 │ App                    │ the TUI itself: selection, keys, actions, main loop                               │
 └────────────────────────┴───────────────────────────────────────────────────────────────────────────────────┘
+
+IDEAS
+Current tool does what I need as it is. What could come next.
+- What is in an image, and is it out of date? A recipe that curls bun or builds nginx leaves no trace of it: no
+  scanner sees what no package manager installed. The recipe would say, per tool: how to read its version
+  (a command, `bun --version`, run once in the built image: what is really there, not what an ARG meant), where
+  its releases are announced (a GitHub repository), and what a CVE database calls it (an OSV package, an NVD
+  CPE). `image updates` would then say "bun 1.1.30 in dev, 1.2.4 released", and which CVEs that version has.
+  The version read goes in the state file by image ID (an image never changes: nothing to go stale); the answers
+  beside what the registries said, asked as rarely. Costs: one declaration per tool, two more things to ask on
+  the network. For what apt or apk installed, run a scanner that exists (trivy, grype) when there is one.
+  Have our own system that eventually generates Dockerfiles? ours could have, for each step, a linked "check version"
+  Share steps across images?
+- A recipe built FROM another recipe: say when the one below was rebuilt since (bases only know registries).
+- `service recreate` with a way back. Today a `docker run` that fails after the old container was removed, or
+  a new one that crashes, is a service down until fixed. The image and the volumes are still there: what is
+  lost is the old container's own files and, once nothing uses it, the old image's ID. Cheapest: print that ID
+  before removing. Costlier: keep the old container, stopped and renamed, restart policy off, until the next.
 """
 
 import argparse
@@ -1150,9 +1168,6 @@ NO_NEW_PRIVILEGES = ("no-new-privileges", "no-new-privileges:true")  # how docke
 LOG_DRIVER = "json-file"
 LOG_MAX_SIZE = "10m"
 LOG_MAX_FILE = 3
-
-# What services still want before they run for months on a server (one line each; drop the line when done):
-# TODO(services): `recreate` is downtime with no way back
 
 
 @dataclass
