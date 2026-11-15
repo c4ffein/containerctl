@@ -463,6 +463,35 @@ class ProjectAndServiceRunTests(unittest.TestCase):
         self.assertEqual([e.cat for e in get_errors()], ["env.secret", "service.create"])
         self.assertIn("API_TOKEN", get_errors()[-1].msg)
 
+    def test_recreate_gets_what_the_new_container_needs_before_removing_the_old_one(self):
+        service = ServiceConfig(name="web", image="nginx", networks=["proxy"])
+        with (
+            mock.patch.object(DockerServices, "find_container", return_value=container("cctl-svc-web")),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertTrue(DockerServices.recreate(service))
+        calls = self.rec.calls
+        removal = calls.index(["rm", "-f", "cctl-svc-web"])
+        self.assertLess(calls.index(["GET", "/images/nginx/json"]), removal)
+        self.assertLess(calls.index(["GET", "/networks/proxy"]), removal)
+        self.assertEqual(calls[removal + 1][:2], ["run", "-d"])  # and nothing is asked twice
+        self.assertEqual(len([call for call in calls if call[0] == "GET"]), 2)
+
+    def test_recreate_removes_nothing_when_the_new_container_could_not_be_made(self):
+        found = mock.patch.object(DockerServices, "find_container", return_value=container("cctl-svc-web"))
+        no_secrets = mock.patch.object(containerctl, "SECRETS_FILE", Path("/nonexistent/secrets.toml"))
+        no_image = mock.patch.object(containerctl, "ensure_image", return_value=False)
+        tokened = ServiceConfig(name="web", image="nginx", secrets={"API_TOKEN": "web_token"})
+        for service, patch in ((tokened, no_secrets), (ServiceConfig(name="web", image="nginx"), no_image)):
+            reset_errors()
+            self.rec.calls.clear()
+            with found, patch, redirect_stdout(io.StringIO()) as out:
+                self.assertFalse(DockerServices.recreate(service))
+            self.assertEqual([call for call in self.rec.calls if call[0] in ("rm", "run")], [])
+            self.assertEqual(get_errors()[-1].cat, "service.recreate")
+            self.assertIn("nothing was removed", get_errors()[-1].msg)
+            self.assertEqual(out.getvalue(), "")  # no "Removing..." either
+
     def test_run_container_refuses_an_env_name_that_is_not_one(self):
         result = Docker.run_container("c", "nginx", env={"BAD-NAME": "x"})
         self.assertEqual(result.returncode, containerctl.REFUSED)

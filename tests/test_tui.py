@@ -541,6 +541,20 @@ class AppRenderTests(AppBase):
             self.goto(key)
             self.assertIn(hint, self.rendered(), key)
 
+    def test_every_tab_key_is_one_the_table_can_reach(self):
+        """ACTIONS is read after the keys that move around and `q`: one of those in it would never run"""
+        tabs = {tab.key for tab in self.app.tabs}
+        for key, actions in App.ACTIONS.items():
+            self.assertIn(key, tabs)
+            keys = [action.key for action in actions]
+            self.assertEqual(len(keys), len(set(keys)), key)
+            self.assertEqual(set(keys) & {"q", *App.MOVE_KEYS}, set(), key)
+            self.goto(key)
+            bottom_line = self.rendered()
+            for action in actions:
+                self.assertIs(getattr(App, action.run.__name__), action.run)
+                self.assertIn(action.label, bottom_line)  # it names every one
+
     def test_render_flushes_in_one_write(self):
         self.containers(1)
         with mock.patch.object(containerctl.sys.stdout, "write") as write:

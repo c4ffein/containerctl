@@ -65,6 +65,7 @@ TUI
 │ ProjectRow             │ a line of the Projects tab                                                        │
 │ ServiceRow             │ a line of the Services tab                                                        │
 │ Tab                    │ a tab: its columns, and what identifies a row                                     │
+│ Action                 │ a key of a tab: its label on the bottom line, and what it does with the row       │
 │ UI                     │ what is drawn: tabs, table, status bar, boxes, prompts                            │
 │ App                    │ the TUI itself: selection, keys, actions, main loop                               │
 └────────────────────────┴───────────────────────────────────────────────────────────────────────────────────┘
@@ -1119,7 +1120,6 @@ LOG_MAX_FILE = 3
 # TODO(services): healthcheck of our own in the TOML (the image's own already shows: see service_issues)
 # TODO(services): updates: say when a pulled image is behind its tag on the registry (needs the network, so a
 #                 command and a cache, never the fetcher); `recreate` is downtime with no way back
-# TODO(tui): App._handle_key as a table of keys per tab, which the bottom line's key hints are then read from
 
 
 @dataclass
@@ -3186,21 +3186,34 @@ class DockerServices:
         return Docker.containers_by_name().get(f"{SERVICE_PREFIX}{service_name}")
 
     @staticmethod
-    def create_container(service: "ServiceConfig") -> bool:
-        """Create and start a container for a service. Its [secrets] are read from secrets.toml now, and one that
-        is not there means no container: a service that runs for months without its token is found out late."""
+    def prepare(service: "ServiceConfig") -> dict[str, str] | None:
+        """Everything a creation needs that can fail without a container: its environment (its [secrets] are read
+        from secrets.toml now), its networks, its image. The environment when all of it is there; None, and the
+        reason in the log, when some is not: a secret that is missing means no container (a service that runs for
+        months without its token is found out late). Apart from create_container so that `recreate` asks before
+        it removes anything."""
         env = resolve_env(service)  # before anything is made or pulled
         if missing := [name for name in service.secrets if name not in env]:
             log_error("service.create", f"{service.name}: no value for {', '.join(missing)}: nothing created")
-            return False
-        # `docker run` takes a single --network; the rest are connected right after creation
+            return None
         for network in service.networks:
             if not Docker.ensure_network(network):
                 log_error("service.create", f"Failed to ensure network {network}")
-                return False
+                return None
         if not ensure_image(service.image):
             log_error("service.create", f"Failed to build or pull image {service.image}")
-            return False
+            return None
+        return env
+
+    @staticmethod
+    def create_container(service: "ServiceConfig", env: dict[str, str] | None = None) -> bool:
+        """Create and start a container for a service; `env` is what `prepare` gave, for a caller that has
+        already asked (see recreate)"""
+        if env is None:
+            env = DockerServices.prepare(service)
+            if env is None:
+                return False
+        # `docker run` takes a single --network; the rest are connected right after creation
         options = ["--restart", service.restart, "--label", f"{LABEL_SERVICE}={service.name}"]
         if service.networks:
             options.extend(["--network", service.networks[0]])
@@ -3288,14 +3301,20 @@ class DockerServices:
 
     @staticmethod
     def recreate(service: "ServiceConfig") -> bool:
-        """Recreate a service container (down + up)"""
+        """Recreate a service container (down + up). What the new one needs is got first (see prepare): a
+        secret that is missing or an image that can't be pulled leaves the old container running. A `docker run`
+        that fails after that (a port taken, a bad option) still leaves none: there is no way back."""
         container = DockerServices.find_container(service.name)
+        env = DockerServices.prepare(service)
+        if env is None:
+            log_error("service.recreate", f"{service.container_name} left as it is: nothing was removed")
+            return False
         if container is not None:
             print(f"Removing {service.container_name}...")
             if not Docker.remove_container(service.container_name, force=True):
                 return False
         print(f"Creating {service.container_name}...")
-        return DockerServices.create_container(service)
+        return DockerServices.create_container(service, env)
 
 
 # =============================================================================
@@ -3535,6 +3554,17 @@ class DataFetcher:
 # =============================================================================
 # UI Components
 # =============================================================================
+
+
+@dataclass(frozen=True)
+class Action:
+    """A key of a tab: the key, what the bottom line calls it, and the App method it runs on the selected row.
+    `needs_row` unless it is for the tab as a whole (clearing the log): a key with no row to act on does nothing."""
+
+    key: str
+    label: str
+    run: Callable
+    needs_row: bool = True
 
 
 @dataclass
@@ -4096,20 +4126,7 @@ class App:
             scr.clear_line()
 
         # Status bar with keybindings
-        if self.current().key == "containers":
-            keys = "[s]tart [S]top [r]estart [L]ogs [e]xec [d]elete [o]rigin [q]uit"
-        elif self.current().key == "projects":
-            keys = "[e]nter [d]estroy [q]uit"
-        elif self.current().key == "services":
-            keys = "[u]p [d]own [r]ecreate [q]uit"
-        elif self.current().key == "networks":
-            keys = "[e]dit [d]elete [q]uit"
-        elif self.current().key == "issues":
-            keys = "[enter] details [q]uit"
-        elif self.current().key == "errors":
-            keys = "[enter] details [c]lear [q]uit"
-        else:
-            keys = "[d]elete [q]uit"
+        keys = " ".join([action.label for action in self.ACTIONS.get(self.current().key, ())] + ["[q]uit"])
         keys += f"  │  {len(items)} items"
         UI.status_bar(scr, keys, status_row, cols)
 
@@ -4149,7 +4166,7 @@ class App:
         # One snapshot for the whole keypress: the fetcher swaps the lists under us, and a row looked up twice may
         # be two different rows (the prompt naming one image, the delete taking another), or gone the second time.
         # In it, the row the key is for is the one that was on screen (see locate), not whatever sits at its index.
-        # The branches below are one elif chain: the ones that move the selection never reach the ones that use it.
+        # The branches below are one elif chain: the ones that move the selection never reach the one that uses it.
         items = self.items()
         selected, gone = self.locate(items)
         selected_id = getattr(selected, self.current().id_key) if selected else None
@@ -4209,189 +4226,190 @@ class App:
             lines = [f"The list changed: {what}.", "Nothing was done: press the key again if you still mean it."]
             UI.info_box("Selection changed", lines, rows, cols, ok=True)
 
-        # Container-specific actions
-        elif self.current().key == "containers" and selected_id:
-            container_id = selected_id
+        # What is left is a key of this tab, if anything: see ACTIONS
+        else:
+            for action in self.ACTIONS.get(self.current().key, ()):
+                if action.key == key and (selected is not None or not action.needs_row):
+                    action.run(self, selected)
+                    break
 
-            if key == "s":  # Start
-                self.busy(f"Starting {container_id[:12]}")
-                if Docker.start(container_id):
-                    self.set_message(f"Started {container_id[:12]}", Term.GREEN)
-                else:
-                    self.set_message(f"Failed to start {container_id[:12]}", Term.RED)
+    # What the keys of each tab do: ACTIONS, below them, says which key is which. Each gets the row the key was for,
+    # out of the one snapshot _handle_key took (None for the one that needs no row).
 
-            elif key == "S":  # Stop
-                self.busy(f"Stopping {container_id[:12]}")
-                if Docker.stop(container_id):
-                    self.set_message(f"Stopped {container_id[:12]}", Term.GREEN)
-                else:
-                    self.set_message(f"Failed to stop {container_id[:12]}", Term.RED)
+    def ask(self, prompt: str) -> bool:
+        rows, cols = Term.size()
+        return UI.confirm(prompt, rows - 1, cols)
 
-            elif key == "r":  # Restart
-                self.busy(f"Restarting {container_id[:12]}")
-                if Docker.restart(container_id):
-                    self.set_message(f"Restarted {container_id[:12]}", Term.GREEN)
-                else:
-                    self.set_message(f"Failed to restart {container_id[:12]}", Term.RED)
+    @staticmethod
+    def box(title: str, lines: list[str]) -> None:
+        rows, cols = Term.size()
+        UI.info_box(title, lines, rows, cols)
 
-            elif key == "L":  # Logs
-                self.exit_tui_temporarily()
-                Docker.logs(container_id, tail=100)
-                self.pause()
-                self.enter_tui()
+    def attempt(self, words: tuple[str, str, str], what: str, action: Callable[[], bool], busy: bool = True) -> None:
+        """Do `action` to `what` and say how it went. `words` are the three it is said with: ("Starting",
+        "Started", "start"), for "Starting x..." while it runs (when `busy`: what may take a while), then
+        "Started x" or "Failed to start x"."""
+        doing, done, verb = words
+        if busy:
+            self.busy(f"{doing} {what}")
+        if action():
+            self.set_message(f"{done} {what}", Term.GREEN)
+        else:
+            self.set_message(f"Failed to {verb} {what}", Term.RED)
 
-            elif key == "e":  # Exec
-                self.exit_tui_temporarily()
-                code = Docker.shell(container_id)
-                self.enter_tui()
-                self.shell_ended(selected.Names, code, container_id)
+    DELETE = ("Deleting", "Deleted", "delete")
 
-            elif key == "d":  # Delete
-                name = selected.Names
-                if UI.confirm(f"Delete container '{name}'?", rows - 1, cols):
-                    self.busy(f"Deleting {name}")
-                    if Docker.remove_container(container_id, force=True):
-                        self.set_message(f"Deleted {name}", Term.GREEN)
-                    else:
-                        self.set_message(f"Failed to delete {name}", Term.RED)
+    def container_start(self, row: DockerContainerRow) -> None:
+        self.attempt(("Starting", "Started", "start"), row.ID[:12], lambda: Docker.start(row.ID))
 
-            elif key == "o":  # Origin/source
-                name = selected.Names
-                source = container_source(container_id)
-                UI.info_box(f"Source: {source.kind}", [f"Container: {name}", *source.details], rows, cols)
+    def container_stop(self, row: DockerContainerRow) -> None:
+        self.attempt(("Stopping", "Stopped", "stop"), row.ID[:12], lambda: Docker.stop(row.ID))
 
-        # Image deletion
-        elif self.current().key == "images" and key == "d" and selected_id:
-            image_id = selected_id
-            repo = selected.Repository
-            tag = selected.Tag
-            name = f"{repo}:{tag}" if tag else repo
+    def container_restart(self, row: DockerContainerRow) -> None:
+        self.attempt(("Restarting", "Restarted", "restart"), row.ID[:12], lambda: Docker.restart(row.ID))
 
-            if UI.confirm(f"Delete image '{name}'?", rows - 1, cols):
-                self.busy(f"Deleting {name}")
-                if Docker.remove_image(image_id, force=True):
-                    self.set_message(f"Deleted {name}", Term.GREEN)
-                else:
-                    self.set_message(f"Failed to delete {name}", Term.RED)
+    def container_logs(self, row: DockerContainerRow) -> None:
+        self.exit_tui_temporarily()
+        Docker.logs(row.ID, tail=100)
+        self.pause()
+        self.enter_tui()
 
-        # Volume deletion
-        elif self.current().key == "volumes" and key == "d" and selected_id:
-            volume_name = selected_id
+    def container_shell(self, row: DockerContainerRow) -> None:
+        self.exit_tui_temporarily()
+        code = Docker.shell(row.ID)
+        self.enter_tui()
+        self.shell_ended(row.Names, code, row.ID)
 
-            if UI.confirm(f"Delete volume '{volume_name}'?", rows - 1, cols):
-                if Docker.remove_volume(volume_name):
-                    self.set_message(f"Deleted {volume_name}", Term.GREEN)
-                else:
-                    self.set_message(f"Failed to delete {volume_name}", Term.RED)
+    def container_delete(self, row: DockerContainerRow) -> None:
+        if self.ask(f"Delete container '{row.Names}'?"):
+            self.attempt(self.DELETE, row.Names, lambda: Docker.remove_container(row.ID, force=True))
 
-        # Network actions
-        elif self.current().key == "networks" and selected_id:
-            network_id = selected_id
-            name = selected.Name
+    def container_origin(self, row: DockerContainerRow) -> None:
+        source = container_source(row.ID)
+        self.box(f"Source: {source.kind}", [f"Container: {row.Names}", *source.details])
 
-            if key == "d":  # Delete
-                if UI.confirm(f"Delete network '{name}'?", rows - 1, cols):
-                    if Docker.remove_network(network_id):
-                        self.set_message(f"Deleted {name}", Term.GREEN)
-                    else:
-                        self.set_message(f"Failed to delete {name}", Term.RED)
+    def image_delete(self, row: DockerImageRow) -> None:
+        name = f"{row.Repository}:{row.Tag}" if row.Tag else row.Repository
+        if self.ask(f"Delete image '{name}'?"):
+            self.attempt(self.DELETE, name, lambda: Docker.remove_image(row.ID, force=True))
 
-            elif key == "e":  # Edit — show connected containers
-                info = Docker.inspect(DockerNetworkInspect, network_id)
-                if info:
-                    containers = info.Containers
-                    if containers:
-                        lines = [v.get("Name", k[:12]) for k, v in containers.items()]
-                    else:
-                        lines = ["No containers connected"]
-                    UI.info_box(f"Network: {info.Name}", lines, rows, cols)
-                else:
-                    self.set_message(f"Failed to inspect {name}", Term.RED)
+    def volume_delete(self, row: DockerVolumeRow) -> None:
+        if self.ask(f"Delete volume '{row.Name}'?"):
+            self.attempt(self.DELETE, row.Name, lambda: Docker.remove_volume(row.Name), busy=False)
 
-        # Project actions
-        elif self.current().key == "projects" and selected_id:
-            project_name = selected_id
-            projects, _ = read_projects()  # a broken file is already on the Issues tab
-            project = projects.get(project_name)
+    def network_delete(self, row: DockerNetworkRow) -> None:
+        if self.ask(f"Delete network '{row.Name}'?"):
+            self.attempt(self.DELETE, row.Name, lambda: Docker.remove_network(row.ID), busy=False)
 
-            if project and key == "e":  # Enter
-                self.exit_tui_temporarily()
-                code = DockerProjects.enter(project)
-                if code is None:  # why is on the main screen (and in the log): leave time to read it
-                    self.pause()
-                self.enter_tui()
-                if code is None:
-                    self.set_message(f"{project_name} was not entered: see Errors", Term.RED)
-                else:
-                    self.shell_ended(project_name, code, project.container_name)
+    def network_containers(self, row: DockerNetworkRow) -> None:
+        """Who is on it"""
+        info = Docker.inspect(DockerNetworkInspect, row.ID)
+        if not info:
+            self.set_message(f"Failed to inspect {row.Name}", Term.RED)
+            return
+        names = [v.get("Name", k[:12]) for k, v in info.Containers.items()] if info.Containers else []
+        self.box(f"Network: {info.Name}", names or ["No containers connected"])
 
-            elif project and key == "d":  # Destroy, the prompt carrying `check`'s verdict when it is DIRTY
-                self.busy(f"Checking the workspace of {project_name}")
-                question = destroy_question(project)
-                if question.names:
-                    if UI.confirm(question.text, rows - 1, cols):
-                        self.busy(f"Destroying {project_name}")
-                        # Only what the prompt named: what appeared while it was up was never agreed to
-                        if DockerProjects.destroy(project, question.names):
-                            self.set_message(f"Destroyed {project_name}", Term.GREEN)
-                        else:
-                            self.set_message(f"Failed to destroy {project_name}", Term.RED)
-                else:
-                    self.set_message(f"No container for {project_name}", Term.YELLOW)
+    def project_enter(self, row: ProjectRow) -> None:
+        project = read_projects()[0].get(row.Name)  # a broken file is already on the Issues tab
+        if not project:
+            return
+        self.exit_tui_temporarily()
+        code = DockerProjects.enter(project)
+        if code is None:  # why is on the main screen (and in the log): leave time to read it
+            self.pause()
+        self.enter_tui()
+        if code is None:
+            self.set_message(f"{row.Name} was not entered: see Errors", Term.RED)
+        else:
+            self.shell_ended(row.Name, code, project.container_name)
 
-        # Service actions
-        elif self.current().key == "services" and selected_id:
-            service_name = selected_id
-            services, _ = read_services()  # a broken file is already on the Issues tab
-            service = services.get(service_name)
+    def project_destroy(self, row: ProjectRow) -> None:
+        """The prompt carries `check`'s verdict when it is DIRTY"""
+        project = read_projects()[0].get(row.Name)
+        if not project:
+            return
+        self.busy(f"Checking the workspace of {row.Name}")
+        question = destroy_question(project)
+        if not question.names:
+            self.set_message(f"No container for {row.Name}", Term.YELLOW)
+        elif self.ask(question.text):
+            # Only what the prompt named: what appeared while it was up was never agreed to
+            destroy = ("Destroying", "Destroyed", "destroy")
+            self.attempt(destroy, row.Name, lambda: DockerProjects.destroy(project, question.names))
 
-            if service and key == "u":  # Up
-                self.exit_tui_temporarily()
-                DockerServices.up(service)
-                self.pause()
-                self.enter_tui()
+    def service_up(self, row: ServiceRow) -> None:
+        service = read_services()[0].get(row.Name)  # a broken file is already on the Issues tab
+        if not service:
+            return
+        self.exit_tui_temporarily()
+        DockerServices.up(service)
+        self.pause()
+        self.enter_tui()
 
-            elif service and key == "d":  # Down
-                if DockerServices.find_container(service_name):
-                    if UI.confirm(f"Stop service '{service_name}'?", rows - 1, cols):
-                        self.busy(f"Stopping {service_name}")
-                        if DockerServices.down(service):
-                            self.set_message(f"Stopped {service_name}", Term.GREEN)
-                        else:
-                            self.set_message(f"Failed to stop {service_name}", Term.RED)
-                else:
-                    self.set_message(f"No container for {service_name}", Term.YELLOW)
+    def service_down(self, row: ServiceRow) -> None:
+        service = read_services()[0].get(row.Name)
+        if not service:
+            return
+        if not DockerServices.find_container(row.Name):
+            self.set_message(f"No container for {row.Name}", Term.YELLOW)
+        elif self.ask(f"Stop service '{row.Name}'?"):
+            self.attempt(("Stopping", "Stopped", "stop"), row.Name, lambda: DockerServices.down(service))
 
-            elif service and key == "r":  # Recreate
-                if UI.confirm(f"Recreate service '{service_name}'?", rows - 1, cols):
-                    self.exit_tui_temporarily()
-                    if DockerServices.recreate(service):
-                        print(f"Recreated {service_name}")
-                    else:
-                        print(f"Failed to recreate {service_name}")
-                    self.pause()
-                    self.enter_tui()
+    def service_recreate(self, row: ServiceRow) -> None:
+        service = read_services()[0].get(row.Name)
+        if not service or not self.ask(f"Recreate service '{row.Name}'?"):
+            return
+        self.exit_tui_temporarily()
+        print(f"Recreated {row.Name}" if DockerServices.recreate(service) else f"Failed to recreate {row.Name}")
+        self.pause()
+        self.enter_tui()
 
-        # What a row clips, in full: an issue's message and hint, a log entry's message and context
-        elif self.current().key == "issues" and key == Term.KEY_ENTER and selected:
-            issue = selected
-            lines = textwrap.wrap(issue.msg, max(cols - 8, 20)) or [""]
-            if issue.hint:
-                lines += [""] + textwrap.wrap(issue.hint, max(cols - 8, 20))
-            for raw in issue.detail.splitlines():
-                lines += [""] + textwrap.wrap(raw, max(cols - 8, 20))
-            UI.info_box(f"{issue.level}  {issue.cat}", lines, rows, cols)
+    def details(self, row: "Issue | Event") -> None:
+        """What a row clips, in full: an issue's message, hint and detail, a log entry's message and context"""
+        width = max(Term.size()[1] - 8, 20)
+        lines = textwrap.wrap(row.msg, width) or [""]
+        if isinstance(row, Issue):
+            more = ([row.hint] if row.hint else []) + row.detail.splitlines()
+            title = f"{row.level}  {row.cat}"
+        else:
+            more = [str(row.ctx)] if row.ctx else []
+            title = f"{row.time}  {row.cat}"
+        for text in more:
+            lines += [""] + textwrap.wrap(text, width)
+        self.box(title, lines)
 
-        elif self.current().key == "errors" and key == Term.KEY_ENTER and selected:
-            event = selected
-            lines = textwrap.wrap(event.msg, max(cols - 8, 20)) or [""]
-            if event.ctx:
-                lines += [""] + textwrap.wrap(str(event.ctx), max(cols - 8, 20))
-            UI.info_box(f"{event.time}  {event.cat}", lines, rows, cols)
+    def errors_clear(self, row: Event | None) -> None:
+        if self.items() and self.ask("Clear the error log?"):
+            self.set_message(f"Cleared {clear_errors()} errors", Term.GREEN)
 
-        elif self.current().key == "errors" and key == "c" and items:
-            if UI.confirm("Clear the error log?", rows - 1, cols):
-                self.set_message(f"Cleared {clear_errors()} errors", Term.GREEN)
+    # The keys of each tab, in the order the bottom line shows them (see Action). The keys that move around are
+    # every tab's, and _handle_key's own: MOVE_KEYS.
+    ACTIONS: dict[str, tuple[Action, ...]] = {
+        "containers": (
+            Action("s", "[s]tart", container_start),
+            Action("S", "[S]top", container_stop),
+            Action("r", "[r]estart", container_restart),
+            Action("L", "[L]ogs", container_logs),
+            Action("e", "[e]xec", container_shell),
+            Action("d", "[d]elete", container_delete),
+            Action("o", "[o]rigin", container_origin),
+        ),
+        "images": (Action("d", "[d]elete", image_delete),),
+        "volumes": (Action("d", "[d]elete", volume_delete),),
+        "networks": (Action("e", "[e]dit", network_containers), Action("d", "[d]elete", network_delete)),
+        "projects": (Action("e", "[e]nter", project_enter), Action("d", "[d]estroy", project_destroy)),
+        "services": (
+            Action("u", "[u]p", service_up),
+            Action("d", "[d]own", service_down),
+            Action("r", "[r]ecreate", service_recreate),
+        ),
+        "issues": (Action(Term.KEY_ENTER, "[enter] details", details),),
+        "errors": (
+            Action(Term.KEY_ENTER, "[enter] details", details),
+            Action("c", "[c]lear", errors_clear, needs_row=False),
+        ),
+    }
 
     def enter_tui(self) -> None:
         """Enter TUI mode: our screen, and the keyboard raw for as long as we stay"""
