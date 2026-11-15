@@ -55,7 +55,17 @@ def as_inspected(
     labels = {containerctl.LABEL_SERVICE: service.name, containerctl.LABEL_ENV: ",".join(env)}
     if service.command:
         labels[containerctl.LABEL_COMMAND] = "1"
+    health = None
+    if service.health_cmd:
+        labels[containerctl.LABEL_HEALTH] = "1"
+        health = {"Test": ["CMD-SHELL", service.health_cmd]}
+        for key, field in (("Interval", "interval"), ("Timeout", "timeout"), ("StartPeriod", "start_period")):
+            if value := getattr(service, f"health_{field}"):
+                health[key] = containerctl.duration_ns(value)
+        if service.health_retries:
+            health["Retries"] = service.health_retries
     config = {
+        "Healthcheck": health,
         "Image": service.image,
         "User": service.user,
         "Cmd": list(service.command) or ["the-image's-own"],

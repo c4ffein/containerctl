@@ -443,6 +443,30 @@ class ProjectAndServiceRunTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--security-opt") + 1], "no-new-privileges")
         self.assertEqual(argv[-1], "nginx")
 
+    def test_create_service_container_healthcheck(self):
+        self.assertTrue(DockerServices.create_container(ServiceConfig(name="web", image="nginx")))
+        self.assertEqual([word for word in self.rec.last if "health" in word], [])
+        service = ServiceConfig(name="web", image="nginx", health_cmd="-x || exit 1", health_interval="30s")
+        self.assertTrue(DockerServices.create_container(service))
+        argv = self.rec.last
+        # one word each, `=` and all: a command that begins with a dash is still the value
+        self.assertIn("--health-cmd=-x || exit 1", argv)
+        self.assertIn("--health-interval=30s", argv)
+        self.assertIn("cctl.health=1", argv)
+        self.assertEqual([word for word in argv if word.startswith(("--health-timeout", "--health-retries"))], [])
+        full = ServiceConfig(
+            name="web",
+            image="nginx",
+            health_cmd="true",
+            health_timeout="5s",
+            health_start_period="1m",
+            health_retries=3,
+        )
+        self.assertTrue(DockerServices.create_container(full))
+        for word in ("--health-timeout=5s", "--health-start-period=1m", "--health-retries=3"):
+            self.assertIn(word, self.rec.last)
+        self.assertLess(self.rec.last.index("--health-retries=3"), self.rec.last.index("--name"))
+
     def test_create_service_container_secrets_never_reach_argv(self):
         service = ServiceConfig(name="web", image="nginx", env={"TZ": "UTC"}, secrets={"API_TOKEN": "web_token"})
         with tempfile.TemporaryDirectory() as d:

@@ -715,6 +715,7 @@ LABEL_REPO = "cctl.repo"
 LABEL_SERVICE = "cctl.service"
 LABEL_ENV = "cctl.env"  # on a service container: the names of the env it was given, comma separated (no values)
 LABEL_COMMAND = "cctl.command"  # on a service container that was given a `command`: "1"
+LABEL_HEALTH = "cctl.health"  # on a service container that was given a `health_cmd`: "1"
 LABEL_IMAGE = "cctl.image"  # on images built from a recipe
 LABEL_RECIPE = "cctl.recipe"  # sha256 of the recipe (Dockerfile + context) the image was built from
 LOCAL_VERSION_PREFIX = "cctl-local-"  # each build is <repo>:cctl-local-NNNNNN; the recipe tag is re-pointed at it
@@ -1116,6 +1117,17 @@ def is_valid_cpus(text: str) -> bool:
     return int(whole) > 0 or (bool(dot) and int(fraction) > 0)
 
 
+DURATION_UNITS = {"ms": 10**6, "s": 10**9, "m": 60 * 10**9, "h": 3600 * 10**9}  # in nanoseconds, docker's own unit
+
+
+def duration_ns(text: str) -> int | None:
+    """`30s`, `500ms`, `2m`, `1h`: one number and one unit (docker takes `1m30s` too: write `90s`), in
+    nanoseconds as docker keeps them; None when it is not one, or zero"""
+    digits = text.rstrip("hms")
+    unit = DURATION_UNITS.get(text[len(digits) :])
+    return int(digits) * unit if unit and _is_uint(digits, 10**6) and int(digits) > 0 else None
+
+
 def is_valid_user_spec(text: str) -> bool:
     """`--user`: name or uid, then maybe `:` and a group or gid"""
     parts = text.split(":")
@@ -1129,7 +1141,6 @@ LOG_MAX_SIZE = "10m"
 LOG_MAX_FILE = 3
 
 # What services still want before they run for months on a server (one line each; drop the line when done):
-# TODO(services): healthcheck of our own in the TOML (the image's own already shows: see service_issues)
 # TODO(services): updates: say when a pulled image is behind its tag on the registry (needs the network, so a
 #                 command and a cache, never the fetcher); `recreate` is downtime with no way back
 
@@ -1158,6 +1169,13 @@ class ServiceConfig:
     cpus: str = ""  # --cpus ("1.5"); empty = unlimited
     user: str = ""  # --user, name|uid[:group|gid]; empty = the image's own USER
     no_new_privileges: bool = False  # --security-opt no-new-privileges: setuid binaries gain nothing
+    # A healthcheck of ours, in place of the image's own if it has one: docker runs `health_cmd` in the container
+    # with its shell (so the image needs one), and a status of `(unhealthy)` is an issue (see service_issues)
+    health_cmd: str = ""  # --health-cmd; empty = the image's HEALTHCHECK, if any
+    health_interval: str = ""  # --health-interval ("30s"); these four: empty / 0 = docker's default
+    health_timeout: str = ""  # --health-timeout
+    health_start_period: str = ""  # --health-start-period
+    health_retries: int = 0  # --health-retries
     # Log rotation, on unless said otherwise: json-file without it grows until the disk is full
     log_max_size: str = LOG_MAX_SIZE  # per file; "" = no limit of ours, and the daemon's own log driver
     log_max_file: int = LOG_MAX_FILE  # files kept
@@ -1252,6 +1270,20 @@ class ServiceConfig:
         if not isinstance(no_new_privileges, bool):
             raise ConfigError("service.config", f"Invalid 'no_new_privileges' (must be true/false) in {path}")
 
+        health_cmd = data.get("health_cmd", "")
+        if not isinstance(health_cmd, str) or "\x00" in health_cmd or health_cmd != health_cmd.strip():
+            raise ConfigError("service.config", f"Invalid 'health_cmd' (a shell command line, as a string) in {path}")
+        health: dict[str, str] = {}
+        for key in ("health_interval", "health_timeout", "health_start_period"):
+            health[key] = data.get(key, "")
+            if not isinstance(health[key], str) or (health[key] and duration_ns(health[key]) is None):
+                raise ConfigError("service.config", f'Invalid \'{key}\' (a duration, as "30s" or "500ms") in {path}')
+        health_retries = data.get("health_retries", 0)
+        if isinstance(health_retries, bool) or not isinstance(health_retries, int) or not 0 <= health_retries <= 1000:
+            raise ConfigError("service.config", f"Invalid 'health_retries' (must be a positive integer) in {path}")
+        if not health_cmd and (any(health.values()) or health_retries):
+            raise ConfigError("service.config", f"'health_*' without a 'health_cmd' in {path}: nothing to time")
+
         log_max_size = data.get("log_max_size", LOG_MAX_SIZE)
         if not isinstance(log_max_size, str) or (log_max_size and not is_valid_size(log_max_size)):
             raise ConfigError("service.config", f'Invalid \'log_max_size\' (a size, as "10m"; "" for none) in {path}')
@@ -1299,6 +1331,9 @@ class ServiceConfig:
             cpus=cpus,
             user=user,
             no_new_privileges=no_new_privileges,
+            health_cmd=health_cmd,
+            health_retries=health_retries,
+            **health,
             log_max_size=log_max_size,
             log_max_file=log_max_file,
         )
@@ -1551,14 +1586,15 @@ def orphan_issues(names: list[str], projects: set[str], services: set[str]) -> l
 
 
 def service_issues(services: dict[str, "ServiceConfig"], containers: list[DockerContainerRow]) -> list[Issue]:
-    """What `docker ps` alone says of a service's container: its health, when the image has a HEALTHCHECK (docker
-    says `(unhealthy)` in the status). How it compares to its TOML takes an inspect: see service_drift."""
+    """What `docker ps` alone says of a service's container: its health, when it has a healthcheck (its TOML's
+    `health_cmd`, or the image's HEALTHCHECK): docker says `(unhealthy)` in the status. How it compares to its
+    TOML takes an inspect: see service_drift."""
     by_name = {c.Names: c for c in containers}
     issues = []
     for name, service in services.items():
         container = by_name.get(service.container_name)
         if container is not None and "(unhealthy)" in container.Status:
-            msg = f"Service {name} is unhealthy: its image's healthcheck fails"
+            msg = f"Service {name} is unhealthy: its healthcheck fails"
             issues.append(Issue(WARNING, "service.health", msg, f"containerctl logs {service.container_name}"))
     return issues
 
@@ -1621,7 +1657,7 @@ def service_differences(
     `secrets` is secrets.toml (a key it doesn't have is not compared); `tag_id` the image the service's `image`
     names now (None when that is not known: not compared either). No secret value is ever in a sentence.
     Not compared: its networks (`up` connects new ones), its scripts (they are for `exec`), and whatever the TOML
-    leaves to docker or to the image (no `command`, no `user`, `log_max_size = ""`)."""
+    leaves to docker or to the image (no `command`, no `user`, no `health_cmd`, `log_max_size = ""`)."""
     found: list[tuple[str, str]] = []
     host, config = info.HostConfig or {}, info.Config
 
@@ -1668,6 +1704,16 @@ def service_differences(
         compare("command", config.get("Cmd") or [], service.command)
     elif info.labels.get(LABEL_COMMAND):
         found.append(("command", "command: one was given to the container, none is in its TOML"))
+
+    if service.health_cmd:
+        health = config.get("Healthcheck") or {}
+        compare("health_cmd", health.get("Test") or [], ["CMD-SHELL", service.health_cmd])
+        for key, there in (("interval", "Interval"), ("timeout", "Timeout"), ("start_period", "StartPeriod")):
+            wanted = getattr(service, f"health_{key}")
+            compare(f"health_{key}", health.get(there) or 0, duration_ns(wanted) if wanted else 0)
+        compare("health_retries", health.get("Retries") or 0, service.health_retries)
+    elif info.labels.get(LABEL_HEALTH):
+        found.append(("health_cmd", "health_cmd: one was given to the container, none is in its TOML"))
 
     env = dict(item.partition("=")[::2] for item in config.get("Env") or [])
     for name, value in service.env.items():
@@ -3411,6 +3457,17 @@ class DockerServices:
         if service.command:
             options += ["--label", f"{LABEL_COMMAND}=1"]
         options += ["--restart", service.restart]
+        if service.health_cmd:
+            # `=`: the value is one word of ours whatever it begins with, never an option of docker's
+            options += ["--label", f"{LABEL_HEALTH}=1", f"--health-cmd={service.health_cmd}"]
+            for flag, value in (
+                ("--health-interval", service.health_interval),
+                ("--health-timeout", service.health_timeout),
+                ("--health-start-period", service.health_start_period),
+                ("--health-retries", str(service.health_retries or "")),
+            ):
+                if value:
+                    options.append(f"{flag}={value}")
         if service.read_only:
             options.append("--read-only")
         for t in service.tmpfs:
@@ -5401,6 +5458,8 @@ def config_usage() -> int:
         "cpus = 1.5                                # --cpus (optional; default: no limit)",
         'user = "101:101"                          # --user: name|uid[:group|gid] (optional; default: the image USER)',
         "no_new_privileges = true                  # setuid binaries gain nothing (optional; default: false)",
+        'health_cmd = "curl -fsS localhost || exit 1"  # run in the container, by its shell: unhealthy is an issue',
+        'health_interval = "30s"                   # health_timeout, health_start_period, health_retries (optional)',
         'log_max_size = "10m"                      # log rotation, per file (default "10m"; "" = docker\'s own setup)',
         "log_max_file = 3                          # log files kept (default 3)",
         "[scripts]                                 # `containerctl service script <name> reload`",

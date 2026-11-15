@@ -337,6 +337,39 @@ class ServiceConfigTests(unittest.TestCase):
         cfg = ServiceConfig.from_toml(write_toml(self.dir, "web", 'image = "nginx"\nlog_max_size = ""\n'))
         self.assertEqual(cfg.log_max_size, "")
 
+    def test_healthcheck_parsed(self):
+        cfg = ServiceConfig.from_toml(write_toml(self.dir, "web", 'image = "nginx"\n'))
+        self.assertEqual((cfg.health_cmd, cfg.health_interval, cfg.health_retries), ("", "", 0))
+        body = (
+            'image = "nginx"\nhealth_cmd = "curl -fsS http://localhost/ || exit 1"\nhealth_interval = "30s"\n'
+            'health_timeout = "500ms"\nhealth_start_period = "1m"\nhealth_retries = 5\n'
+        )
+        cfg = ServiceConfig.from_toml(write_toml(self.dir, "web", body))
+        self.assertEqual(cfg.health_cmd, "curl -fsS http://localhost/ || exit 1")
+        self.assertEqual((cfg.health_interval, cfg.health_timeout, cfg.health_start_period), ("30s", "500ms", "1m"))
+        self.assertEqual(cfg.health_retries, 5)
+        durations = {"30s": 30 * 10**9, "500ms": 5 * 10**8, "2m": 120 * 10**9, "1h": 3600 * 10**9}
+        self.assertEqual({text: containerctl.duration_ns(text) for text in durations}, durations)
+        for text in ("", "30", "s", "0s", "1m30s", "-5s", "5 s", "5d", "1.5s", "٣s"):
+            self.assertIsNone(containerctl.duration_ns(text), text)
+
+    def test_healthcheck_rejected(self):
+        for body in (
+            'health_cmd = ["curl", "localhost"]\n',
+            'health_cmd = " true"\n',
+            'health_cmd = "true"\nhealth_interval = 30\n',
+            'health_cmd = "true"\nhealth_interval = "30"\n',
+            'health_cmd = "true"\nhealth_timeout = "1m30s"\n',
+            'health_cmd = "true"\nhealth_start_period = "soon"\n',
+            'health_cmd = "true"\nhealth_retries = -1\n',
+            'health_cmd = "true"\nhealth_retries = "3"\n',
+            'health_interval = "30s"\n',  # of what?
+            "health_retries = 3\n",
+        ):
+            reset_errors()
+            path = write_toml(self.dir, "web", 'image = "nginx"\n' + body)
+            self.assertEqual(rejected(ServiceConfig.from_toml, path).cat, "service.config", body)
+
     def test_limits_and_logs_rejected(self):
         for body in (
             "memory = 512\n",
@@ -823,7 +856,7 @@ class IssueTests(unittest.TestCase):
         rows[0].Status, rows[2].Status = "Up 3 hours (healthy)", "Up 1 hour (unhealthy)"  # not ours to speak of
         (issue,) = containerctl.service_issues(services, rows)
         self.assertEqual((issue.level, issue.cat), (containerctl.WARNING, "service.health"))
-        self.assertEqual(issue.msg, "Service sick is unhealthy: its image's healthcheck fails")
+        self.assertEqual(issue.msg, "Service sick is unhealthy: its healthcheck fails")
         self.assertEqual(issue.hint, "containerctl logs cctl-svc-sick")
 
 
@@ -848,6 +881,11 @@ FULL = ServiceConfig(
     cpus="1.5",
     user="101:101",
     no_new_privileges=True,
+    health_cmd="curl -fsS http://localhost/ || exit 1",
+    health_interval="30s",
+    health_timeout="500ms",
+    health_start_period="1m",
+    health_retries=5,
     log_max_size="10m",
     log_max_file=3,
 )
@@ -897,6 +935,11 @@ class ServiceDifferencesTests(unittest.TestCase):
             "user": {"user": "0"},
             "no_new_privileges": {"no_new_privileges": False},
             "logs": {"log_max_file": 5},
+            "health_cmd": {"health_cmd": "true"},
+            "health_interval": {"health_interval": "10s"},
+            "health_timeout": {"health_timeout": ""},
+            "health_start_period": {"health_start_period": "2m"},
+            "health_retries": {"health_retries": 3},
             "command": {"command": ["nginx"]},
             "env TZ": {"env": {"TZ": "Europe/Paris", "EMPTY": ""}},
             "env NEW": {"env": {**FULL.env, "NEW": "1"}},
@@ -909,6 +952,11 @@ class ServiceDifferencesTests(unittest.TestCase):
         (said,) = containerctl.service_differences(dataclasses.replace(FULL, memory="1g"), info, SECRETS, IMAGE_ID)
         self.assertEqual(said, ("memory", "memory: 536870912 on the container, 1073741824 in its TOML"))
         self.assertEqual(self.whats(dataclasses.replace(FULL, command=[]), info), ["command"])  # by its label too
+        no_health = dataclasses.replace(
+            FULL, health_cmd="", health_interval="", health_timeout="", health_start_period="", health_retries=0
+        )
+        self.assertEqual(self.whats(no_health, info), ["health_cmd"])  # by its label as well
+        self.assertEqual(self.whats(no_health, as_inspected(no_health, SECRETS)), [])  # the image's own: not ours
 
     def test_a_docker_update_by_hand_is_named(self):
         """The TOML has not moved: only an inspect can say"""

@@ -157,6 +157,11 @@ class WhatIsThereTests(unittest.TestCase):
             cpus="0.5",
             user="101:101",
             no_new_privileges=True,
+            health_cmd="/nothing --healthy || exit 1",
+            health_interval="30s",
+            health_timeout="500ms",
+            health_start_period="1m",
+            health_retries=5,
         )
         secrets = {"token": "s3cr3t"}
         env = {"TZ": "UTC", "EMPTY": "", "API_TOKEN": "s3cr3t"}
