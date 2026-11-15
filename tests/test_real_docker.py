@@ -6,10 +6,11 @@ fake can vouch for. Every other test file plays docker and so pins our side only
 Skipped without docker, like the rest of the collection's integration suites. With CCTL_REAL_DOCKER=1 (CI) a missing
 docker is a failure instead: there, a skip would be a check that silently stopped checking.
 
-Nothing is pulled and no container is run: an inspect of what isn't there, one of each kind made (an image built
-`FROM scratch`, a container of it created and never started, a volume, a network), found and removed, the four
-listings, a service container read back against its config (see service_differences), and a daemon that isn't there
-(DOCKER_HOST pointed at no socket: needs the client only).
+No container is run, and nothing is pulled but one tiny image (RegistryTests: the one test that needs the
+network): an inspect of what isn't there, one of each kind made (an image built `FROM scratch`, a container of it
+created and never started, a volume, a network), found and removed, the four listings, a service container read
+back against its config (see service_differences), and a daemon that isn't there (DOCKER_HOST pointed at no
+socket: needs the client only).
 """
 
 import os
@@ -197,6 +198,34 @@ class WhatIsThereTests(unittest.TestCase):
         self.assertNotEqual(build("second"), first)  # the same tag, another image
         self.assertEqual([said.split(":")[0] for said in differences()], ["image"])
         self.assertEqual(containerctl.get_errors(), [])
+
+
+class RegistryTests(unittest.TestCase):
+    """The one test that pulls: check_registry compares what the daemon's /distribution answers for a tag with the
+    digests the local image was pulled as. Are those still the same thing, for an image pulled a moment ago?"""
+
+    IMAGE = "hello-world:latest"  # a few kB
+
+    @classmethod
+    def setUpClass(cls):
+        need_daemon()
+        pulled = subprocess.run(["docker", "pull", "-q", cls.IMAGE], capture_output=True, text=True, timeout=300)
+        need(f"docker pull {cls.IMAGE} failed: {pulled.stderr.strip()}", pulled.returncode == 0)
+
+    def setUp(self):
+        reset_errors()
+
+    def test_an_image_pulled_just_now_is_current(self):
+        check = containerctl.check_registry(self.IMAGE)
+        self.assertEqual((check.status, containerctl.get_errors()), ("current", []))
+        self.assertTrue(check.remote.startswith("sha256:"), check.remote)
+        row = next(i for i in Docker.list_images().required() if f"{i.Repository}:{i.Tag}" == self.IMAGE)
+        self.assertTrue(containerctl.standing(check, row.ID))  # the ID of the listing and the inspect's: one image
+
+    def test_an_image_nobody_has_is_one_the_registry_does_not_say_for(self):
+        with self.assertRaises(containerctl.DockerError) as raised:
+            Docker.registry_digest(f"cctl-test-no-such-repository-{os.getpid()}:nope")
+        self.assertEqual(str(raised.exception), "The registry did not say")
 
 
 class ListingsTests(unittest.TestCase):

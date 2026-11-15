@@ -41,7 +41,7 @@ from containerctl import (
     WorkspaceReport,
     log_error,
 )
-from tests.helper import RunRecorder, as_inspected, container, listings, reset_errors
+from tests.helper import RunRecorder, as_inspected, asked, container, listings, reset_errors
 
 WARNING, ERROR = containerctl.WARNING, containerctl.ERROR
 DOWN = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"
@@ -536,7 +536,7 @@ class AppRenderTests(AppBase):
             "networks": "[e]dit [d]elete",
             "issues": "[q]uit",
             "errors": "[q]uit",
-            "images": "[d]elete [q]uit",
+            "images": "[d]elete [u]pdates? [r]egistry [q]uit",
         }
         for key, hint in expectations.items():
             self.goto(key)
@@ -843,6 +843,55 @@ class AppOtherTabActionTests(AppBase):
             self.feed("d")
         confirm.assert_called_once_with("Delete image 'nginx:1.27'?", self.ROWS - 1, self.COLS)
         self.assertEqual(self.rec.last, ["rmi", "-f", "sha"])
+
+    def test_u_on_the_images_tab_asks_the_registries_with_or_without_a_row(self):
+        self.goto("images")
+        services = {"web": ServiceConfig(name="web", image="nginx:1.27")}
+        check = containerctl.RegistryCheck("nginx:1.27", time.time(), "sha256:" + "1" * 64, "sha256:" + "a" * 64, True)
+        with (
+            mock.patch.object(containerctl, "read_projects", return_value=({}, [])),
+            mock.patch.object(containerctl, "read_services", return_value=(services, [])),
+            mock.patch.object(containerctl, "read_image_recipes", return_value=({}, [])),
+            mock.patch.object(containerctl, "check_registries", return_value={"nginx:1.27": check}) as ask,
+            mock.patch.object(UI, "info_box") as box,
+        ):
+            self.feed("u")  # no image listed at all: the question is not about a row
+            ask.assert_called_once_with(["nginx:1.27"])
+            title, lines = box.call_args.args[:2]
+            self.assertEqual(title, "Registries, asked just now")
+            self.assertEqual(lines, ["nginx:1.27: behind, asked 0s ago (service web)"])
+            self.assertIn("Asking the registries about 1 image...", plain(self.out.getvalue()))
+        with (
+            mock.patch.object(containerctl, "read_projects", return_value=({}, [])),
+            mock.patch.object(containerctl, "read_services", return_value=({}, [])),
+            mock.patch.object(containerctl, "read_image_recipes", return_value=({}, [])),
+            mock.patch.object(containerctl, "check_registries") as ask,
+        ):
+            self.feed("u")
+            ask.assert_not_called()
+        self.assertIn("nothing to ask", self.app.message_text)
+
+    def test_r_on_the_images_tab_reads_what_the_registries_said_and_asks_nothing(self):
+        self.goto("images")
+        services = {"web": ServiceConfig(name="web", image="nginx:1.27"), "db": ServiceConfig(name="db", image="pg:16")}
+        kept = asked("nginx:1.27", behind=None, note="unknown: The registry did not say", checked=time.time() - 7300)
+        with (
+            mock.patch.object(containerctl, "read_projects", return_value=({}, [])),
+            mock.patch.object(containerctl, "read_services", return_value=(services, [])),
+            mock.patch.object(containerctl, "read_image_recipes", return_value=({}, [])),
+            mock.patch.object(containerctl, "read_registry_checks", return_value=kept),
+            mock.patch.object(containerctl, "check_registry") as ask,
+            mock.patch.object(UI, "info_box") as box,
+        ):
+            self.feed("r")
+        ask.assert_not_called()
+        self.assertEqual(
+            box.call_args.args[1],
+            [
+                "nginx:1.27: unknown: The registry did not say, asked 2h ago (service web)",
+                "pg:16: never asked (service db)",
+            ],
+        )
 
     def test_a_keypress_acts_on_one_snapshot_of_the_list(self):
         """The fetcher swaps the lists between two reads: the row named in the prompt is the row deleted"""
@@ -1402,6 +1451,7 @@ class DataFetcherTests(unittest.TestCase):
         ]
         self.projects = {"demo": ProjectConfig(name="demo", image="i")}
         self.services = {"web": ServiceConfig(name="web", image="n")}
+        self.checks = asked("i:latest", "n:latest")  # what the registries said, a moment ago: nothing to say of it
         # What an inspect of the service container answers: made from the config as it is, until a test says otherwise
         self.inspect = mock.Mock(side_effect=lambda cls, ref, timeout=None: as_inspected(self.services["web"], id_=ref))
 
@@ -1415,6 +1465,7 @@ class DataFetcherTests(unittest.TestCase):
                 Docker, "listings", docker or (lambda timeout=None: listings(failed, containers=self.containers))
             ),
             mock.patch.object(Docker, "inspect", self.inspect),
+            mock.patch.object(containerctl, "read_registry_checks", lambda: dict(self.checks)),
             mock.patch.object(containerctl, "read_projects", return_value=(projects, list(broken))),
             mock.patch.object(containerctl, "read_services", return_value=(services, [])),
             mock.patch.object(containerctl, "read_image_recipes", return_value=({}, [])),
@@ -1605,6 +1656,25 @@ class DataFetcherTests(unittest.TestCase):
         self._fetch()
         self.assertEqual(self.inspect.call_args.args[1], "new")
         self.assertEqual(list(self.fetcher.inspected), ["new"])
+
+    def test_what_the_registries_said_last_is_read_at_every_fetch_never_asked(self):
+        rows = [DockerImageRow("1" * 12, "n", "latest", "1MB"), DockerImageRow("9" * 12, "other", "1", "1MB")]
+        self.checks.update(asked("n:latest", behind=True, checked=time.time() - 3700))
+        with mock.patch.object(Docker, "registry_digest") as registry:
+            self._fetch(docker=lambda timeout=None: listings(containers=self.containers, images=rows))
+        registry.assert_not_called()
+        (issue,) = self.fetcher.get("issues")
+        self.assertEqual(
+            (issue.cat, issue.msg), ("image.behind", "n:latest is behind its tag on the registry (asked 1h ago)")
+        )
+        self.assertEqual(issue.detail, "used by: service web")
+        self.assertEqual([image.Registry for image in self.fetcher.get("images")], ["behind, 1h ago", ""])
+        # The file gone, or never written: nothing is behind any more, and nothing was ever asked
+        self.checks.clear()
+        self._fetch(failed={"images": "boom"})  # said from the file alone, whatever docker does
+        unchecked = [i for i in self.fetcher.get("issues") if i.cat == "image.unchecked"]
+        self.assertEqual([i.msg for i in unchecked], ["2 images not checked against the registry for over 2h"])
+        self.assertEqual(unchecked[0].detail, "i:latest: never asked\nn:latest: never asked")
 
     def test_a_container_whose_config_is_gone_is_an_orphan(self):
         self._fetch(projects={}, services={})

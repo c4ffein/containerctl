@@ -37,6 +37,10 @@ Concepts
                <repo>:cctl-local-NNNNNN, and the recipe tag is re-pointed at it: the previous build is
                still there to go back to. `spawn` / `up` build a missing image, never rebuild one.
                `image check` says when the build is stale, and diffs the Dockerfile against upstream.
+               A pulled image has no recipe: `image updates` (`u` on the Images tab) asks its registry
+               whether it is behind its tag: when asked, never by itself. The answer is kept, the one
+               thing that is (docker can't tell it again): behind is an issue until the image is pulled,
+               and so is an answer older than 2 hours, or none: `u` again, or `r` to read the last.
                A project image must have: the project's user and its home (`dev` and /home/dev,
                unless its TOML says another `user` / `home`), bash, git (+ ssh for git@ repos),
                coreutils. python3 too, for `check-local` to run inside. Its USER does not matter: the
@@ -100,9 +104,11 @@ Concepts
 - containerctl image ls                        ==> list recipes: current build, versions (nags past 3)
 - containerctl image build <name>              ==> build <repo>:cctl-local-NNNNNN, re-point the recipe tag
 - containerctl image check [name]              ==> built image vs recipe, local Dockerfile vs upstream
+- containerctl image updates                   ==> ask the registries: are the pulled images behind?
 ──────────────────────────────────────────────
 Project configs: ~/.config/containerctl/projects/<name>.toml
 Service configs: ~/.config/containerctl/services/<name>.toml
 Image recipes:   ~/.config/containerctl/images/<name>.toml + <name>.Dockerfile [+ <name>/ build context]
 Secrets:         ~/.config/containerctl/secrets.toml (chmod 600; a [secrets] table picks keys from it)
+Kept:            ~/.local/state/containerctl/registry.json (what the registries said: see `image updates`)
 ```

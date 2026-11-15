@@ -55,6 +55,7 @@ Docker: asking and doing
 │ DockerServices         │ a service's container: found, created, brought up and down                        │
 │ Source                 │ who made a container, as far as we can tell (compose, systemd, ...)               │
 │ ImageRecipeState       │ what docker alone knows of a recipe: its versions, built or stale                 │
+│ RegistryCheck          │ what a registry said of a tag when it was last asked: the one thing we keep       │
 └────────────────────────┴───────────────────────────────────────────────────────────────────────────────────┘
 
 TUI
@@ -105,6 +106,9 @@ from typing import Callable, Sequence
 # Seconds a container may stay under its spawning name (see SPAWNING_PREFIX) before the Issues tab warns about it.
 # A spawn is rarely that fast, a dead one is dead at once: past this it is "maybe slow, maybe stuck", never a verdict.
 SPAWN_WARN_AFTER = 10
+# Seconds after which what a registry said of an image is old news, and the Issues tab says to ask again (see
+# stale_registry_issue). Nothing asks by itself: without this, an image nobody asks about is never behind.
+REGISTRY_STALE_AFTER = 2 * 3600
 
 # =============================================================================
 # Errors (a log) and issues (detected from current state)
@@ -402,6 +406,7 @@ class DockerImageRow(DockerRow):
     SharedSize: str = ""
     UniqueSize: str = ""
     VirtualSize: str = ""
+    Registry: str = ""  # not docker's: what the registry said of this tag when last asked (see registry_notes)
 
 
 @dataclass
@@ -450,6 +455,7 @@ class DockerNetworkRow(DockerRow):
 QUERY_TIMEOUT = 6
 POLL_TIMEOUT = 1
 SIZE_TIMEOUT = 60
+REGISTRY_TIMEOUT = 20  # a question the daemon takes to a registry: the network is in it
 TIMED_OUT = 124  # exit code _run gives a call that timed out (as timeout(1) does)
 NO_ANSWER = "containerctl: no answer after"  # what _run puts on stderr for a call that timed out
 
@@ -691,6 +697,10 @@ CONFIG_DIR = Path.home() / ".config" / "containerctl"
 PROJECTS_DIR = CONFIG_DIR / "projects"
 SERVICES_DIR = CONFIG_DIR / "services"
 IMAGES_DIR = CONFIG_DIR / "images"  # <name>.toml + <name>.Dockerfile [+ <name>/ build context]
+# The one thing we keep: what the registries said and when they were last asked (see RegistryCheck), which nothing
+# on this machine can tell us again. State, not a cache: whoever empties ~/.cache should not also reset "asked 3d
+# ago" to "never asked". Never anything docker could answer: that is asked of docker, every time.
+REGISTRY_FILE = Path.home() / ".local" / "state" / "containerctl" / "registry.json"
 SECRETS_FILE = CONFIG_DIR / "secrets.toml"  # flat `key = "value"`, 0600, never versioned; [secrets] picks keys from it
 
 # Who a spawned container is for, and that user's home *inside* it, unless the project says otherwise (`user`,
@@ -1141,8 +1151,7 @@ LOG_MAX_SIZE = "10m"
 LOG_MAX_FILE = 3
 
 # What services still want before they run for months on a server (one line each; drop the line when done):
-# TODO(services): updates: say when a pulled image is behind its tag on the registry (needs the network, so a
-#                 command and a cache, never the fetcher); `recreate` is downtime with no way back
+# TODO(services): `recreate` is downtime with no way back
 
 
 @dataclass
@@ -1492,6 +1501,167 @@ def fetch_upstream(url: str, limit: int = 1 << 20) -> str | None:
         log_error("image.upstream", f"{url}: larger than {limit} bytes, not a Dockerfile")
         return None
     return data.decode("utf-8", errors="replace")
+
+
+# =============================================================================
+# Registries: is a pulled image behind its tag?
+# =============================================================================
+#
+# A question for the network, so never asked by itself: `image updates` and the `u` of the Images tab
+# ask, the answers are kept in REGISTRY_FILE, and everything else (the fetcher, the issues, the Images tab) only
+# reads that file. The daemon does the asking (see Docker.registry_digest): its network, its proxy, no HTTP client
+# of ours. What is asked about: the `image` of every project and service that is pulled, not built from a recipe
+# (`image check` is for those) and not pinned by digest (nothing to be behind).
+
+
+@dataclass(frozen=True)
+class RegistryCheck:
+    """What a registry said of a tag when it was last asked, and of which local image that makes a verdict: one
+    entry of REGISTRY_FILE"""
+
+    ref: str
+    checked: float  # time.time() of the question
+    local: str = ""  # the ID of the image the tag was on here, then: the verdict is about that one
+    remote: str = ""  # the digest the registry had the tag on
+    behind: bool | None = None  # None: not known, and `note` says why
+    note: str = ""
+
+    @property
+    def status(self) -> str:
+        return {True: "behind", False: "current"}.get(self.behind, self.note)
+
+
+def span(seconds: float) -> str:
+    """A length of time, short: 40s, 5m, 3h, 12d"""
+    seconds = max(0, int(seconds))
+    for size, unit in ((86400, "d"), (3600, "h"), (60, "m")):
+        if seconds >= size:
+            return f"{seconds // size}{unit}"
+    return f"{seconds}s"
+
+
+def ago(then: float) -> str:
+    """How long since `then` (a time.time()), as a span"""
+    return span(time.time() - then)
+
+
+def registry_lines(refs: dict[str, list[str]], checks: dict[str, RegistryCheck]) -> list[str]:
+    """What is kept of the registries' answers, one line per image a project or a service uses: for the TUI's
+    boxes, after asking (`u`) or without (`r`)"""
+    lines = []
+    for ref, users in refs.items():
+        check = checks.get(ref)
+        said = f"{check.status}, asked {ago(check.checked)} ago" if check else "never asked"
+        lines.append(f"{ref}: {said} ({', '.join(users)})")
+    return lines
+
+
+def registry_refs(
+    projects: dict[str, ProjectConfig], services: dict[str, "ServiceConfig"], images: dict[str, ImageRecipeConfig]
+) -> dict[str, list[str]]:
+    """The images a registry can be asked about, each with who uses it ("project demo", "service web")"""
+    refs: dict[str, list[str]] = {}
+    for kind, configs in (("project", projects), ("service", services)):
+        for name, config in configs.items():
+            if "@" not in config.image and find_image_recipe(config.image, images) is None:
+                refs.setdefault(normalize_image_ref(config.image), []).append(f"{kind} {name}")
+    return refs
+
+
+def read_registry_checks() -> dict[str, RegistryCheck]:
+    """REGISTRY_FILE, by ref. One that is not there, or not what we wrote, is one with nothing in it: every image
+    is then one the registries were never asked about, which is an issue of its own (see stale_registry_issue)"""
+    try:
+        entries = json.loads(REGISTRY_FILE.read_text())
+        checks = [deserialize(RegistryCheck, entry) for entry in entries]
+    except (OSError, ValueError, TypeError):
+        return {}
+    return {check.ref: check for check in checks}
+
+
+def write_registry_checks(checks: dict[str, RegistryCheck]) -> None:
+    """All of them, in place of the file: written beside it, then renamed over it"""
+    REGISTRY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", dir=REGISTRY_FILE.parent, prefix=".registry-", delete=False) as f:
+        json.dump([dataclasses.asdict(check) for check in checks.values()], f, indent=1)
+    os.replace(f.name, REGISTRY_FILE)
+
+
+def check_registry(ref: str) -> RegistryCheck:
+    """Ask: is the image `ref` names here the one its registry has under that tag now? By digest: the one the
+    registry answers against the ones the local image was pulled as (its RepoDigests). Whatever keeps us from
+    knowing is the check's note, not an error: not pulled, built here, a registry that would not say."""
+    now = time.time()
+    try:
+        info = Docker.inspect(DockerImageInspect, ref)
+        if info is None:
+            return RegistryCheck(ref, now, note="not pulled")
+        pulled_as = {digest.rpartition("@")[2] for digest in info.RepoDigests or []}
+        if not pulled_as:
+            return RegistryCheck(ref, now, info.Id, note="not from a registry")
+        remote = Docker.registry_digest(ref)
+    except DockerError as e:
+        log_error("image.registry", f"{ref}: {e.failure.detail or e}")
+        return RegistryCheck(ref, now, note=f"unknown: {e}")
+    return RegistryCheck(ref, now, info.Id, remote, behind=remote not in pulled_as)
+
+
+def check_registries(refs: Sequence[str]) -> dict[str, RegistryCheck]:
+    """Ask about each of `refs` and keep the answers: REGISTRY_FILE is then those, and nothing of a ref no project
+    or service uses any more. Written after each: an interrupted run keeps what it had the time to learn."""
+    known = read_registry_checks()
+    checks = {ref: known[ref] for ref in refs if ref in known}
+    for ref in refs:
+        checks[ref] = check_registry(ref)
+        write_registry_checks(checks)
+    return checks
+
+
+def _tag_ids(rows: list[DockerImageRow]) -> dict[str, str]:
+    return {f"{row.Repository}:{row.Tag}": row.ID for row in rows}
+
+
+def standing(check: RegistryCheck | None, tag_id: str | None) -> bool:
+    """Is that check still about the image the tag is on here? One pulled (or built, or removed) since is another
+    image: nothing is known of it until the registry is asked again."""
+    return check is not None and check.behind is not None and tag_id is not None and same_image(check.local, tag_id)
+
+
+def registry_notes(rows: list[DockerImageRow], checks: dict[str, RegistryCheck]) -> None:
+    """Write on each image row what the registry said of its tag, when that still stands: `behind, 3d ago`"""
+    for row in rows:
+        check = checks.get(f"{row.Repository}:{row.Tag}")
+        if standing(check, row.ID):
+            row.Registry = f"{check.status}, {ago(check.checked)} ago"
+
+
+def registry_issues(
+    refs: dict[str, list[str]], checks: dict[str, RegistryCheck], rows: list[DockerImageRow]
+) -> list[Issue]:
+    """An image a registry said is behind its tag, for as long as that image is the one the tag is on here"""
+    tag_ids = _tag_ids(rows)
+    issues = []
+    for ref, users in refs.items():
+        check = checks.get(ref)
+        if standing(check, tag_ids.get(ref)) and check.behind:
+            msg = f"{ref} is behind its tag on the registry (asked {ago(check.checked)} ago)"
+            hint = f"docker pull {ref}, then recreate what runs it"
+            issues.append(Issue(WARNING, "image.behind", msg, hint, f"used by: {', '.join(users)}"))
+    return issues
+
+
+def stale_registry_issue(refs: dict[str, list[str]], checks: dict[str, RegistryCheck]) -> Issue | None:
+    """The images whose registry was never asked, or not for REGISTRY_STALE_AFTER: one issue for all of them, as
+    one `image updates` answers for all of them. From the file alone: docker has no part in it."""
+    limit = time.time() - REGISTRY_STALE_AFTER
+    stale = {ref: checks.get(ref) for ref in refs if ref not in checks or checks[ref].checked < limit}
+    if not stale:
+        return None
+    count = f"{len(stale)} image{'s' if len(stale) > 1 else ''}"
+    msg = f"{count} not checked against the registry for over {span(REGISTRY_STALE_AFTER)}"
+    lines = [f"{ref}: {f'asked {ago(check.checked)} ago' if check else 'never asked'}" for ref, check in stale.items()]
+    hint = "containerctl image updates (or `u` on the Images tab)"
+    return Issue(WARNING, "image.unchecked", msg, hint, "\n".join(lines))
 
 
 # =============================================================================
@@ -2763,6 +2933,27 @@ class Docker:
         return data
 
     @staticmethod
+    def registry_digest(ref: str, timeout: float = REGISTRY_TIMEOUT) -> str:
+        """The digest `ref`'s registry has under that tag now. The daemon asks it for us (the engine API's
+        /distribution): its network and its proxy, anonymously, so a private image is one it will not say for.
+        DockerError when there is no digest to hand back, whatever the reason: the detail has what was said."""
+        if not is_valid_image_ref(ref):
+            raise DockerError(Failure("Not an image ref", "", f"refused: {ref!r}"))
+        path = f"/distribution/{urllib.parse.quote(ref, safe='/:@')}/json"
+        status, body = Docker._api(path, timeout)
+        try:
+            data = json.loads(body)
+        except ValueError:
+            data = None
+        data = data if isinstance(data, dict) else {}
+        digest = (data.get("Descriptor") or {}).get("digest") if isinstance(data.get("Descriptor"), dict) else None
+        if status == 200 and isinstance(digest, str) and _is_ref_digest(digest):
+            return digest
+        said = data.get("message") or body.strip()[:200]
+        hint = "is it public, and is this machine online?"
+        raise DockerError(Failure("The registry did not say", hint, f"GET {path}: HTTP {status}: {said}"))
+
+    @staticmethod
     def _stream(args: list[str], env: dict[str, str] | None = None) -> int:
         """Run a docker command on our own terminal (logs, exec: nothing captured) and hand back its exit code.
         `env` extends the client's environment for this one call (see exec)."""
@@ -3773,6 +3964,13 @@ class DataFetcher:
         issues = broken_projects + broken_services + broken_images
         issues += detect_issues(projects_config, services_config, images_config, listings)
         issues += service_drift(services_config, listings, self.inspected, POLL_TIMEOUT)
+        checks = read_registry_checks()  # what the registries said last (a file: see RegistryCheck)
+        refs = registry_refs(projects_config, services_config, images_config)
+        if stale := stale_registry_issue(refs, checks):
+            issues.append(stale)
+        if not listings["images"].failure:
+            issues += registry_issues(refs, checks, listings["images"].rows)
+            registry_notes(listings["images"].rows, checks)
 
         # Projects and services come from config, so they list whatever docker does; only their status needs `ps`
         status = status_lookup(listings["containers"])
@@ -4087,7 +4285,8 @@ class App:
                 columns=[
                     ("Repository", "REPOSITORY", 35),
                     ("Tag", "TAG", 20),
-                    ("Size", "SIZE", 15),
+                    ("Size", "SIZE", 12),
+                    ("Registry", "REGISTRY", 18),
                     ("ID", "ID", 0),
                 ],
                 id_key="ID",
@@ -4540,6 +4739,22 @@ class App:
         if self.ask(f"Delete image '{name}'?"):
             self.attempt(self.DELETE, name, lambda: Docker.remove_image(row.ID, force=True))
 
+    def images_updates(self, row: DockerImageRow | None) -> None:
+        """Ask the registries about the pulled images of the projects and services: the one key that needs the
+        network. The answers are kept (see RegistryCheck): the REGISTRY column and the issues read them."""
+        refs = registry_refs(read_projects()[0], read_services()[0], read_image_recipes()[0])
+        if not refs:
+            self.set_message("No project or service runs a pulled image: nothing to ask", Term.YELLOW)
+            return
+        self.busy(f"Asking the registries about {len(refs)} image{'s' if len(refs) > 1 else ''}")
+        self.box("Registries, asked just now", registry_lines(refs, check_registries(list(refs))))
+
+    def images_registry(self, row: DockerImageRow | None) -> None:
+        """What the registries said when last asked, every image a project or a service uses: nothing is asked"""
+        refs = registry_refs(read_projects()[0], read_services()[0], read_image_recipes()[0])
+        lines = registry_lines(refs, read_registry_checks())
+        self.box("Registries, as last asked ([u] asks)", lines or ["No project or service runs a pulled image"])
+
     def volume_delete(self, row: DockerVolumeRow) -> None:
         if self.ask(f"Delete volume '{row.Name}'?"):
             self.attempt(self.DELETE, row.Name, lambda: Docker.remove_volume(row.Name), busy=False)
@@ -4642,7 +4857,11 @@ class App:
             Action("d", "[d]elete", container_delete),
             Action("o", "[o]rigin", container_origin),
         ),
-        "images": (Action("d", "[d]elete", image_delete),),
+        "images": (
+            Action("d", "[d]elete", image_delete),
+            Action("u", "[u]pdates?", images_updates, needs_row=False),
+            Action("r", "[r]egistry", images_registry, needs_row=False),
+        ),
         "volumes": (Action("d", "[d]elete", volume_delete),),
         "networks": (Action("e", "[e]dit", network_containers), Action("d", "[d]elete", network_delete)),
         "projects": (Action("e", "[e]nter", project_enter), Action("d", "[d]estroy", project_destroy)),
@@ -5051,6 +5270,12 @@ def current_issues() -> list[Issue]:
     issues = broken_projects + broken_services + broken_images
     listings = Docker.listings()
     issues += detect_issues(projects, services, images, listings) + service_drift(services, listings)
+    checks = read_registry_checks()
+    refs = registry_refs(projects, services, images)
+    if stale := stale_registry_issue(refs, checks):
+        issues.append(stale)
+    if not listings["images"].failure:
+        issues += registry_issues(refs, checks, listings["images"].rows)
     return by_severity(issues)
 
 
@@ -5298,6 +5523,23 @@ def cli_image_check(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def cli_image_updates(args: argparse.Namespace) -> None:
+    """Ask the registries whether the pulled images of projects and services are behind their tags. Exit 1 when
+    one is."""
+    refs = registry_refs(load_projects(), load_services(), load_image_recipes())
+    if not refs:
+        print("No project or service runs a pulled image: nothing to ask")
+        return
+    checks = check_registries(list(refs))
+    rows = [[ref, checks[ref].status, ", ".join(users)] for ref, users in refs.items()]
+    print("\n".join(format_table(["IMAGE", "REGISTRY", "USED BY"], rows, None, [])))
+    behind = [ref for ref, check in checks.items() if check.behind]
+    for ref in behind:
+        print(f"\n{ref}: docker pull {ref}, then recreate what runs it")
+    if behind:
+        sys.exit(1)
+
+
 # `help full`: the why and the concepts, ahead of the commands. Written for me in two years, and for whoever reads
 # the README, which is this output (a test holds them equal). Say what a thing is and why it is that way, not how
 # to type it: the commands below it do that.
@@ -5333,6 +5575,10 @@ CONCEPTS = [
     "               <repo>:cctl-local-NNNNNN, and the recipe tag is re-pointed at it: the previous build is",
     "               still there to go back to. `spawn` / `up` build a missing image, never rebuild one.",
     "               `image check` says when the build is stale, and diffs the Dockerfile against upstream.",
+    "               A pulled image has no recipe: `image updates` (`u` on the Images tab) asks its registry",
+    "               whether it is behind its tag: when asked, never by itself. The answer is kept, the one",
+    "               thing that is (docker can't tell it again): behind is an issue until the image is pulled,",
+    "               and so is an answer older than 2 hours, or none: `u` again, or `r` to read the last.",
     "               A project image must have: the project's user and its home (`dev` and /home/dev,",
     "               unless its TOML says another `user` / `home`), bash, git (+ ssh for git@ repos),",
     "               coreutils. python3 too, for `check-local` to run inside. Its USER does not matter: the",
@@ -5405,11 +5651,13 @@ def usage(full: bool = False) -> int:
         "- containerctl image ls                        ==> list recipes: current build, versions (nags past 3)",
         "- containerctl image build <name>              ==> build <repo>:cctl-local-NNNNNN, re-point the recipe tag",
         "- containerctl image check [name]              ==> built image vs recipe, local Dockerfile vs upstream",
+        "- containerctl image updates                   ==> ask the registries: are the pulled images behind?",
         "──────────────────────────────────────────────",
         f"Project configs: {PROJECTS_DIR}/<name>.toml",
         f"Service configs: {SERVICES_DIR}/<name>.toml",
         f"Image recipes:   {IMAGES_DIR}/<name>.toml + <name>.Dockerfile [+ <name>/ build context]",
         f"Secrets:         {SECRETS_FILE} (chmod 600; a [secrets] table picks keys from it)",
+        f"Kept:            {REGISTRY_FILE} (what the registries said: see `image updates`)",
     ]
     print("\n" + "\n".join(output_lines) + "\n")
     return 0
@@ -5644,6 +5892,9 @@ def main() -> None:
     img_check = image_sub.add_parser("check", help="Built image vs recipe, local Dockerfile vs upstream")
     img_check.add_argument("image", nargs="?", help="Image name (default: all)")
     img_check.set_defaults(func=cli_image_check)
+
+    img_updates = image_sub.add_parser("updates", help="Ask the registries: are the pulled images behind their tags?")
+    img_updates.set_defaults(func=cli_image_updates)
 
     # services (list)
     services_parser = subparsers.add_parser("services", help="List configured services")

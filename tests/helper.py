@@ -8,10 +8,24 @@ replace the two places a subprocess is launched and assert on the command that
   - ``containerctl.subprocess.run`` for the streaming ones (logs/exec/shell)
 """
 
+import dataclasses
 import subprocess
+import time
+from pathlib import Path
 
 import containerctl
 from containerctl import DockerContainerRow
+
+# Never the real file of what the registries said: a test that wants one points this at a file of its own
+containerctl.REGISTRY_FILE = Path("/nonexistent/containerctl-tests/registry.json")
+
+
+def asked(*refs: str, **said) -> dict:
+    """What REGISTRY_FILE has when the registries were asked about `refs` a moment ago and each is current (or as
+    `said`: behind=True, ...): for the tests where that is not the subject, and "never asked" would be an issue"""
+    image = "sha256:" + "1" * 64
+    checks = [containerctl.RegistryCheck(ref, time.time(), image, "sha256:" + "a" * 64, False) for ref in refs]
+    return {check.ref: dataclasses.replace(check, **said) for check in checks}
 
 
 def container(

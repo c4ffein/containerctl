@@ -11,7 +11,7 @@ from unittest import mock
 
 import containerctl
 from containerctl import ProjectConfig, RepoStatus, WorkspaceReport, config_usage, format_table, usage
-from tests.helper import PopenRecorder, RunRecorder, container, listings, reset_errors
+from tests.helper import PopenRecorder, RunRecorder, asked, container, listings, reset_errors
 
 
 def readme_block(section):
@@ -63,6 +63,7 @@ class UsageTests(unittest.TestCase):
             mock.patch.object(containerctl, "SERVICES_DIR", "~/.config/containerctl/services"),
             mock.patch.object(containerctl, "IMAGES_DIR", "~/.config/containerctl/images"),
             mock.patch.object(containerctl, "SECRETS_FILE", "~/.config/containerctl/secrets.toml"),
+            mock.patch.object(containerctl, "REGISTRY_FILE", "~/.local/state/containerctl/registry.json"),
             redirect_stdout(buf),
         ):
             usage(full=True)
@@ -535,6 +536,7 @@ class CliIssuesTests(unittest.TestCase):
             mock.patch.object(containerctl, "read_image_recipes", return_value=({}, [])),
             mock.patch.object(containerctl, "SECRETS_FILE", Path("/nonexistent/secrets.toml")),
             mock.patch.object(containerctl.Docker, "listings", return_value=listings(failed)),
+            mock.patch.object(containerctl, "read_registry_checks", return_value=asked("i:latest")),
             redirect_stdout(out),
         ):
             code = 0
@@ -843,6 +845,7 @@ class CliImageTests(unittest.TestCase):
             (["image", "ls"], "cli_image_ls", None),
             (["image", "build", "x"], "cli_image_build", "x"),
             (["image", "check"], "cli_image_check", None),
+            (["image", "updates"], "cli_image_updates", None),
             (["issues"], "cli_issues", None),
         )
         for argv, func, attr in cases:
