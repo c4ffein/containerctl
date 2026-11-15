@@ -55,12 +55,14 @@ class RunRecorder:
         self.stdins = []  # one entry per call: the stdin= of a no-context `build -` lands here
         self.inputs = []  # one entry per call: the input= string of an `exec -i` lands here
         self.own_groups = []  # one entry per call: was it taken out of the terminal's process group?
+        self.envs = []  # one entry per call: the env= of a `run -e NAME` lands here
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
 
-    def __call__(self, args, capture=True, stdin=None, input=None, timeout=None, own_group=False):
+    def __call__(self, args, capture=True, stdin=None, input=None, timeout=None, own_group=False, env=None):
         self.calls.append(list(args))
+        self.envs.append(env)
         self.own_groups.append(own_group)
         self.stdins.append(stdin)
         self.inputs.append(input)
@@ -89,7 +91,7 @@ class ApiRecorder:
         self.calls.append(path)
         if self.into is not None:
             self.into.calls.append(["GET", path])
-            for column in (self.into.own_groups, self.into.stdins, self.into.inputs):
+            for column in (self.into.own_groups, self.into.stdins, self.into.inputs, self.into.envs):
                 column.append(None)  # these go by the index of the call
         return self.status, self.body
 

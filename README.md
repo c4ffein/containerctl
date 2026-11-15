@@ -29,8 +29,10 @@ Concepts
                `enter` shell only: never argv, never the container's config, never a project file.
 - service  ==> a long-lived container (cctl-svc-<name>): `docker run` written as TOML, plus scripts to
                exec in it. `up` creates or starts (and connects new networks), it never changes a
-               container: any other TOML edit needs `recreate`. Its `env` is plain `docker run -e`:
-               anyone who can `docker inspect` reads it.
+               container: any other TOML edit needs `recreate` (an issue says so for the image, and when
+               its tag has moved). [env] plain values, [secrets] names of keys in secrets.toml, read at
+               creation: neither is in argv, both are in the container: who can `docker inspect` reads
+               them. Logs are rotated (10m x 3) unless its TOML says otherwise.
 - image    ==> a recipe: a Dockerfile (+ context dir) beside a TOML. Each build is its own tag,
                <repo>:cctl-local-NNNNNN, and the recipe tag is re-pointed at it: the previous build is
                still there to go back to. `spawn` / `up` build a missing image, never rebuild one.
@@ -102,5 +104,5 @@ Concepts
 Project configs: ~/.config/containerctl/projects/<name>.toml
 Service configs: ~/.config/containerctl/services/<name>.toml
 Image recipes:   ~/.config/containerctl/images/<name>.toml + <name>.Dockerfile [+ <name>/ build context]
-Secrets:         ~/.config/containerctl/secrets.toml (chmod 600; a project's [secrets] picks keys from it)
+Secrets:         ~/.config/containerctl/secrets.toml (chmod 600; a [secrets] table picks keys from it)
 ```

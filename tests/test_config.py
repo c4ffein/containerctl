@@ -232,7 +232,6 @@ class ServiceConfigTests(unittest.TestCase):
             'restart = "always"\n'
             'ports = ["8080:80", "4000-5000:4000-5000/tcp"]\n'
             'volumes = ["/home/dev/data:/data:ro"]\n'
-            'env = ["FOO=bar", "BAZ=qux"]\n'
             "[scripts]\n"
             'migrate = ["python", "manage.py", "migrate"]\n'
         )
@@ -291,10 +290,77 @@ class ServiceConfigTests(unittest.TestCase):
             path = write_toml(self.dir, "web", 'image = "nginx"\n' + body)
             self.assertEqual(rejected(ServiceConfig.from_toml, path).cat, "service.config")
 
-    def test_env_is_parsed_into_config(self):
+    def test_env_and_secrets_are_tables_as_for_a_project(self):
+        body = 'image = "nginx"\n[env]\nFOO = "bar"\nEMPTY = ""\n[secrets]\nAPI_TOKEN = "web_token"\n'
+        cfg = ServiceConfig.from_toml(write_toml(self.dir, "web", body))
+        self.assertEqual(cfg.env, {"FOO": "bar", "EMPTY": ""})
+        self.assertEqual(cfg.secrets, {"API_TOKEN": "web_token"})
+        self.assertEqual((ServiceConfig(name="w", image="i").env, ServiceConfig(name="w", image="i").secrets), ({}, {}))
+
+    def test_the_env_list_of_before_is_refused_saying_what_to_write(self):
         path = write_toml(self.dir, "web", 'image = "nginx"\nenv = ["FOO=bar"]\n')
-        cfg = ServiceConfig.from_toml(path)
-        self.assertEqual(cfg.env, ["FOO=bar"])
+        error = rejected(ServiceConfig.from_toml, path)
+        self.assertEqual(error.cat, "service.config")
+        self.assertIn("'env' is a table now", str(error))
+        self.assertIn("[env]", str(error))
+
+    def test_env_and_secrets_rejected(self):
+        for body in (
+            'env = "FOO=bar"\n',
+            '[env]\n"BAD-NAME" = "x"\n',
+            '[env]\n"1X" = "x"\n',
+            "[env]\nFOO = 1\n",
+            '[secrets]\nTOKEN = "not a key"\n',
+            '[secrets]\n"A B" = "key"\n',
+            '[env]\nTOKEN = "x"\n[secrets]\nTOKEN = "key"\n',  # which one would win?
+        ):
+            reset_errors()
+            path = write_toml(self.dir, "web", 'image = "nginx"\n' + body)
+            self.assertEqual(rejected(ServiceConfig.from_toml, path).cat, "service.config", body)
+
+    def test_limits_and_logs_parsed(self):
+        cfg = ServiceConfig.from_toml(write_toml(self.dir, "web", 'image = "nginx"\n'))
+        self.assertEqual((cfg.memory, cfg.cpus, cfg.user, cfg.no_new_privileges), ("", "", "", False))
+        self.assertEqual((cfg.log_max_size, cfg.log_max_file), ("10m", 3))  # rotation is on unless said otherwise
+        body = (
+            'image = "nginx"\nmemory = "512m"\ncpus = 1.5\nuser = "101:101"\nno_new_privileges = true\n'
+            'log_max_size = "1g"\nlog_max_file = 5\n'
+        )
+        cfg = ServiceConfig.from_toml(write_toml(self.dir, "web", body))
+        self.assertEqual((cfg.memory, cfg.cpus, cfg.user, cfg.no_new_privileges), ("512m", "1.5", "101:101", True))
+        self.assertEqual((cfg.log_max_size, cfg.log_max_file), ("1g", 5))
+        for written, read in (("2", "2"), ('"0.25"', "0.25"), ("0.5", "0.5"), ("2.0", "2")):
+            cfg = ServiceConfig.from_toml(write_toml(self.dir, "web", f'image = "nginx"\ncpus = {written}\n'))
+            self.assertEqual(cfg.cpus, read)
+        cfg = ServiceConfig.from_toml(write_toml(self.dir, "web", 'image = "nginx"\nlog_max_size = ""\n'))
+        self.assertEqual(cfg.log_max_size, "")
+
+    def test_limits_and_logs_rejected(self):
+        for body in (
+            "memory = 512\n",
+            'memory = "512mb"\n',
+            'memory = "0"\n',
+            'memory = "-1g"\n',
+            'memory = "1g --privileged"\n',
+            "cpus = 0\n",
+            "cpus = -1\n",
+            "cpus = true\n",
+            'cpus = "two"\n',
+            'cpus = "1.5.2"\n',
+            'user = "-u"\n',
+            'user = "a:b:c"\n',
+            'user = "web user"\n',
+            "user = 101\n",
+            'no_new_privileges = "yes"\n',
+            "log_max_size = 10\n",
+            'log_max_size = "ten"\n',
+            "log_max_file = 0\n",
+            'log_max_file = "3"\n',
+            "log_max_file = true\n",
+        ):
+            reset_errors()
+            path = write_toml(self.dir, "web", 'image = "nginx"\n' + body)
+            self.assertEqual(rejected(ServiceConfig.from_toml, path).cat, "service.config", body)
 
     def test_invalid_restart_policy(self):
         path = write_toml(self.dir, "web", 'image = "nginx"\nrestart = "sometimes"\n')
@@ -746,6 +812,60 @@ class IssueTests(unittest.TestCase):
                 ),
             ],
         )
+
+    def test_a_service_on_another_image_than_its_toml_is_an_issue(self):
+        services = {
+            "same": ServiceConfig(name="same", image="nginx"),  # `nginx` and `nginx:latest` are one ref
+            "edited": ServiceConfig(name="edited", image="nginx:1.28"),
+            "moved": ServiceConfig(name="moved", image="hermes:latest"),
+            "down": ServiceConfig(name="down", image="nginx"),  # no container: nothing to say
+        }
+        rows = [
+            container("cctl-svc-same", image="nginx:latest"),
+            container("cctl-svc-edited", image="nginx:1.27"),
+            container("cctl-svc-moved", image="0123456789ab"),  # what `docker ps` shows once the tag is elsewhere
+            container("cctl-prj-moved", image="0123456789ab"),  # not a service
+        ]
+        issues = containerctl.service_issues(services, rows)
+        self.assertEqual(
+            [(i.level, i.cat, i.msg, i.hint) for i in issues],
+            [
+                (
+                    containerctl.WARNING,
+                    "service.image",
+                    "Service edited runs nginx:1.27, its TOML says nginx:1.28",
+                    "containerctl service recreate edited",
+                ),
+                (
+                    containerctl.WARNING,
+                    "service.image",
+                    "Service moved runs an older hermes:latest: the tag has moved since it was created",
+                    "containerctl service recreate moved",
+                ),
+            ],
+        )
+        with mock.patch.object(containerctl, "SECRETS_FILE", Path("/nonexistent/secrets.toml")):
+            detected = containerctl.detect_issues({}, services, {}, listings(containers=rows[:3]))
+            unknown = containerctl.detect_issues({}, services, {}, listings(failed={"containers": "boom"}))
+        self.assertEqual(detected, issues)
+        self.assertEqual([i.cat for i in unknown], ["docker"])  # no listing, no verdict
+
+    def test_what_reads_as_an_image_id(self):
+        for text in ("0123456789ab", "sha256:" + "a" * 64, "A" * 12):
+            self.assertTrue(containerctl.is_image_id(text), text)
+        for text in ("nginx", "nginx:1.27", "0123456789a", "deadbeefcafe:latest", "registry:5000/app", ""):
+            self.assertFalse(containerctl.is_image_id(text), text)
+
+    def test_an_unhealthy_service_is_an_issue(self):
+        services = {name: ServiceConfig(name=name, image="i") for name in ("ok", "sick")}
+        sick = container("cctl-svc-sick")
+        sick.Status = "Up 3 hours (unhealthy)"
+        rows = [container("cctl-svc-ok"), sick, container("other")]
+        rows[0].Status, rows[2].Status = "Up 3 hours (healthy)", "Up 1 hour (unhealthy)"  # not ours to speak of
+        (issue,) = containerctl.service_issues(services, rows)
+        self.assertEqual((issue.level, issue.cat), (containerctl.WARNING, "service.health"))
+        self.assertEqual(issue.msg, "Service sick is unhealthy: its image's healthcheck fails")
+        self.assertEqual(issue.hint, "containerctl logs cctl-svc-sick")
 
     def test_image_versions_from_docker_images_rows(self):
         image = containerctl.ImageRecipeConfig(name="hermes", dockerfile=Path("h.Dockerfile"), context=Path("h"))

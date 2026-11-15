@@ -26,15 +26,15 @@ from containerctl import (
     DockerContainerRow,
     DockerImageRow,
     DockerNetworkRow,
+    DockerProjects,
+    DockerServices,
     DockerVolumeRow,
     Event,
     Issue,
     ProjectConfig,
-    Projects,
     RepoStatus,
     Screen,
     ServiceConfig,
-    Services,
     Tab,
     Term,
     WorkspaceReport,
@@ -959,7 +959,9 @@ class AppOtherTabActionTests(AppBase):
         with (
             mock.patch.object(containerctl, "read_projects", return_value=({"demo": project}, [])),
             mock.patch.object(self.app, "exit_tui_temporarily"),
-            mock.patch.object(Projects, "enter", return_value=0) as enter,  # a shell that ended well: no more asked
+            mock.patch.object(
+                DockerProjects, "enter", return_value=0
+            ) as enter,  # a shell that ended well: no more asked
             mock.patch.object(self.app, "enter_tui"),
         ):
             self.feed("e")
@@ -971,7 +973,7 @@ class AppOtherTabActionTests(AppBase):
         project = ProjectConfig(name="demo", image="i")
         with (
             mock.patch.object(containerctl, "read_projects", return_value=({"demo": project}, [])),
-            mock.patch.object(Projects, "containers", return_value=(None, None)),
+            mock.patch.object(DockerProjects, "containers", return_value=(None, None)),
             mock.patch.object(UI, "confirm") as confirm,
         ):
             self.feed("d")
@@ -985,7 +987,7 @@ class AppOtherTabActionTests(AppBase):
         with (
             mock.patch.object(containerctl, "read_projects", return_value=({"demo": project}, [])),
             mock.patch.object(self.app, "exit_tui_temporarily"),
-            mock.patch.object(Projects, "enter", return_value=None),  # spawn failed, or was declined
+            mock.patch.object(DockerProjects, "enter", return_value=None),  # spawn failed, or was declined
             mock.patch("builtins.input") as pause,
             mock.patch.object(self.app, "enter_tui") as back,
         ):
@@ -1004,7 +1006,7 @@ class AppOtherTabActionTests(AppBase):
         with (
             mock.patch.object(containerctl, "read_projects", return_value=({"demo": project}, [])),
             mock.patch.object(self.app, "exit_tui_temporarily"),
-            mock.patch.object(Projects, "enter", **enter_project),
+            mock.patch.object(DockerProjects, "enter", **enter_project),
             mock.patch.object(Docker, "inspect", return_value=mock.Mock(State={"Running": True})),
             mock.patch("builtins.input", side_effect=EOFError),  # Ctrl-D at "Press Enter to return..."
             mock.patch.object(self.app, "enter_tui") as self.back,
@@ -1046,10 +1048,10 @@ class AppOtherTabActionTests(AppBase):
         ):
             with (
                 mock.patch.object(containerctl, "read_projects", return_value=({"demo": project}, [])),
-                mock.patch.object(Projects, "containers", return_value=(main, leftover)),
+                mock.patch.object(DockerProjects, "containers", return_value=(main, leftover)),
                 mock.patch.object(containerctl, "project_report", return_value=WorkspaceReport()) as check,
                 mock.patch.object(UI, "confirm", return_value=True) as confirm,
-                mock.patch.object(Projects, "destroy", return_value=True) as destroy,
+                mock.patch.object(DockerProjects, "destroy", return_value=True) as destroy,
             ):
                 self.feed("d")
             self.assertEqual(check.call_count, 1 if main else 0)  # a leftover was never entered: nothing to check
@@ -1062,10 +1064,10 @@ class AppOtherTabActionTests(AppBase):
         project = ProjectConfig(name="demo", image="i")
         with (
             mock.patch.object(containerctl, "read_projects", return_value=({"demo": project}, [])),
-            mock.patch.object(Projects, "containers", return_value=(container("cctl-prj-demo"), None)),
+            mock.patch.object(DockerProjects, "containers", return_value=(container("cctl-prj-demo"), None)),
             mock.patch.object(containerctl, "project_report", return_value=report) as check,
             mock.patch.object(UI, "confirm", return_value=answer) as confirm,
-            mock.patch.object(Projects, "destroy", return_value=True) as destroy,
+            mock.patch.object(DockerProjects, "destroy", return_value=True) as destroy,
         ):
             self.feed("d")
         check.assert_called_once_with(project)
@@ -1094,10 +1096,10 @@ class AppOtherTabActionTests(AppBase):
         project = ProjectConfig(name="demo", image="i")
         with (
             mock.patch.object(containerctl, "read_projects", return_value=({"demo": project}, [])),
-            mock.patch.object(Projects, "containers", return_value=(container("cctl-prj-demo", "exited"), None)),
+            mock.patch.object(DockerProjects, "containers", return_value=(container("cctl-prj-demo", "exited"), None)),
             mock.patch.object(containerctl, "project_report", side_effect=failed),
             mock.patch.object(UI, "confirm", return_value=True) as confirm,
-            mock.patch.object(Projects, "destroy", return_value=True) as destroy,
+            mock.patch.object(DockerProjects, "destroy", return_value=True) as destroy,
         ):
             self.feed("d")
         prompt = "Destroy cctl-prj-demo, though its workspace could NOT be checked (Container is not running)?"
@@ -1117,9 +1119,9 @@ class AppOtherTabActionTests(AppBase):
         service = ServiceConfig(name="web", image="i")
         with (
             mock.patch.object(containerctl, "read_services", return_value=({"web": service}, [])),
-            mock.patch.object(Services, "find_container", return_value=container("cctl-svc-web")),
+            mock.patch.object(DockerServices, "find_container", return_value=container("cctl-svc-web")),
             mock.patch.object(UI, "confirm", return_value=True) as confirm,
-            mock.patch.object(Services, "down", return_value=True) as down,
+            mock.patch.object(DockerServices, "down", return_value=True) as down,
         ):
             self.feed("d")
         confirm.assert_called_once_with("Stop service 'web'?", self.ROWS - 1, self.COLS)
@@ -1133,7 +1135,7 @@ class AppOtherTabActionTests(AppBase):
                 containerctl, "read_services", return_value=({"web": ServiceConfig(name="web", image="i")}, [])
             ),
             mock.patch.object(UI, "confirm", return_value=False),
-            mock.patch.object(Services, "recreate") as recreate,
+            mock.patch.object(DockerServices, "recreate") as recreate,
         ):
             self.feed("r")
         recreate.assert_not_called()

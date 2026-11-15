@@ -193,13 +193,13 @@ class CliEnterOptionTests(unittest.TestCase):
         self._load.stop()
 
     def _enter(self, options):
-        with mock.patch.object(containerctl.Projects, "enter", return_value=0) as enter:
+        with mock.patch.object(containerctl.DockerProjects, "enter", return_value=0) as enter:
             containerctl.cli_enter(argparse.Namespace(project="proj", options=options))
         return enter
 
     def test_exits_with_the_shell_code_and_with_1_when_no_shell_was_entered(self):
         for returned, code in ((3, 3), (None, 1)):
-            with mock.patch.object(containerctl.Projects, "enter", return_value=returned):
+            with mock.patch.object(containerctl.DockerProjects, "enter", return_value=returned):
                 with self.assertRaises(SystemExit) as ctx:
                     containerctl.cli_enter(argparse.Namespace(project="proj", options=[]))
             self.assertEqual(ctx.exception.code, code)
@@ -213,7 +213,7 @@ class CliEnterOptionTests(unittest.TestCase):
     def test_shortcut_resolves_to_project_and_workdir(self):
         project = ProjectConfig(name="proj", image="ubuntu", shortcuts={"lib": "lib/src"})
         with mock.patch.object(containerctl, "load_projects", return_value={"proj": project}):
-            with mock.patch.object(containerctl.Projects, "enter", return_value=0) as enter:
+            with mock.patch.object(containerctl.DockerProjects, "enter", return_value=0) as enter:
                 containerctl.cli_enter(argparse.Namespace(project="lib", options=["user=root"]))
         enter.assert_called_once_with(project, user="root", workdir="/home/dev/workspace/lib/src")
 
@@ -260,9 +260,9 @@ class CliDestroyTests(unittest.TestCase):
         code = 0
         with (
             mock.patch.object(containerctl, "stdin_is_tty", real_stdin_is_tty),
-            mock.patch.object(containerctl.Projects, "containers", return_value=(container, leftover)),
+            mock.patch.object(containerctl.DockerProjects, "containers", return_value=(container, leftover)),
             mock.patch.object(containerctl, "project_report", side_effect=[report]) as check,
-            mock.patch.object(containerctl.Projects, "destroy", return_value=True) as destroy,
+            mock.patch.object(containerctl.DockerProjects, "destroy", return_value=True) as destroy,
             mock.patch.object(containerctl.sys, "stdin", stdin),
             mock.patch("builtins.input", typed),
             redirect_stdout(out),
@@ -417,7 +417,7 @@ class ExitCodeTests(unittest.TestCase):
         out = io.StringIO()
         with (
             mock.patch.object(containerctl, "load_projects", return_value=projects),
-            mock.patch.object(containerctl.Projects, "find_container", return_value=container("c")),
+            mock.patch.object(containerctl.DockerProjects, "find_container", return_value=container("c")),
             mock.patch.object(containerctl, "project_report", side_effect=[failed, WorkspaceReport()]) as check,
             redirect_stdout(out),
         ):

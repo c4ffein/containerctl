@@ -51,8 +51,8 @@ Docker: asking and doing
 ┌────────────────────────┬───────────────────────────────────────────────────────────────────────────────────┐
 │ UnixHTTPConnection     │ HTTP over a unix socket: how the daemon is asked its questions                    │
 │ Docker                 │ the CLI for actions, the socket for questions; knows no project or service        │
-│ Projects               │ a project's container: found, spawned, entered, destroyed                         │
-│ Services               │ a service's container: found, created, brought up and down                        │
+│ DockerProjects         │ a project's container: found, spawned, entered, destroyed                         │
+│ DockerServices         │ a service's container: found, created, brought up and down                        │
 │ Source                 │ who made a container, as far as we can tell (compose, systemd, ...)               │
 │ ImageRecipeState       │ what docker alone knows of a recipe: its versions, built or stale                 │
 └────────────────────────┴───────────────────────────────────────────────────────────────────────────────────┘
@@ -760,30 +760,31 @@ def is_valid_env_name(name: str) -> bool:
     return bool(name) and not name[0].isdigit() and all(c in VALID_ENV_NAME_CHARS for c in name)
 
 
-def _parse_name_table(raw, path: Path, table: str, value_ok: Callable[[str], bool]) -> dict[str, str]:
-    """A `[table]` of `ENV_NAME = "string"`. ConfigError when anything is malformed: a half-applied environment
-    is worse than none."""
+def _parse_name_table(raw, path: Path, table: str, value_ok: Callable[[str], bool], cat: str) -> dict[str, str]:
+    """A `[table]` of `ENV_NAME = "string"`. ConfigError (under `cat`) when anything is malformed: a half-applied
+    environment is worse than none."""
     if raw is None:
         return {}
     if not isinstance(raw, dict):
-        raise ConfigError("project.config", f"Invalid '{table}' (must be a table) in {path}")
+        raise ConfigError(cat, f"Invalid '{table}' (must be a table) in {path}")
     for name, value in raw.items():
         if not is_valid_env_name(name):
-            raise ConfigError("project.config", f"Invalid env name '{name}' in [{table}] of {path}")
+            raise ConfigError(cat, f"Invalid env name '{name}' in [{table}] of {path}")
         if not isinstance(value, str) or not value_ok(value):
-            raise ConfigError("project.config", f"Invalid value for '{name}' in [{table}] of {path}")
+            raise ConfigError(cat, f"Invalid value for '{name}' in [{table}] of {path}")
     return dict(raw)
 
 
-def parse_env_table(raw, path: Path) -> dict[str, str]:
-    """`[env]`: `NAME = "value"`, plain values for the `enter` shell's environment"""
-    return _parse_name_table(raw, path, "env", lambda v: "\x00" not in v)
+def parse_env_table(raw, path: Path, cat: str = "project.config") -> dict[str, str]:
+    """`[env]`: `NAME = "value"`, plain values: for a project's `enter` shell, for a service's container"""
+    return _parse_name_table(raw, path, "env", lambda v: "\x00" not in v, cat)
 
 
-def parse_secrets_table(raw, path: Path) -> dict[str, str]:
-    """`[secrets]`: `NAME = "key"`, the key of a secrets.toml entry whose value is looked up at `enter`.
-    Only names and keys live here, so a value can never land in a versioned project file."""
-    return _parse_name_table(raw, path, "secrets", is_valid_env_name)
+def parse_secrets_table(raw, path: Path, cat: str = "project.config") -> dict[str, str]:
+    """`[secrets]`: `NAME = "key"`, the key of a secrets.toml entry whose value is looked up when it is needed (a
+    project's `enter`, a service's creation). Only names and keys live here, so a value can never land in a
+    versioned config file."""
+    return _parse_name_table(raw, path, "secrets", is_valid_env_name, cat)
 
 
 VALID_VOLUME_SUFFIX = {"ro", "rw"}
@@ -1057,10 +1058,11 @@ def load_secrets() -> dict[str, str]:
     return secrets
 
 
-def resolve_env(project: "ProjectConfig") -> dict[str, str]:
-    """What `enter` injects: the project's [env], plus each [secrets] entry found in secrets.toml. A missing
-    secret is recorded under env.secret and left out; the rest still goes in. secrets.toml is only read when
-    the project names a secret, and only the keys it names are used."""
+def resolve_env(project: "ProjectConfig | ServiceConfig") -> dict[str, str]:
+    """What `enter` injects (and what a service is created with): the [env] of the config, plus each [secrets]
+    entry found in secrets.toml. A missing secret is recorded under env.secret and left out; the rest still goes
+    in (a service is not created without all of its own: see DockerServices.create_container). secrets.toml is
+    only read when the config names a secret, and only the keys it names are used."""
     env = dict(project.env)
     if not project.secrets:
         return env
@@ -1085,12 +1087,39 @@ def is_valid_tmpfs_spec(spec_str: str) -> bool:
     return not options or all(c in VALID_TMPFS_OPTION_CHARS for c in options)
 
 
+def is_valid_size(text: str) -> bool:
+    """A size as docker takes them (`--memory`, `--log-opt max-size`): digits and at most one of b k m g; not zero"""
+    digits = text[:-1] if text[-1:] in tuple("bkmgBKMG") else text
+    return _is_uint(digits, 10**12) and int(digits) > 0
+
+
+def is_valid_cpus(text: str) -> bool:
+    """`--cpus`: a positive decimal number, `2` or `0.5`"""
+    whole, dot, fraction = text.partition(".")
+    if not _is_uint(whole, 4096) or (dot and not _is_uint(fraction, 10**6)):
+        return False
+    return int(whole) > 0 or (bool(dot) and int(fraction) > 0)
+
+
+def is_valid_user_spec(text: str) -> bool:
+    """`--user`: name or uid, then maybe `:` and a group or gid"""
+    parts = text.split(":")
+    return len(parts) in (1, 2) and all(is_valid_id(part) for part in parts)
+
+
+LOG_DRIVER = (
+    "json-file"  # said at every run: `max-size` is this driver's option, and the daemon's default may be another
+)
+LOG_MAX_SIZE = "10m"
+LOG_MAX_FILE = 3
+
 # What services still want before they run for months on a server (one line each; drop the line when done):
-# TODO(services): log limits: `--log-opt max-size/max-file`; json-file grows until the disk is full
-# TODO(services): drift: an issue when a running container no longer matches its TOML (label a config hash at run)
-# TODO(services): secrets: `env` values sit in argv and `docker inspect`; give services a [secrets] like projects
-# TODO(services): limits and health: memory / cpus, healthcheck, `--user`, `--security-opt no-new-privileges`
-# TODO(services): updates: say when a pulled image is behind its tag; `recreate` is downtime with no way back
+# TODO(services): drift: an issue when a running container no longer matches its TOML (label a config hash at run);
+#                 only the image is compared today (see service_issues)
+# TODO(services): healthcheck of our own in the TOML (the image's own already shows: see service_issues)
+# TODO(services): updates: say when a pulled image is behind its tag on the registry (needs the network, so a
+#                 command and a cache, never the fetcher); `recreate` is downtime with no way back
+# TODO(tui): App._handle_key as a table of keys per tab, which the bottom line's key hints are then read from
 
 
 @dataclass
@@ -1103,7 +1132,8 @@ class ServiceConfig:
     ports: list[str] = field(default_factory=list)
     volumes: list[str] = field(default_factory=list)
     scripts: dict[str, list[str]] = field(default_factory=dict)
-    env: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)  # plain values: in the container's config, so in `inspect`
+    secrets: dict[str, str] = field(default_factory=dict)  # env name -> key in secrets.toml, read at creation
     command: list[str] = field(default_factory=list)  # argv after the image; empty = the image's own CMD
     networks: list[str] = field(default_factory=list)  # created if missing; `up` connects an existing container
     # Hardening (all optional, off by default): --read-only, --tmpfs, --cap-drop/--cap-add, --pids-limit
@@ -1112,6 +1142,13 @@ class ServiceConfig:
     cap_drop: list[str] = field(default_factory=list)
     cap_add: list[str] = field(default_factory=list)
     pids_limit: int = 0  # 0 = docker default (unlimited)
+    memory: str = ""  # --memory, as docker writes sizes ("512m"); empty = unlimited
+    cpus: str = ""  # --cpus ("1.5"); empty = unlimited
+    user: str = ""  # --user, name|uid[:group|gid]; empty = the image's own USER
+    no_new_privileges: bool = False  # --security-opt no-new-privileges: setuid binaries gain nothing
+    # Log rotation, on unless said otherwise: json-file without it grows until the disk is full
+    log_max_size: str = LOG_MAX_SIZE  # per file; "" = no limit of ours, and the daemon's own log driver
+    log_max_file: int = LOG_MAX_FILE  # files kept
 
     @property
     def container_name(self) -> str:
@@ -1150,11 +1187,13 @@ class ServiceConfig:
 
         volumes = parse_volumes(data.get("volumes", []), path, "service.config")
 
-        env_list = []
-        for e in data.get("env", []):
-            if not isinstance(e, str) or "=" not in e:
-                raise ConfigError("service.config", f"Invalid env entry '{e}' in {path}")
-            env_list.append(e)
+        if isinstance(data.get("env"), list):  # how it was written before services had [secrets]
+            msg = f"'env' is a table now, in {path}: write `[env]` then one `NAME = \"value\"` per line"
+            raise ConfigError("service.config", f"{msg} (below the plain keys, as any table; see `help config`)")
+        env = parse_env_table(data.get("env"), path, "service.config")
+        secrets = parse_secrets_table(data.get("secrets"), path, "service.config")
+        if both := sorted(set(env) & set(secrets)):
+            raise ConfigError("service.config", f"{', '.join(both)}: in both [env] and [secrets] of {path}")
 
         networks = []
         for n in data.get("networks", []):
@@ -1183,6 +1222,32 @@ class ServiceConfig:
         if isinstance(pids_limit, bool) or not isinstance(pids_limit, int) or pids_limit < 0:
             raise ConfigError("service.config", f"Invalid 'pids_limit' (must be a positive integer) in {path}")
 
+        memory = data.get("memory", "")
+        if not isinstance(memory, str) or (memory and not is_valid_size(memory)):
+            raise ConfigError("service.config", f'Invalid \'memory\' (a size, as "512m" or "2g") in {path}')
+
+        cpus = data.get("cpus", "")
+        if isinstance(cpus, (int, float)) and not isinstance(cpus, bool):
+            cpus = format(cpus, "f").rstrip("0").rstrip(".") if isinstance(cpus, float) else str(cpus)
+        if not isinstance(cpus, str) or (cpus and not is_valid_cpus(cpus)):
+            raise ConfigError("service.config", f"Invalid 'cpus' (a positive number, as 2 or 0.5) in {path}")
+
+        user = data.get("user", "")
+        if not isinstance(user, str) or (user and not is_valid_user_spec(user)):
+            raise ConfigError("service.config", f"Invalid 'user' (name|uid[:group|gid]) in {path}")
+
+        no_new_privileges = data.get("no_new_privileges", False)
+        if not isinstance(no_new_privileges, bool):
+            raise ConfigError("service.config", f"Invalid 'no_new_privileges' (must be true/false) in {path}")
+
+        log_max_size = data.get("log_max_size", LOG_MAX_SIZE)
+        if not isinstance(log_max_size, str) or (log_max_size and not is_valid_size(log_max_size)):
+            raise ConfigError("service.config", f'Invalid \'log_max_size\' (a size, as "10m"; "" for none) in {path}')
+
+        log_max_file = data.get("log_max_file", LOG_MAX_FILE)
+        if isinstance(log_max_file, bool) or not isinstance(log_max_file, int) or not 1 <= log_max_file <= 1000:
+            raise ConfigError("service.config", f"Invalid 'log_max_file' (must be an integer, 1 or more) in {path}")
+
         command = data.get("command", [])
         if not isinstance(command, list) or not all(isinstance(a, str) and a for a in command):
             raise ConfigError("service.config", f"Invalid 'command' (must be a list of non-empty strings) in {path}")
@@ -1209,7 +1274,8 @@ class ServiceConfig:
             ports=ports,
             volumes=volumes,
             scripts=scripts,
-            env=env_list,
+            env=env,
+            secrets=secrets,
             command=list(command),
             networks=networks,
             read_only=read_only,
@@ -1217,6 +1283,12 @@ class ServiceConfig:
             cap_drop=caps["cap_drop"],
             cap_add=caps["cap_add"],
             pids_limit=pids_limit,
+            memory=memory,
+            cpus=cpus,
+            user=user,
+            no_new_privileges=no_new_privileges,
+            log_max_size=log_max_size,
+            log_max_file=log_max_file,
         )
 
 
@@ -1466,6 +1538,38 @@ def orphan_issues(names: list[str], projects: set[str], services: set[str]) -> l
     return issues
 
 
+def is_image_id(text: str) -> bool:
+    """An image ID, short or whole: what `docker ps` has in its IMAGE column once no tag points at the image a
+    container was made of (a ref never reads as one unless it is a bare hex name of 12 or more: don't)"""
+    digits = text.removeprefix("sha256:")
+    return len(digits) >= 12 and all(c in HEX for c in digits)
+
+
+def service_issues(services: dict[str, "ServiceConfig"], containers: list[DockerContainerRow]) -> list[Issue]:
+    """What `docker ps` alone says of a service's container, against its TOML: nothing more is asked of docker.
+    - its image: `up` never changes a container, so one made of another image than the TOML's `image` goes on
+      until a `recreate`. Either the TOML now names another, or the tag itself moved (an `image build`, a pull),
+      and `docker ps` then shows the ID of the image the container is still of.
+    - its health, when the image has a HEALTHCHECK: docker says `(unhealthy)` in the status."""
+    by_name = {c.Names: c for c in containers}
+    issues = []
+    for name, service in services.items():
+        container = by_name.get(service.container_name)
+        if container is None:
+            continue
+        hint = f"containerctl service recreate {name}"
+        if is_image_id(container.Image) and not is_image_id(service.image):
+            msg = f"Service {name} runs an older {service.image}: the tag has moved since it was created"
+            issues.append(Issue(WARNING, "service.image", msg, hint, f"its image: {container.Image}"))
+        elif normalize_image_ref(container.Image) != normalize_image_ref(service.image):
+            msg = f"Service {name} runs {container.Image}, its TOML says {service.image}"
+            issues.append(Issue(WARNING, "service.image", msg, hint))
+        if "(unhealthy)" in container.Status:
+            msg = f"Service {name} is unhealthy: its image's healthcheck fails"
+            issues.append(Issue(WARNING, "service.health", msg, f"containerctl logs {service.container_name}"))
+    return issues
+
+
 def leftover_note(container: DockerContainerRow) -> str:
     """What a question says of a container still under its spawning name, before removing it"""
     return f"{container.Names} ({created_ago(container)}: a spawn still running, or one that died)"
@@ -1528,6 +1632,7 @@ def detect_issues(
     if not listings["containers"].failure:
         rows = listings["containers"].rows
         issues += orphan_issues([c.Names for c in rows], set(projects), set(services)) + spawning_issues(rows)
+        issues += service_issues(services, rows)
     return issues
 
 
@@ -1883,7 +1988,7 @@ def destroy_question(project: "ProjectConfig") -> DestroyQuestion:
     """Look at what a project has (one `ps`), `check` the workspace of its container, and word the question: the
     verdict (DIRTY, or a check that could not run) is in it, and so is what an unfinished spawn left (never
     entered, so nothing to check, but it may be a spawn still running elsewhere)."""
-    container, leftover = Projects.containers(project)
+    container, leftover = DockerProjects.containers(project)
     question = DestroyQuestion(names=[c.Names for c in (container, leftover) if c])
     what = []
     if container:
@@ -2263,9 +2368,9 @@ REFUSED = 2  # exit code of a call we never made: an argument failed validation 
 
 class Docker:
     """Docker itself: its CLI through subprocess, its socket for the questions (see _api). Names and refs in,
-    answers out: it knows no project, service or recipe. What a project or a service needs of it is Projects and
-    Services; a recipe builds itself (ImageRecipeConfig.build), and ensure_image gets what a `docker run` is about to
-    need."""
+    answers out: it knows no project, service or recipe. What a project or a service needs of it is DockerProjects
+    and DockerServices; a recipe builds itself (ImageRecipeConfig.build), and ensure_image gets what a `docker run`
+    is about to need."""
 
     @staticmethod
     def _run(
@@ -2275,9 +2380,11 @@ class Docker:
         input: str | None = None,
         timeout: float | None = None,
         own_group: bool = False,
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess:
         """Run docker command; `input` feeds stdin from a string, `stdin` from a file (never both). With a
-        `timeout` (seconds; see QUERY_TIMEOUT), a call that hasn't answered by then is killed.
+        `timeout` (seconds; see QUERY_TIMEOUT), a call that hasn't answered by then is killed. `env` extends the
+        client's environment for this one call (see run_container); not for an own_group one.
 
         `own_group` takes the call out of the terminal's foreground process group, and off its stdin: a Ctrl-C
         goes to that whole group, whichever thread started the process and whatever it reads from, and a listing
@@ -2288,9 +2395,10 @@ class Docker:
         try:
             if own_group:
                 return Docker._run_own_group(cmd, timeout)
+            kwargs = {"env": {**os.environ, **env}} if env else {}
             if input is not None:
-                return subprocess.run(cmd, capture_output=capture, text=True, input=input, timeout=timeout)
-            return subprocess.run(cmd, capture_output=capture, text=True, timeout=timeout, stdin=stdin)
+                return subprocess.run(cmd, capture_output=capture, text=True, input=input, timeout=timeout, **kwargs)
+            return subprocess.run(cmd, capture_output=capture, text=True, timeout=timeout, stdin=stdin, **kwargs)
         except FileNotFoundError:  # no docker on PATH: reads as a failed call, which every caller already reports
             return subprocess.CompletedProcess(cmd, 127, "", "docker: command not found on PATH")
         except subprocess.TimeoutExpired:  # so does a daemon that hangs
@@ -2583,11 +2691,18 @@ class Docker:
 
     @staticmethod
     def run_container(
-        name: str, image: str, command: Sequence[str] = (), options: Sequence[str] = ()
+        name: str,
+        image: str,
+        command: Sequence[str] = (),
+        options: Sequence[str] = (),
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess:
         """`docker run -d`: a container of `image`, named `name`, running `command` (the image's own when none).
         `options` are `docker run`'s own, whole (`["--network", "x", "--init"]`), and the caller's to have checked:
-        they come from its config. The result, for the caller to say what failed in its own words (the ID is on
+        they come from its config. `env` is the container's environment, passed as bare `-e NAME` flags: docker
+        fills each value from the client's environment, which we extend for this one call, so no value is in
+        argv (`ps` on the host). It is in the container's config all the same: `docker inspect` shows it. The
+        result, for the caller to say what failed in its own words (the ID is on
         stdout); a refused call (a name or an image that is not one) is a result with the REFUSED exit code, and
         the reason in the log."""
         refused = None
@@ -2595,10 +2710,13 @@ class Docker:
             refused = f"Invalid container name: {name}"
         elif not is_valid_image_ref(image):
             refused = f"Invalid image ref: {image}"
+        elif bad := [key for key in env or {} if not is_valid_env_name(key)]:
+            refused = f"Invalid env name: {bad[0]}"
         if refused:
             log_error("docker.invalid_id", refused)
             return subprocess.CompletedProcess(["docker", "run"], REFUSED, "", refused)
-        return Docker._run(["run", "-d", *options, "--name", name, image, *command])
+        names = [word for key in env or {} for word in ("-e", key)]
+        return Docker._run(["run", "-d", *options, *names, "--name", name, image, *command], env=env or None)
 
     @staticmethod
     def rename_container(container_id: str, name: str) -> subprocess.CompletedProcess:
@@ -2790,7 +2908,7 @@ def ensure_image(ref: str) -> bool:
     return recipe.build()
 
 
-class Projects:
+class DockerProjects:
     """A project's container, from its ProjectConfig: found, spawned, entered, destroyed"""
 
     @staticmethod
@@ -2864,10 +2982,10 @@ class Projects:
         print(f"Creating container {project.container_name}...")
         # From here on by ID: the spawning name may change hands (another terminal said yes to "start over"), and
         # what we put in, rename or clean up must be the container we made
-        container_id = Projects.create_container(project, name=name)
+        container_id = DockerProjects.create_container(project, name=name)
         if container_id is None:
             return False
-        if not Projects._provision(project, container_id):
+        if not DockerProjects._provision(project, container_id):
             return False
         result = Docker.rename_container(container_id, project.container_name)
         if result.returncode != 0:  # it stays under its spawning name, complete: the Issues tab says what to do
@@ -2989,11 +3107,11 @@ class Projects:
 
         `workdir` (a shortcut target) overrides the default landing directory; `user` who the shell is for
         (the project's user unless said: never the image's default, see CONTAINER_USER)."""
-        container = Projects.find_container(project.name)
+        container = DockerProjects.find_container(project.name)
 
         if container is None:
             # No container — spawn it
-            if not Projects.spawn(project):
+            if not DockerProjects.spawn(project):
                 print(f"Failed to spawn project {project.name}", file=sys.stderr)
                 return None
         else:
@@ -3044,7 +3162,7 @@ class Projects:
         meanwhile no longer has the name that was agreed to). Unset: all that exist now, an unfinished spawn's
         leftover included."""
         if names is None:
-            names = [c.Names for c in Projects.containers(project) if c]
+            names = [c.Names for c in DockerProjects.containers(project) if c]
         if not names:
             print(f"No container found for project {project.name}")
             return False
@@ -3058,7 +3176,7 @@ class Projects:
         return True
 
 
-class Services:
+class DockerServices:
     """A service's container, from its ServiceConfig: found, created, brought up and down"""
 
     @staticmethod
@@ -3069,7 +3187,12 @@ class Services:
 
     @staticmethod
     def create_container(service: "ServiceConfig") -> bool:
-        """Create and start a container for a service"""
+        """Create and start a container for a service. Its [secrets] are read from secrets.toml now, and one that
+        is not there means no container: a service that runs for months without its token is found out late."""
+        env = resolve_env(service)  # before anything is made or pulled
+        if missing := [name for name in service.secrets if name not in env]:
+            log_error("service.create", f"{service.name}: no value for {', '.join(missing)}: nothing created")
+            return False
         # `docker run` takes a single --network; the rest are connected right after creation
         for network in service.networks:
             if not Docker.ensure_network(network):
@@ -3095,16 +3218,25 @@ class Services:
             options.extend(["-p", port])
         for vol in service.volumes:
             options.extend(["-v", vol])
-        for e in service.env:
-            options.extend(["-e", e])
-        result = Docker.run_container(service.container_name, service.image, service.command, options)
+        if service.memory:
+            options.extend(["--memory", service.memory])
+        if service.cpus:
+            options.extend(["--cpus", service.cpus])
+        if service.user:
+            options.extend(["--user", service.user])
+        if service.no_new_privileges:
+            options.extend(["--security-opt", "no-new-privileges"])
+        if service.log_max_size:
+            options.extend(["--log-driver", LOG_DRIVER, "--log-opt", f"max-size={service.log_max_size}"])
+            options.extend(["--log-opt", f"max-file={service.log_max_file}"])
+        result = Docker.run_container(service.container_name, service.image, service.command, options, env=env)
         if result.returncode != 0:
             log_error(
                 "service.create",
                 f"Failed to create container: {result.stderr.strip()}",
             )
             return False
-        return Services.apply_networks(service, already=set(service.networks[:1]))
+        return DockerServices.apply_networks(service, already=set(service.networks[:1]))
 
     @staticmethod
     def apply_networks(service: "ServiceConfig", already: set[str] | None = None) -> bool:
@@ -3129,10 +3261,10 @@ class Services:
     @staticmethod
     def up(service: "ServiceConfig") -> bool:
         """Bring a service up: create if missing, start if stopped"""
-        container = Services.find_container(service.name)
+        container = DockerServices.find_container(service.name)
         if container is None:
             print(f"Creating service {service.container_name}...")
-            return Services.create_container(service)
+            return DockerServices.create_container(service)
         state = container.State.lower()
         if state != "running":
             print(f"Starting {service.container_name}...")
@@ -3142,12 +3274,12 @@ class Services:
             print(f"Service {service.container_name} is already running")
         # Networks added to the config since creation get connected; the hardening flags can't
         # be changed on a live container, use `service recreate` for those.
-        return Services.apply_networks(service)
+        return DockerServices.apply_networks(service)
 
     @staticmethod
     def down(service: "ServiceConfig") -> bool:
         """Stop and remove a service container"""
-        container = Services.find_container(service.name)
+        container = DockerServices.find_container(service.name)
         if container is None:
             print(f"No container found for service {service.name}")
             return False
@@ -3157,13 +3289,13 @@ class Services:
     @staticmethod
     def recreate(service: "ServiceConfig") -> bool:
         """Recreate a service container (down + up)"""
-        container = Services.find_container(service.name)
+        container = DockerServices.find_container(service.name)
         if container is not None:
             print(f"Removing {service.container_name}...")
             if not Docker.remove_container(service.container_name, force=True):
                 return False
         print(f"Creating {service.container_name}...")
-        return Services.create_container(service)
+        return DockerServices.create_container(service)
 
 
 # =============================================================================
@@ -4184,7 +4316,7 @@ class App:
 
             if project and key == "e":  # Enter
                 self.exit_tui_temporarily()
-                code = Projects.enter(project)
+                code = DockerProjects.enter(project)
                 if code is None:  # why is on the main screen (and in the log): leave time to read it
                     self.pause()
                 self.enter_tui()
@@ -4200,7 +4332,7 @@ class App:
                     if UI.confirm(question.text, rows - 1, cols):
                         self.busy(f"Destroying {project_name}")
                         # Only what the prompt named: what appeared while it was up was never agreed to
-                        if Projects.destroy(project, question.names):
+                        if DockerProjects.destroy(project, question.names):
                             self.set_message(f"Destroyed {project_name}", Term.GREEN)
                         else:
                             self.set_message(f"Failed to destroy {project_name}", Term.RED)
@@ -4215,15 +4347,15 @@ class App:
 
             if service and key == "u":  # Up
                 self.exit_tui_temporarily()
-                Services.up(service)
+                DockerServices.up(service)
                 self.pause()
                 self.enter_tui()
 
             elif service and key == "d":  # Down
-                if Services.find_container(service_name):
+                if DockerServices.find_container(service_name):
                     if UI.confirm(f"Stop service '{service_name}'?", rows - 1, cols):
                         self.busy(f"Stopping {service_name}")
-                        if Services.down(service):
+                        if DockerServices.down(service):
                             self.set_message(f"Stopped {service_name}", Term.GREEN)
                         else:
                             self.set_message(f"Failed to stop {service_name}", Term.RED)
@@ -4233,7 +4365,7 @@ class App:
             elif service and key == "r":  # Recreate
                 if UI.confirm(f"Recreate service '{service_name}'?", rows - 1, cols):
                     self.exit_tui_temporarily()
-                    if Services.recreate(service):
+                    if DockerServices.recreate(service):
                         print(f"Recreated {service_name}")
                     else:
                         print(f"Failed to recreate {service_name}")
@@ -4510,7 +4642,7 @@ def cli_enter(args: argparse.Namespace) -> None:
             print(f"Invalid user: {value}", file=sys.stderr)
             sys.exit(1)
         user = value
-    code = Projects.enter(project, user=user, workdir=workdir)
+    code = DockerProjects.enter(project, user=user, workdir=workdir)
     if code != 0:  # no shell (None), or the shell's own exit code, as `shell` and `exec` hand it back
         sys.exit(1 if code is None else code)
 
@@ -4522,10 +4654,10 @@ def cli_spawn(args: argparse.Namespace) -> None:
         print(f"Unknown project: {args.project}", file=sys.stderr)
         sys.exit(1)
     project = projects[args.project]
-    if Projects.find_container(project.name):
+    if DockerProjects.find_container(project.name):
         print(f"Container {project.container_name} already exists. Use 'enter' or 'destroy' first.", file=sys.stderr)
         sys.exit(1)
-    if not Projects.spawn(project):
+    if not DockerProjects.spawn(project):
         sys.exit(1)
 
 
@@ -4566,7 +4698,7 @@ def cli_destroy(args: argparse.Namespace) -> None:
         nobody = "" if stdin_is_tty() else ": no terminal to ask on, use --force"
         print(f"Not destroyed{nobody}", file=sys.stderr)
         sys.exit(1)
-    if not Projects.destroy(project, question.names):  # what was asked about
+    if not DockerProjects.destroy(project, question.names):  # what was asked about
         sys.exit(1)
     print(f"Destroyed {args.project}")
 
@@ -4605,7 +4737,7 @@ def _check_one(project: "ProjectConfig") -> bool | None:
 
     Returns True if clean, False if dirty or impossible to check, None if there is no container.
     """
-    container = Projects.find_container(project.name)
+    container = DockerProjects.find_container(project.name)
     if container is None:
         print(f"{project.name}: no container (nothing to check)")
         return None
@@ -4710,7 +4842,7 @@ def cli_service_up(args: argparse.Namespace) -> None:
         )
         print(f"Add service configs to {SERVICES_DIR}/", file=sys.stderr)
         sys.exit(1)
-    if not Services.up(services[args.service]):
+    if not DockerServices.up(services[args.service]):
         sys.exit(1)
 
 
@@ -4720,7 +4852,7 @@ def cli_service_down(args: argparse.Namespace) -> None:
     if args.service not in services:
         print(f"Unknown service: {args.service}", file=sys.stderr)
         sys.exit(1)
-    if not Services.down(services[args.service]):
+    if not DockerServices.down(services[args.service]):
         sys.exit(1)
 
 
@@ -4730,7 +4862,7 @@ def cli_service_recreate(args: argparse.Namespace) -> None:
     if args.service not in services:
         print(f"Unknown service: {args.service}", file=sys.stderr)
         sys.exit(1)
-    if not Services.recreate(services[args.service]):
+    if not DockerServices.recreate(services[args.service]):
         sys.exit(1)
     print(f"Recreated {args.service}")
 
@@ -4747,7 +4879,7 @@ def cli_service_script(args: argparse.Namespace) -> None:
         print(f"Unknown script '{args.script}' for service {args.service}", file=sys.stderr)
         print(f"Available scripts: {', '.join(service.scripts.keys()) or 'none'}", file=sys.stderr)
         sys.exit(1)
-    container = Services.find_container(service.name)
+    container = DockerServices.find_container(service.name)
     if container is None:
         print(f"No container found for service {service.name} (run 'service up' first)", file=sys.stderr)
         sys.exit(1)
@@ -4926,8 +5058,10 @@ CONCEPTS = [
     "               `enter` shell only: never argv, never the container's config, never a project file.",
     "- service  ==> a long-lived container (cctl-svc-<name>): `docker run` written as TOML, plus scripts to",
     "               exec in it. `up` creates or starts (and connects new networks), it never changes a",
-    "               container: any other TOML edit needs `recreate`. Its `env` is plain `docker run -e`:",
-    "               anyone who can `docker inspect` reads it.",
+    "               container: any other TOML edit needs `recreate` (an issue says so for the image, and when",
+    "               its tag has moved). [env] plain values, [secrets] names of keys in secrets.toml, read at",
+    "               creation: neither is in argv, both are in the container: who can `docker inspect` reads",
+    "               them. Logs are rotated (10m x 3) unless its TOML says otherwise.",
     "- image    ==> a recipe: a Dockerfile (+ context dir) beside a TOML. Each build is its own tag,",
     "               <repo>:cctl-local-NNNNNN, and the recipe tag is re-pointed at it: the previous build is",
     "               still there to go back to. `spawn` / `up` build a missing image, never rebuild one.",
@@ -5008,7 +5142,7 @@ def usage(full: bool = False) -> int:
         f"Project configs: {PROJECTS_DIR}/<name>.toml",
         f"Service configs: {SERVICES_DIR}/<name>.toml",
         f"Image recipes:   {IMAGES_DIR}/<name>.toml + <name>.Dockerfile [+ <name>/ build context]",
-        f"Secrets:         {SECRETS_FILE} (chmod 600; a project's [secrets] picks keys from it)",
+        f"Secrets:         {SECRETS_FILE} (chmod 600; a [secrets] table picks keys from it)",
     ]
     print("\n" + "\n".join(output_lines) + "\n")
     return 0
@@ -5046,7 +5180,6 @@ def config_usage() -> int:
         'restart = "unless-stopped"                # no | always | unless-stopped | on-failure',
         'ports = ["127.0.0.1:8080:80"]             # [host_ip:]host:container[/udp]; no ip = all interfaces',
         'volumes = ["~/srv/www:/usr/share/nginx/html:ro"]',
-        'env = ["TZ=UTC"]',
         'command = ["nginx", "-g", "daemon off;"]    # argv after the image (optional; default: the image CMD)',
         'networks = ["proxy"]                      # created if missing; `up` also connects an existing container',
         "read_only = true                          # read-only root fs: writable paths must be tmpfs or volumes",
@@ -5054,16 +5187,27 @@ def config_usage() -> int:
         'cap_drop = ["ALL"]                        # hardening flags apply on create/recreate, not on `up`',
         'cap_add = ["NET_BIND_SERVICE"]',
         "pids_limit = 256",
+        'memory = "512m"                           # --memory (optional; default: no limit)',
+        "cpus = 1.5                                # --cpus (optional; default: no limit)",
+        'user = "101:101"                          # --user: name|uid[:group|gid] (optional; default: the image USER)',
+        "no_new_privileges = true                  # setuid binaries gain nothing (optional; default: false)",
+        'log_max_size = "10m"                      # log rotation, per file (default "10m"; "" = docker\'s own setup)',
+        "log_max_file = 3                          # log files kept (default 3)",
         "[scripts]                                 # `containerctl service script <name> reload`",
         'reload = ["nginx", "-s", "reload"]',
+        "[env]                                     # plain values, set at creation: `recreate` after an edit",
+        'TZ = "UTC"',
+        "[secrets]                                 # env name = key in secrets.toml, read at creation (optional);",
+        'API_TOKEN = "web_api_token"               # out of argv and of this file, not out of `docker inspect`',
         "",
         f"# {IMAGES_DIR}/<name>.toml  -  recipe: <name>.Dockerfile beside it; <name>/ is the build context if present",
         'tag = "hermes:latest"                     # newest build\'s alias, for `image =` (default <name>:latest)',
         'upstream = "https://raw.githubusercontent.com/you/images/main/hermes/Dockerfile"  # `image check` diffs it',
         "",
-        f"# {SECRETS_FILE}  -  chmod 600, never versioned; only the keys a project names are read",
+        f"# {SECRETS_FILE}  -  chmod 600, never versioned; only the keys a project or a service names are read",
         "# Claude Code subscription token: `claude setup-token` on a trusted machine, valid ~1 year.",
         'claude_token = "sk-ant-oat01-..."',
+        'web_api_token = "..."',
     ]
     print("\n" + "\n".join(output_lines) + "\n")
     return 0

@@ -8,7 +8,8 @@ docker is a failure instead: there, a skip would be a check that silently stoppe
 
 Nothing is pulled and no container is run: an inspect of what isn't there, one of each kind made (an image built
 `FROM scratch`, a container of it created and never started, a volume, a network), found and removed, the four
-listings, and a daemon that isn't there (DOCKER_HOST pointed at no socket: needs the client only).
+listings, a tag moved from under a container (how `docker ps` then names its image), and a daemon that isn't there
+(DOCKER_HOST pointed at no socket: needs the client only).
 """
 
 import os
@@ -131,6 +132,38 @@ class WhatIsThereTests(unittest.TestCase):
         self.assertTrue(Docker.remove_image(tag))
         self.assertFalse(Docker.image_exists(tag))
         self.assertEqual(containerctl.get_errors(), [])  # every answer was one we could read
+
+    def test_a_container_whose_tag_has_moved_is_listed_under_its_image_id(self):
+        """service_issues reads "the tag has moved" off `docker ps`: a container made of an image its tag no longer
+        points at is listed under the image's ID, not under the ref it was made with. Is that still what docker
+        does (and with this image store)?"""
+        service = f"{self.PREFIX}-moved"
+        tag, name = f"{service}:probe", f"{containerctl.SERVICE_PREFIX}{service}"
+        config = containerctl.ServiceConfig(name=service, image=tag)
+        self.later("rmi", "-f", tag)
+
+        def build(content: str) -> str:
+            with tempfile.TemporaryDirectory() as context:  # FROM scratch: nothing to pull
+                with open(os.path.join(context, "Dockerfile"), "w") as f:
+                    f.write(f"FROM scratch\nCOPY Dockerfile /Dockerfile\nLABEL cctl.test={content}\n")
+                self.docker("build", "-q", "-t", tag, context)
+            return Docker.inspect(containerctl.DockerImageInspect, tag).Id
+
+        def row() -> containerctl.DockerContainerRow:
+            return next(c for c in Docker.list_containers().required() if c.Names == name)
+
+        first = build("first")
+        self.later("rmi", "-f", first)  # once the tag has moved, only its ID names it
+        self.later("rm", "-f", name)  # cleanups run last first: the container goes before its images
+        self.docker("create", "--name", name, tag, "/nothing")  # created, never started: there is nothing to run
+        self.assertEqual(row().Image, tag)
+        self.assertEqual(containerctl.service_issues({service: config}, [row()]), [])
+
+        self.assertNotEqual(build("second"), first)  # the same tag, another image
+        self.assertTrue(containerctl.is_image_id(row().Image), row().Image)
+        (issue,) = containerctl.service_issues({service: config}, [row()])
+        self.assertEqual(issue.cat, "service.image")
+        self.assertIn("the tag has moved", issue.msg)
 
 
 class ListingsTests(unittest.TestCase):
